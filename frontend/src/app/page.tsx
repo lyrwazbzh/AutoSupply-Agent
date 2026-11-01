@@ -5,28 +5,36 @@ import Sidebar from "@/components/sidebar/Sidebar";
 import ChatArea from "@/components/chat/ChatArea";
 import { useChat } from "@/hooks/useChat";
 import { useHistory } from "@/hooks/useHistory";
-import { getMessages } from "@/lib/api";
+import { getChatState, getMessages } from "@/lib/api";
 import { ChatMessage } from "@/lib/types";
 
 export default function Home() {
   const chat = useChat();
   const history = useHistory();
   const wasStreaming = useRef(false);
+  const refreshHistory = history.refresh;
 
   // 聊天结束后自动刷新历史列表
   useEffect(() => {
-    if (wasStreaming.current && !chat.streaming) {
+    const justFinished = wasStreaming.current && !chat.streaming;
+    wasStreaming.current = chat.streaming;
+    if (justFinished) {
       // 延迟 500ms 等待后端保存完成
-      const timer = setTimeout(() => history.refresh(), 500);
+      const timer = setTimeout(() => refreshHistory(), 500);
       return () => clearTimeout(timer);
     }
-    wasStreaming.current = chat.streaming;
-  }, [chat.streaming, history]);
+  }, [chat.streaming, refreshHistory]);
 
   const handleSelectThread = useCallback(
     async (threadId: string) => {
+      // 当前回答期间，侧栏会因为会话已在后端登记而立刻出现同一个 thread。
+      // 点击它不应 abort 正在运行的 SSE；切换其他历史也等当前轮结束再做。
+      if (chat.streaming || threadId === chat.threadId) return;
       try {
-        const data = await getMessages(threadId);
+        const [data, state] = await Promise.all([
+          getMessages(threadId),
+          getChatState(threadId).catch(() => null),
+        ]);
         const msgs: ChatMessage[] = (data.messages || data || []).map(
           (m: Record<string, unknown>, idx: number) => ({
             id: (m.id as string) || `msg-${idx}`,
@@ -37,7 +45,11 @@ export default function Home() {
             timestamp: (m.timestamp as number) || Date.now(),
           })
         );
-        chat.loadThread(threadId, msgs);
+        chat.loadThread(
+          threadId,
+          msgs,
+          state?.interrupted ? state.interrupt_data ?? null : null
+        );
       } catch {
         // 加载失败静默处理
       }
@@ -63,11 +75,17 @@ export default function Home() {
   );
 
   const handleApprove = useCallback(() => {
-    chat.resumeWith({ decisions: [{ type: "approve" }] });
+    const operationIds = chat.interruptData?.operation_ids ?? [];
+    chat.resumeWith({
+      decisions: operationIds.map((operation_id) => ({ operation_id, type: "approve" })),
+    });
   }, [chat]);
 
   const handleReject = useCallback(() => {
-    chat.resumeWith({ decisions: [{ type: "reject" }] });
+    const operationIds = chat.interruptData?.operation_ids ?? [];
+    chat.resumeWith({
+      decisions: operationIds.map((operation_id) => ({ operation_id, type: "reject" })),
+    });
   }, [chat]);
 
   return (
@@ -92,7 +110,7 @@ export default function Home() {
         pendingQueue={chat.pendingQueue}
         phase={chat.phase}
         phaseLabel={chat.phaseLabel}
-        dispatchSpans={chat.dispatchSpans}
+        error={chat.error}
         onSend={chat.sendMessage}
         onSupplement={handleSupplement}
         onApprove={handleApprove}

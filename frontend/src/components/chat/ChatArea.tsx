@@ -8,7 +8,6 @@ import InputBar from "./InputBar";
 import ThinkingIndicator from "./ThinkingIndicator";
 import TodoListPanel from "./TodoListPanel";
 import HarnessPhaseBar from "./HarnessPhaseBar";
-import AgentDispatchTimeline, { DispatchSpanView } from "./AgentDispatchTimeline";
 import ToolCallToggle from "@/components/common/ToolCallToggle";
 import InterruptBanner from "@/components/interrupt/InterruptBanner";
 
@@ -23,7 +22,7 @@ interface Props {
   pendingQueue: string[];
   phase: string;
   phaseLabel: string;
-  dispatchSpans: DispatchSpanView[];
+  error: string | null;
   onSend: (msg: string) => void;
   onSupplement: (text: string) => void;
   onApprove: () => void;
@@ -41,7 +40,7 @@ export default function ChatArea({
   pendingQueue,
   phase,
   phaseLabel,
-  dispatchSpans,
+  error,
   onSend,
   onSupplement,
   onApprove,
@@ -68,11 +67,11 @@ export default function ChatArea({
       {/* Harness 阶段指示器 */}
       <HarnessPhaseBar phase={phase} phaseLabel={phaseLabel} visible={streaming || phase === "done"} />
 
-      {/* 子 Agent 并行派发时间线 */}
-      <AgentDispatchTimeline
-        spans={dispatchSpans}
-        visible={dispatchSpans.length > 0 && (streaming || phase === "done")}
-      />
+      {error && (
+        <div className="mx-6 mt-2 rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">
+          {error}
+        </div>
+      )}
 
       {/* 消息区域 / 欢迎页 */}
       {hasMessages ? (

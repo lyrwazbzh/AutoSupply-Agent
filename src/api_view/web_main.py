@@ -2,25 +2,38 @@
 FastAPI 应用入口
 CORS 全开、路由注册、startup/shutdown 事件
 """
-import sys
-import os
 import asyncio
-from pathlib import Path
+import mimetypes
+import os
+import sys
 from contextlib import asynccontextmanager, suppress
 
 # 确保项目根目录在 path 中
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from .api.chat import router as chat_router
-from .api.history import router as history_router
-from .web_config import close_mongo_client
-from ..agent.log_utils import web_logger
+from ..artifacts import cleanup_expired_artifacts, resolve_artifact
+from ..agent.audit.reconciler import WriteReconciler
 from ..agent.backends.sandbox_manager import sandbox_manager
-from ..agent.config import SANDBOX_MAINTENANCE_INTERVAL_SECONDS
+from ..agent.config import (
+    AUTH_MODE,
+    AUTH_USER_HEADER,
+    CORS_ALLOW_ORIGINS,
+    INTERNAL_AUTH_HEADER,
+    INTERNAL_AUTH_TOKEN,
+    SANDBOX_MAINTENANCE_INTERVAL_SECONDS,
+)
+from ..agent.log_utils import web_logger
+from .api.chat import router as chat_router
+from .api.dingtalk import router as dingtalk_router
+from .api.evaluation import router as evaluation_router
+from .api.history import router as history_router
+from .api.write_audit import router as write_audit_router
+from .auth import current_user_id
+from .web_config import setup_database
 
 
 async def _sandbox_maintenance(stop_event: asyncio.Event) -> None:
@@ -33,6 +46,7 @@ async def _sandbox_maintenance(stop_event: asyncio.Event) -> None:
         try:
             await asyncio.to_thread(sandbox_manager.cleanup_idle_sandboxes)
             await asyncio.to_thread(sandbox_manager.ensure_warm_pool)
+            await asyncio.to_thread(cleanup_expired_artifacts)
         except Exception as exc:
             web_logger.warning(f"Sandbox maintenance iteration failed: {exc}")
 
@@ -47,69 +61,130 @@ async def _sandbox_maintenance(stop_event: asyncio.Event) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    web_logger.info("Starting AutoSupply Agent Web Server...")
+    web_logger.info("Starting ERP Agent Web Server...")
+    if AUTH_MODE == "proxy" and not INTERNAL_AUTH_TOKEN:
+        web_logger.warning(
+            f"AUTH_MODE=proxy without INTERNAL_AUTH_TOKEN: backend trusts "
+            f"{AUTH_USER_HEADER} from anyone who can reach it. Sandbox code runs "
+            f"inside dind, which shares a Docker network with this container, so it "
+            f"can forge that header and read other users' conversations. Set "
+            f"INTERNAL_AUTH_TOKEN (and inject {INTERNAL_AUTH_HEADER} from nginx) to close it."
+        )
     stop_event = asyncio.Event()
     maintenance_task = None
+    reconciliation_task = None
     try:
-        # 预热失败不阻止 Web 服务启动；首个请求仍会按需创建并回退到 LocalShell。
+        # 所有环境只使用 PostgreSQL；缺少数据库时启动直接失败，避免写审计降级。
+        await asyncio.to_thread(setup_database)
+        from .agent_loader import agent_loader
+
+        await agent_loader.initialize()
+        # 先清扫上次进程遗留的孤儿容器，再补预热池。否则重启一次就多留一批
+        # 随机命名的暖容器，它们在内存里没有对应 entry，永远不会被空闲回收。
+        await asyncio.to_thread(sandbox_manager.prune_orphans)
+        # 预热失败不阻止 Web 服务启动；首个请求仍会按需创建。
         await asyncio.to_thread(sandbox_manager.ensure_warm_pool)
         maintenance_task = asyncio.create_task(
             _sandbox_maintenance(stop_event), name="sandbox-maintenance"
         )
+        reconciliation_task = asyncio.create_task(
+            WriteReconciler(
+                repository=agent_loader.write_audit_repository,
+                store=agent_loader.store,
+            ).run(stop_event),
+            name="write-reconciliation",
+        )
         yield
     finally:
-        web_logger.info("Shutting down AutoSupply Agent Web Server...")
+        web_logger.info("Shutting down ERP Agent Web Server...")
         stop_event.set()
         if maintenance_task is not None:
             maintenance_task.cancel()
             with suppress(asyncio.CancelledError):
                 await maintenance_task
+        if reconciliation_task is not None:
+            try:
+                await asyncio.wait_for(reconciliation_task, timeout=12)
+            except TimeoutError:
+                reconciliation_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await reconciliation_task
         # 不销毁已认领容器：Manager 会把 user → container 映射持久化，重启后可恢复。
-        await close_mongo_client()
+        await agent_loader.shutdown()
 
 
 app = FastAPI(
-    title="AutoSupply Agent",
-    description="面向新能源汽车整车制造的采购与供应链协同智能体 API",
+    title="DeepAgent 智能采购助手",
+    description="基于 Harness Engineering 架构的摩托车零部件采购智能助手 API",
     version="1.0.0",
     lifespan=lifespan,
 )
 
-# CORS 全开（开发环境）
+# CORS 白名单来自 CORS_ALLOW_ORIGINS。容器部署下前端与后端同源（都在 nginx
+# 后面），跨域不再发生，本项只服务直连后端本地开发的场景。
+# 不用 allow_credentials：本服务不依赖 cookie，而 "*" + credentials 是浏览器
+# 明确拒绝的非法组合。
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# Prometheus 指标：/metrics 端点由 instrumentator 自动挂载，暴露
+# http_request_duration_seconds / http_requests_total 等，供 Prometheus 抓取。
+# 指标路径不认证（Prometheus 从 data 网络内抓取，带不了 Basic Auth），
+# 但只暴露聚合计数，不含请求体或用户标识。
+#
+# 参数名必须与安装到的大版本对齐：requirements 是 >=7，pip 会解析到 8.x。
+# 8.x 没有 should_gauge（传了在构造期 TypeError，backend 直接起不来——CI 集成
+# 栈因此 unhealthy）；默认就不建 per-handler gauge，只输出按 handler 名分桶的
+# counter/histogram，基数由路由模板（而非实际 URL）控制。expose 的 OpenAPI
+# 开关叫 include_in_schema，不是 include_render_schema；tags 是 OpenAPI 的
+# List[str]，与 Prometheus relabel 无关（relabel 在 prometheus.yml 做）。
+from prometheus_fastapi_instrumentator import Instrumentator
+
+Instrumentator().instrument(app).expose(
+    app,
+    endpoint="/metrics",
+    include_in_schema=False,  # 不把 /metrics 写进 OpenAPI 文档，减少攻击面
 )
 
 # 注册路由
 app.include_router(chat_router)
 app.include_router(history_router)
+app.include_router(dingtalk_router)
+app.include_router(evaluation_router)
+app.include_router(write_audit_router)
 
-# 文件下载目录（图表等生成文件）
-DOWNLOAD_DIR = Path(__file__).resolve().parent.parent / "download"
-DOWNLOAD_DIR.mkdir(exist_ok=True)
-
-
-@app.get("/api/download/{filename}")
-async def download_file(filename: str):
-    """提供生成文件（图表PNG等）的HTTP下载"""
-    file_path = DOWNLOAD_DIR / filename
-    if not file_path.exists() or not file_path.is_file():
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail=f"文件不存在: {filename}")
+@app.get("/api/download/{file_id}/{filename}")
+async def download_file(
+    file_id: str,
+    filename: str,
+    user_id: str = Depends(current_user_id),
+):
+    """下载当前用户在 TTL 内保存的临时生成文件。"""
+    file_path = resolve_artifact(user_id, file_id, filename)
+    if file_path is None:
+        raise HTTPException(status_code=404, detail="文件不存在或已过期")
+    media_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
     return FileResponse(
         path=str(file_path),
-        filename=filename,
-        media_type="application/octet-stream",
+        filename=file_path.name,
+        media_type=media_type,
+        # 图片/PDF 可以直接嵌入对话预览；其他生成文件仍按附件下载。
+        content_disposition_type=(
+            "inline"
+            if media_type.startswith("image/") or media_type == "application/pdf"
+            else "attachment"
+        ),
     )
 
 
 @app.get("/")
 async def root():
-    return {"message": "AutoSupply Agent API", "version": "1.0.0"}
+    return {"message": "DeepAgent 智能采购助手 API", "version": "1.0.0"}
 
 
 @app.get("/health")
@@ -119,4 +194,6 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # workers 必须为 1：SandboxManager / sandbox_holder / AgentLoader 都是进程内
+    # 单例状态，多 worker 会各自认领同一个暖容器并互相覆盖持久化映射。
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1, proxy_headers=True)

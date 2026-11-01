@@ -1,6 +1,11 @@
-import { Conversation, ChatRequest, ResumeRequest } from "./types";
+import { ChatStateResponse, Conversation, ChatRequest, ResumeRequest } from "./types";
 
-const BASE_URL = "http://localhost:8000/api";
+// 默认相对路径：由 nginx 把 /api/ 反代到 backend，浏览器与 API 同源，
+// 既不用管 CORS，也不用为每个部署域名重新构建镜像。
+// NEXT_PUBLIC_ 前缀是必需的——这个模块在浏览器里执行，非 NEXT_PUBLIC_ 的
+// 变量会在客户端 bundle 里变成 undefined。
+export const BASE_URL =
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "/api";
 
 // ===== 对话 API =====
 export async function streamChat(
@@ -40,7 +45,8 @@ export async function resumeChat(
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(request),
+      // 后端路径已经包含 thread_id，ResumeRequest 的请求体字段名是 resume。
+      body: JSON.stringify({ resume: request.resume_data }),
       signal,
     }
   );
@@ -60,13 +66,15 @@ export async function resumeChat(
   }
 }
 
-export async function getChatState(threadId: string) {
+export async function getChatState(threadId: string): Promise<ChatStateResponse> {
   const res = await fetch(`${BASE_URL}/chat/${threadId}/state`);
   if (!res.ok) throw new Error(`State failed: ${res.status}`);
   return res.json();
 }
 
 // ===== 历史 API =====
+// 仅本机开发（AUTH_MODE=none）下生效。容器部署走 nginx Basic Auth，backend
+// 会用认证身份覆盖这个值并把它丢弃 —— 前端改它不会、也不能切到别人的会话。
 const USER_ID = "user-001";
 
 export async function getConversations(): Promise<Conversation[]> {

@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Sequence
 
-from .config import MemoryConfig, DEFAULT_MEMORY_CONFIG
+from .config import DEFAULT_MEMORY_CONFIG, MemoryConfig
 
 # ---------------------------------------------------------------- 关键词表
 
@@ -45,6 +45,18 @@ PREFERENCE_TRIGGERS = (
 
 # 祈使/指令性语境，配合关键词即可判定为偏好
 IMPERATIVE_HINTS = ("用", "输出", "展示", "生成", "画", "来", "给我", "按", "格式", "结算", "计价")
+
+_TEMPORARY_MARKERS = ("这次", "本次", "临时", "仅此")
+_CANCEL_MARKERS = (
+    "不要", "别用", "不用", "不想", "不喜欢", "不再", "不能", "无需",
+    "取消", "清除", "恢复默认", "不固定", "没有偏好", "don't", "do not",
+)
+_PREFERENCE_DOMAIN_HINTS = {
+    "preferred_chart_type": ("图表类型", "图形", "图"),
+    "preferred_output": ("输出格式", "固定格式", "格式"),
+    "preferred_currency": ("计价货币", "货币", "币种", "计价"),
+    "preferred_language": ("回复语言", "语言"),
+}
 
 _SUPPLIER_SPLIT_RE = re.compile(r"[，。；！？、,.;!?\s和及与()（）:：]+")
 _SUPPLIER_NAME_RE = re.compile(r"([\u4e00-\u9fffA-Za-z0-9]{2,12})(?:供应商|公司|厂家|集团)")
@@ -101,6 +113,36 @@ def _tool_name_of(message: Any) -> str:
     return str(name) if isinstance(name, str) else ""
 
 
+def _collect_tool_results(messages: Sequence[Any]) -> List[Dict[str, Any]]:
+    calls: Dict[str, dict] = {}
+    for message in messages:
+        for call in _tool_calls_of(message):
+            call_id = str(call.get("id") or "")
+            if call_id:
+                calls[call_id] = call
+
+    results: List[Dict[str, Any]] = []
+    for message in messages:
+        if _role_of(message) != "tool":
+            continue
+        call_id = str(getattr(message, "tool_call_id", "") or "")
+        call = calls.get(call_id)
+        status = getattr(message, "status", None)
+        if call is None or status not in ("success", "error"):
+            continue
+        args = dict(call.get("args") or {})
+        metadata = getattr(message, "additional_kwargs", None)
+        if isinstance(metadata, dict) and metadata.get("write_operation_id"):
+            args.setdefault("operation_id", str(metadata["write_operation_id"]))
+        results.append({
+            "tool": str(call.get("name") or _tool_name_of(message)),
+            "args": args,
+            "status": status,
+            "result": getattr(message, "content", None),
+        })
+    return results
+
+
 # ---------------------------------------------------------------- 偏好抽取
 
 def _has_trigger(text: str) -> bool:
@@ -132,6 +174,16 @@ def _pick(text: str, table: Dict[str, str], *, require_trigger: bool) -> Optiona
                 selected = table[keyword]
                 break
     return selected
+
+
+def _cancels_preference(text: str, table: Dict[str, str], field: str) -> bool:
+    """判断用户是否明确取消某类长期偏好，临时要求不改变长期记忆。"""
+    if any(marker in text for marker in _TEMPORARY_MARKERS):
+        return False
+    if not any(marker in text for marker in _CANCEL_MARKERS):
+        return False
+    hints = tuple(table) + _PREFERENCE_DOMAIN_HINTS.get(field, ())
+    return any(hint in text for hint in hints)
 
 
 def _extract_supplier_names(text: str) -> List[str]:
@@ -204,21 +256,19 @@ def extract_preferences(
             continue
         lowered = text.lower()
 
-        chart = _pick(lowered, CHART_KEYWORDS, require_trigger=False)
-        if chart:
-            updates["preferred_chart_type"] = chart
-
-        output = _pick(lowered, OUTPUT_KEYWORDS, require_trigger=False)
-        if output:
-            updates["preferred_output"] = output
-
-        currency = _pick(lowered, CURRENCY_KEYWORDS, require_trigger=False)
-        if currency:
-            updates["preferred_currency"] = currency
-
-        language = _pick(lowered, LANGUAGE_KEYWORDS, require_trigger=False)
-        if language:
-            updates["preferred_language"] = language
+        for field, table in (
+            ("preferred_chart_type", CHART_KEYWORDS),
+            ("preferred_output", OUTPUT_KEYWORDS),
+            ("preferred_currency", CURRENCY_KEYWORDS),
+            ("preferred_language", LANGUAGE_KEYWORDS),
+        ):
+            selected = _pick(lowered, table, require_trigger=False)
+            if selected:
+                updates[field] = selected
+            elif _cancels_preference(lowered, table, field):
+                # None 是明确的删除语义，不是“没有抽取到”。后续同一 thread
+                # 若再次出现肯定表达，按消息顺序自然覆盖该删除标记。
+                updates[field] = None
 
     # 最近查询：用户原话（去重、截断）
     recent_queries: List[str] = []
@@ -267,7 +317,7 @@ def summarize_episode(
     config: Optional[MemoryConfig] = None,
     thread_id: str = "",
 ) -> Dict[str, Any]:
-    """把一轮会话压成一条情节记忆。"""
+    """把当前 thread（一个完整业务任务）压成一条情节记忆。"""
     cfg = config or DEFAULT_MEMORY_CONFIG
     window = list(messages or [])
     if not window:
@@ -287,15 +337,8 @@ def summarize_episode(
                 outcome = text
                 break
 
-    tools: List[str] = []
-    for message in window:
-        for call in _tool_calls_of(message):
-            name = str(call.get("name") or "")
-            if name and name not in tools:
-                tools.append(name)
-        standalone = _tool_name_of(message)
-        if standalone and _role_of(message) == "tool" and standalone not in tools:
-            tools.append(standalone)
+    tool_results = _collect_tool_results(window)
+    tools = list(dict.fromkeys(result["tool"] for result in tool_results))
 
     limit = max(80, cfg.episode_summary_chars)
     summary_parts = []
@@ -312,10 +355,12 @@ def summarize_episode(
 
     return {
         "goal": goal[:200],
+        "outcome": outcome[:limit],
         "summary": summary,
         "task_type": task_type,
         "tags": tags,
         "tools": tools[:20],
+        "tool_results": tool_results,
         "turns": sum(1 for m in window if _role_of(m) in ("human", "user")),
         "thread_id": thread_id,
     }

@@ -1,24 +1,16 @@
 "use client";
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { v4 as uuidv4 } from "uuid";
 import { ChatMessage, ToolCallInfo, SSEEvent, InterruptData, TodoItem } from "@/lib/types";
 import { streamChat, resumeChat } from "@/lib/api";
 import { useSSE } from "./useSSE";
-import type { DispatchSpanView } from "@/components/chat/AgentDispatchTimeline";
 
+// 仅本机开发（AUTH_MODE=none）下生效；容器部署下 backend 用认证身份覆盖它。
 const USER_ID = "user-001";
 const USERNAME = "采购管理员";
 
 export type HarnessPhase = "idle" | "thinking" | "planning" | "executing" | "reviewing" | "done";
-
-function mapDispatchStatus(raw?: string): DispatchSpanView["status"] {
-  if (raw === "completed") return "completed";
-  if (raw === "timeout") return "timeout";
-  if (raw === "verification_failed") return "verification_failed";
-  if (raw === "error") return "error";
-  return "running";
-}
 
 export function useChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -33,12 +25,15 @@ export function useChat() {
   const [phase, setPhase] = useState<HarnessPhase>("idle");
   const [phaseLabel, setPhaseLabel] = useState("");
   const [pendingQueue, setPendingQueue] = useState<string[]>([]);
-  const [dispatchSpans, setDispatchSpans] = useState<DispatchSpanView[]>([]);
 
   const assistantMsgRef = useRef<string>("");
   const toolCallsRef = useRef<ToolCallInfo[]>([]);
   const currentToolIdRef = useRef<string>("");
   const pendingQueueRef = useRef<string[]>([]);
+  const doneReceivedRef = useRef(false);
+  // handleEvent 的生命周期比单次 render 长；通过 ref 始终调用使用当前
+  // threadId 的发送函数，避免新建/加载会话后把排队消息发回旧会话。
+  const doSendRef = useRef<(content: string) => void>(() => undefined);
 
   const resetAssistantState = useCallback(() => {
     assistantMsgRef.current = "";
@@ -133,53 +128,6 @@ export function useChat() {
           setPhaseLabel(event.label);
           break;
 
-        case "agent_dispatch": {
-          setDispatchSpans((prev) => {
-            const idx = prev.findIndex((s) => s.callId === event.call_id);
-            if (event.phase === "start") {
-              const next: DispatchSpanView = {
-                callId: event.call_id,
-                agent: event.agent || "subagent",
-                status: "running",
-                startedAt: event.started_at,
-              };
-              if (idx >= 0) {
-                const copy = [...prev];
-                copy[idx] = { ...copy[idx], ...next };
-                return copy;
-              }
-              return [...prev, next];
-            }
-            // end
-            const patch: Partial<DispatchSpanView> = {
-              status: mapDispatchStatus(event.status),
-              finishedAt: event.finished_at,
-              elapsedMs: event.elapsed_ms,
-              error: event.error || undefined,
-              agent: event.agent,
-              startedAt: event.started_at,
-            };
-            if (idx >= 0) {
-              const copy = [...prev];
-              copy[idx] = { ...copy[idx], ...patch, agent: patch.agent || copy[idx].agent };
-              return copy;
-            }
-            return [
-              ...prev,
-              {
-                callId: event.call_id,
-                agent: event.agent || "subagent",
-                status: mapDispatchStatus(event.status),
-                startedAt: event.started_at,
-                finishedAt: event.finished_at,
-                elapsedMs: event.elapsed_ms,
-                error: event.error || undefined,
-              },
-            ];
-          });
-          break;
-        }
-
         case "todo_update": {
           // 新格式：后端直接发送 todos 数组
           if (event.todos && Array.isArray(event.todos)) {
@@ -218,6 +166,7 @@ export function useChat() {
         }
 
         case "done":
+          doneReceivedRef.current = true;
           setStreaming(false);
           setPhase("done");
           setPhaseLabel("✅ 完成");
@@ -235,8 +184,14 @@ export function useChat() {
             const next = q.shift()!;
             setPendingQueue([...q]);
             // 延迟一帧发送，确保 streaming 状态已更新
-            setTimeout(() => doSend(next), 50);
+            setTimeout(() => doSendRef.current(next), 50);
           }
+          break;
+
+        case "error":
+          setError(event.message || "服务返回错误");
+          setThinking(false);
+          setStreaming(false);
           break;
       }
     },
@@ -250,6 +205,9 @@ export function useChat() {
       setStreaming(false);
     },
     onComplete: () => {
+      if (!doneReceivedRef.current) {
+        setError("连接在回答完成前中断，请重新发送或新建对话后重试。");
+      }
       setStreaming(false);
     },
   });
@@ -265,7 +223,7 @@ export function useChat() {
       setTodoVisible(false);
       setPhase("idle");
       setPhaseLabel("");
-      setDispatchSpans([]);
+      doneReceivedRef.current = false;
       resetAssistantState();
 
       const userMsg: ChatMessage = {
@@ -292,6 +250,9 @@ export function useChat() {
     },
     [threadId, start, resetAssistantState]
   );
+  useEffect(() => {
+    doSendRef.current = doSend;
+  }, [doSend]);
 
   const sendMessage = useCallback(
     (content: string) => {
@@ -315,6 +276,7 @@ export function useChat() {
       setInterrupted(false);
       setInterruptData(null);
       setStreaming(true);
+      doneReceivedRef.current = false;
       resetAssistantState();
 
       start((onChunk, signal) =>
@@ -335,23 +297,28 @@ export function useChat() {
     setInterrupted(false);
     setInterruptData(null);
     setError(null);
+    doneReceivedRef.current = false;
     setThreadId(uuidv4());
     setPendingQueue([]);
     pendingQueueRef.current = [];
-    setDispatchSpans([]);
     resetAssistantState();
   }, [abort, resetAssistantState]);
 
   const loadThread = useCallback(
-    (id: string, msgs: ChatMessage[]) => {
+    (id: string, msgs: ChatMessage[], restoredInterrupt: InterruptData | null = null) => {
       abort();
       setThreadId(id);
       setMessages(msgs);
       setStreaming(false);
-      setInterrupted(false);
-      setInterruptData(null);
-      setError(null);
-      setDispatchSpans([]);
+      setInterrupted(restoredInterrupt !== null);
+      setInterruptData(restoredInterrupt);
+      setError(
+        msgs.length === 0
+          ? "该会话上次在回答完成前中断，没有可恢复的展示消息；请新建对话后重试。"
+          : null
+      );
+      setPendingQueue([]);
+      pendingQueueRef.current = [];
       resetAssistantState();
     },
     [abort, resetAssistantState]
@@ -370,7 +337,6 @@ export function useChat() {
     pendingQueue,
     phase,
     phaseLabel,
-    dispatchSpans,
     sendMessage,
     resumeWith,
     newChat,

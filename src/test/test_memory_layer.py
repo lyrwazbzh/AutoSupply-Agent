@@ -1,6 +1,6 @@
 """三层记忆（HOT/WARM/COLD）的验证测试。
 
-设计原则：**不依赖 MongoDB、Docker、DeepSeek、langchain**，用内存假 Store 跑，
+设计原则：**不依赖 MongoDB、Docker、LLM API、langchain**，用内存假 Store 跑，
 所以 `python -m src.test.test_memory_layer` 在任何 Python 3.10+ 上都能跑通。
 
 覆盖：
@@ -8,7 +8,7 @@
 - 命名空间规范化
 - 双时态冲突消解（用户"改口"）
 - 分层归属（WARM / COLD 下沉）
-- 整合（情节归档幂等）
+- 整合（任务级情节归档幂等）
 - 遗忘（过期、超量、节流）
 - 检索相关性与排序
 - 容错（Store 报错不能抛到主流程）
@@ -27,12 +27,11 @@ from src.agent.memory import (
     MemoryItem,
     MemoryKeeper,
     episodic_ns,
+    scoring,
     semantic_ns,
 )
 from src.agent.memory import namespaces as ns
-from src.agent.memory import scoring
 from src.agent.memory.extractor import extract_preferences, summarize_episode
-from src.agent.memory.rewrite import rewrite_retrieval_query
 
 # ---------------------------------------------------------------- 测试脚手架
 
@@ -97,11 +96,21 @@ class FakeStore:
 class Msg:
     """最简消息替身，模拟 LangChain 消息的接口面。"""
 
-    def __init__(self, type_: str, content: str = "", tool_calls=None, name: Optional[str] = None):
+    def __init__(
+        self,
+        type_: str,
+        content: str = "",
+        tool_calls=None,
+        name: Optional[str] = None,
+        tool_call_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ):
         self.type = type_
         self.content = content
         self.tool_calls = tool_calls or []
         self.name = name
+        self.tool_call_id = tool_call_id
+        self.status = status
 
 
 def _iso(days_ago: float = 0.0) -> str:
@@ -260,6 +269,25 @@ def test_upsert_same_value_does_not_create_new_version():
 
 
 @test
+def test_cancel_preference_invalidates_active_semantic():
+    store = FakeStore()
+    keeper = MemoryKeeper(store, "u1")
+    keeper.merge_preferences({"preferred_output": "table"})
+
+    updates = extract_preferences([
+        Msg("human", "以后结果用表格"),
+        Msg("human", "以后不要固定输出格式"),
+    ])
+    assert updates["preferred_output"] is None, updates
+    keeper.merge_preferences(updates)
+
+    assert "preferred_output" not in keeper.load_preferences()
+    assert keeper.active_semantic("preferred_output") is None
+    history = keeper.semantic_history("preferred_output")
+    assert len(history) == 1 and history[0].is_invalidated(), history
+
+
+@test
 def test_warm_brief_excludes_invalidated():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1")
@@ -296,12 +324,12 @@ def test_old_episodes_demote_out_of_warm():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1", _cfg(warm_episode_days=7))
 
-    keeper.archive_episode("t-new", summary="新会话")
+    keeper.archive_episode("t-new", summary="新任务")
     fresh = keeper.get("episodic", "ep_t-new")
     fresh.created_at = _iso(1)
     keeper.put(fresh)
 
-    keeper.archive_episode("t-old", summary="老会话")
+    keeper.archive_episode("t-old", summary="老任务")
     old = keeper.get("episodic", "ep_t-old")
     old.created_at = _iso(30)
     keeper.put(old)
@@ -330,16 +358,64 @@ def test_episode_archive_is_idempotent():
 
 
 @test
+def test_episode_archive_updates_one_task_per_thread():
+    store = FakeStore()
+    keeper = MemoryKeeper(store, "u1")
+    keeper.archive_episode("t-1", summary="处理中")
+    keeper.archive_episode("t-1", summary="完成缺料分析")
+
+    episodes = keeper.list_items("episodic")
+    assert len(episodes) == 1
+    assert episodes[0].id == "ep_t-1"
+    assert episodes[0].summary == "完成缺料分析"
+
+
+@test
 def test_episode_summary_shape():
     messages = [
         Msg("human", "查询恒力机械的信用和供货能力"),
-        Msg("ai", "", tool_calls=[{"name": "supplier_page", "args": {}}]),
+        Msg("ai", "", tool_calls=[{
+            "id": "call-supplier-1",
+            "name": "supplier_page",
+            "args": {"supplier_id": "S001"},
+        }]),
+        Msg(
+            "tool",
+            '{"supplier_id":"S001","rating":"AA"}',
+            name="supplier_page",
+            tool_call_id="call-supplier-1",
+            status="success",
+        ),
         Msg("ai", "恒力机械信用评级 AA，交期最短。"),
     ]
     digest = summarize_episode(messages, thread_id="t-9")
     assert digest["task_type"] == "supplier", digest
+    assert digest["goal"] == "查询恒力机械的信用和供货能力", digest
+    assert digest["outcome"] == "恒力机械信用评级 AA，交期最短。", digest
     assert "恒力机械" in digest["summary"], digest
     assert "supplier_page" in digest["tools"], digest
+    assert digest["tool_results"][0]["status"] == "success", digest
+    assert digest["tool_results"][0]["args"]["supplier_id"] == "S001", digest
+
+
+@test
+def test_episode_summary_uses_full_thread():
+    messages = [
+        Msg("human", "分析缺料"),
+        Msg("ai", "", tool_calls=[{"id": "call-old", "name": "inventory_warning", "args": {}}]),
+        Msg("tool", "old", tool_call_id="call-old", status="success"),
+        Msg("ai", "缺料分析完成"),
+        Msg("human", "比较供应商"),
+        Msg("ai", "", tool_calls=[{"id": "call-new", "name": "supplier_page", "args": {}}]),
+        Msg("tool", "new", tool_call_id="call-new", status="success"),
+        Msg("ai", "供应商比较完成"),
+    ]
+
+    digest = summarize_episode(messages, thread_id="t-1")
+    assert digest["goal"] == "分析缺料", digest
+    assert digest["outcome"] == "供应商比较完成", digest
+    assert digest["tools"] == ["inventory_warning", "supplier_page"], digest
+    assert [item["result"] for item in digest["tool_results"]] == ["old", "new"], digest
 
 
 # ---------------------------------------------------------------- 遗忘
@@ -368,7 +444,7 @@ def test_forget_enforces_episode_cap():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1", _cfg(max_episodes=3))
     for index in range(5):
-        keeper.archive_episode(f"t-{index}", summary=f"会话 {index}")
+        keeper.archive_episode(f"t-{index}", summary=f"任务 {index}")
         item = keeper.get("episodic", f"ep_t-{index}")
         item.created_at = _iso(5 - index)  # t-0 最旧
         keeper.put(item)
@@ -459,70 +535,6 @@ def test_search_text_is_human_readable():
     text = keeper.search_text("供应商")
     assert text.startswith("检索到的历史记忆"), text
     assert "相关度" in text
-
-
-class _KeywordEmbedder:
-    """测试用：延误/催交/拖 与库存 两路正交向量。"""
-
-    _delay = [1.0, 0.0, 0.0]
-    _stock = [0.0, 1.0, 0.0]
-    _other = [0.0, 0.0, 1.0]
-
-    def embed_texts(self, texts):
-        out = []
-        for text in texts:
-            blob = text or ""
-            if any(token in blob for token in ("延误", "催交", "拖", "晚到")):
-                out.append(list(self._delay))
-            elif any(token in blob for token in ("库存", "预警", "盘点")):
-                out.append(list(self._stock))
-            else:
-                out.append(list(self._other))
-        return out
-
-
-@test
-def test_rewrite_fills_anaphora_from_context():
-    rewritten = rewrite_retrieval_query(
-        "那家靠不靠谱",
-        "近期任务：对比了恒力机械的交期与催交",
-    )
-    assert "恒力" in rewritten, rewritten
-
-
-@test
-def test_search_rewritten_query_hits_episode():
-    store = FakeStore()
-    keeper = MemoryKeeper(store, "u1")
-    keeper.archive_episode("t-1", summary="对比了恒力机械的交期，多次催交")
-    keeper.archive_episode("t-2", summary="生成了库存预警报表")
-
-    hits = keeper.search(
-        "那家货还要多久到",
-        context="近期任务：对比了恒力机械的交期，多次催交",
-    )
-    assert hits, "改写后应召回情节"
-    assert "恒力" in hits[0][0].summary, hits[0][0].summary
-
-
-@test
-def test_search_semantic_hits_colloquial_query():
-    store = FakeStore()
-    cfg = _cfg(min_retrieval_score=0.01)
-    keeper = MemoryKeeper(store, "u1", cfg, embedder=_KeywordEmbedder())
-    keeper.archive_episode("t-delay", summary="交期经常延误需要催交")
-    keeper.archive_episode("t-stock", summary="库存低于安全线预警")
-
-    hits = keeper.search("货老是拖着不来", context="本周交付情况")
-    assert hits, "口语问句应走向量召回延误情节"
-    assert "延误" in hits[0][0].summary or "催交" in hits[0][0].summary, hits[0][0].summary
-
-
-@test
-def test_text_channel_weights_are_lexical_heavy():
-    cfg = MemoryConfig()
-    assert cfg.weight_lexical == 0.7
-    assert cfg.weight_semantic == 0.3
 
 
 @test
@@ -627,7 +639,7 @@ def test_stats_reports_tier_distribution():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1", _cfg(warm_episode_days=7))
     keeper.upsert_semantic("preferred_chart_type", "pie")
-    keeper.archive_episode("t-1", summary="最近会话")
+    keeper.archive_episode("t-1", summary="最近任务")
     stats = keeper.stats()
     assert stats["total"] == 2, stats
     assert stats["warm"] == 2 and stats["cold"] == 0, stats

@@ -8,27 +8,31 @@
 1. SummarizationToolMiddleware  — 长对话自动压缩（大量数据分析时必备）
 2. ContextInjectionMiddleware   — 子Agent专用上下文注入
 3. SkillsSyncMiddleware         — 技能文件同步（子Agent执行代码时需要）
-4. SandboxCircuitBreakerMiddleware — 沙箱熔断器（防止子Agent陷入无限重试）
+4. ToolsSummarizationMiddleware — 大工具结果摘要监控
+5. SandboxCircuitBreakerMiddleware — 沙箱熔断器（防止子Agent陷入无限重试）
+
+ERPWriteMiddleware 由 main_agent 在工厂结果上追加，使 analyst/order 两条委派路径
+与主 Agent 直调共享同一套写治理仓储和审批策略。
 
 与主Agent中间件栈的关系：
 - 主Agent：7个自定义中间件 + 框架内置
-- 子Agent：4个精选中间件 + 框架内置（轻量化，聚焦子Agent任务）
+- 子Agent：5个精选中间件 + ERPWriteMiddleware + 框架内置
 """
 from pathlib import Path
+
 from deepagents.middleware import SummarizationToolMiddleware
 
 from .middlewares.context_injection import ContextInjectionMiddleware
-from .middlewares.skills_sync import SkillsSyncMiddleware
 from .middlewares.sandbox_breaker import SandboxCircuitBreakerMiddleware
+from .middlewares.skills_sync import SkillsSyncMiddleware
 from .middlewares.tools_summarization import ToolsSummarizationMiddleware
 from .schema import ProcurementContext
-
 
 # 技能目录
 SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
 
-def get_analyst_middleware(user_context: ProcurementContext | None = None) -> list:
+def get_analyst_middleware(sandbox_backend, user_context: ProcurementContext | None = None) -> list:
     """
     获取采购分析子Agent的中间件列表
 
@@ -48,17 +52,24 @@ def get_analyst_middleware(user_context: ProcurementContext | None = None) -> li
         ContextInjectionMiddleware(user_context=context),
 
         # 3. 技能同步（分析子Agent可能需要调用脚本）
-        SkillsSyncMiddleware(skills_dir=SKILLS_DIR),
+        SkillsSyncMiddleware(
+            skills_dir=SKILLS_DIR,
+            sandbox_backend=sandbox_backend,
+        ),
 
         # 4. 摘要监控（采购领域定制）
         ToolsSummarizationMiddleware(),
 
         # 5. 沙箱熔断器（连续失败时降级）
-        SandboxCircuitBreakerMiddleware(failure_threshold=3, recovery_timeout=60),
+        SandboxCircuitBreakerMiddleware(
+            sandbox_backend=sandbox_backend,
+            failure_threshold=3,
+            recovery_timeout=60,
+        ),
     ]
 
 
-def get_order_middleware(user_context: ProcurementContext | None = None) -> list:
+def get_order_middleware(sandbox_backend, user_context: ProcurementContext | None = None) -> list:
     """
     获取采购订单子Agent的中间件列表
 
@@ -77,17 +88,27 @@ def get_order_middleware(user_context: ProcurementContext | None = None) -> list
         ContextInjectionMiddleware(user_context=context),
 
         # 3. 技能同步
-        SkillsSyncMiddleware(skills_dir=SKILLS_DIR),
+        SkillsSyncMiddleware(
+            skills_dir=SKILLS_DIR,
+            sandbox_backend=sandbox_backend,
+        ),
 
         # 4. 摘要监控
         ToolsSummarizationMiddleware(),
 
         # 5. 沙箱熔断器
-        SandboxCircuitBreakerMiddleware(failure_threshold=3, recovery_timeout=60),
+        SandboxCircuitBreakerMiddleware(
+            sandbox_backend=sandbox_backend,
+            failure_threshold=3,
+            recovery_timeout=60,
+        ),
     ]
 
 
-def get_all_subagent_middlewares(user_context: ProcurementContext | None = None) -> dict:
+def get_all_subagent_middlewares(
+    sandbox_backend,
+    user_context: ProcurementContext | None = None,
+) -> dict:
     """
     获取所有子Agent的中间件配置（供 main_agent 统一加载）
 
@@ -95,8 +116,6 @@ def get_all_subagent_middlewares(user_context: ProcurementContext | None = None)
         {subagent_name: [middleware_list]}
     """
     return {
-        "supply-planning-analyst": get_analyst_middleware(user_context),
-        "delivery-collaboration": get_order_middleware(user_context),
-        "strategic-sourcing": get_order_middleware(user_context),
-        "supplier-quality-risk": get_analyst_middleware(user_context),
+        "procurement-analyst": get_analyst_middleware(sandbox_backend, user_context),
+        "procurement-order": get_order_middleware(sandbox_backend, user_context),
     }

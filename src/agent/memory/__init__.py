@@ -6,7 +6,7 @@
     COLD = 全部历史归档 / 程序记忆，按需检索（read_memory 工具）
 
 对外只需要两个东西：``MemoryKeeper``（读写门面）和 ``MemoryConfig``（参数）。
-本包**不依赖 langchain / pymongo**，可以独立测试。
+本包不依赖具体数据库驱动，可以独立测试。
 """
 from .config import DEFAULT_MEMORY_CONFIG, MemoryConfig
 from .keeper import MemoryKeeper
@@ -19,8 +19,14 @@ from .namespaces import (
     type_ns,
 )
 from .types import (
-    COLD, EPISODIC, HOT, PROCEDURAL, SEMANTIC, WARM,
-    MEMORY_TYPES, MemoryItem,
+    COLD,
+    EPISODIC,
+    HOT,
+    MEMORY_TYPES,
+    PROCEDURAL,
+    SEMANTIC,
+    WARM,
+    MemoryItem,
 )
 
 __all__ = [

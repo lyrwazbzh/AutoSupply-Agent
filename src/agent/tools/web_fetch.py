@@ -10,16 +10,15 @@ Skill 标准结构：
     requirements.txt  # 依赖（可选）
     assets/           # 资源文件（可选）
 """
-import os
-import re
-import io
 import base64
-import zipfile
+import io
+import re
 import tarfile
-import httpx
-import shutil
-import yaml
+import zipfile
 from pathlib import Path, PurePosixPath
+
+import httpx
+import yaml
 from langchain_core.tools import tool
 
 from ..config import skills_store_namespace
@@ -631,7 +630,8 @@ def _install_dependencies(skill_dir: Path):
                 "python3 -m pip install --no-cache-dir "
                 "--target /workspace/python-packages "
                 f"-r '{sandbox_req}' -q",
-                timeout=120,
+                # 用户 Skill 的依赖可能包含编译型包，120s 常常不够
+                timeout=300,
             )
             # 清理沙箱临时文件
             sandbox.execute(f"rm -f {sandbox_req}")

@@ -1,8 +1,19 @@
 # ============ 环境变量（含 API Key，严禁提交） ============
 .env
 .env.*
+# 任何位置的 *.env（deploy/nginx.env、deploy/dr/backup.env…）。上面两条只挡
+# 根目录与「点开头」的形态，挡不住 deploy/dr/backup.env 这种 —— 而它装着 OSS
+# 的 AccessKey。宁可多挡一层：.env 这类文件一旦进历史，删文件是不够的。
+*.env
 !.env.example
 !.env.sample
+
+# ============ 本机便携运行时与历史数据库数据（不入库） ============
+.tools/
+.runtime/
+.mongo-data/
+.mongo-log/
+postgres-data/
 
 # ============ Python ============
 __pycache__/
@@ -30,14 +41,46 @@ out/
 *.tsbuildinfo
 next-env.d.ts
 
-# ============ 生成文件 / 下载目录 ============
-src/download/
+# ============ 发布状态 ============
+# deploy/cd/state/ 是「这台机器当前跑的是哪一版」的真值源，只对本机有意义。
+# 它同时是回滚的依据，被同步覆盖会让回滚指向错误的版本。
+deploy/cd/state/
+
+# ============ 认证凭据 ============
+# nginx Basic Auth 的密码哈希
+deploy/nginx/htpasswd
+# TLS 证书（bootstrap.sh 生成：certbot 真证书或 openssl 自签）
+deploy/nginx/tls/
+# Prometheus / Grafana 持久化数据（运行时生成，不属于源码树）
+deploy/prometheus/data/
+deploy/grafana/data/
+# CI 集成 job 的一次性口令（deploy/ci/prepare-stack.sh 生成，含 Basic Auth 明文）。
+# 只在 runner 上存在几十分钟，但它形态上和真凭据没有区别，不给自己留例外。
+deploy/ci/.ci-credentials.sh
+# smoke-edge.sh 负向验证期间对 nginx.env 的临时备份，以及 prepare-stack.sh 的备份
+deploy/nginx.env.smoke-backup
+deploy/.env.bak.*
+deploy/nginx.env.bak.*
+# nginx ↔ backend 共享密钥。deploy/set_internal_token.sh 会把真实值同时写进
+# 这里和 deploy/.env，所以不能入库 —— 仓库里只留 deploy/nginx.env.example 模板。
+deploy/nginx.env
+
+# ============ 临时脚本 ============
+/tmp/
 
 # ============ 日志 ============
 *.log
 
+# ============ 本地运维脚本（不入库） ============
+# 直推发布链路的本地脚本：含部署机路径等运维细节，不进 public 仓库。
+# 本地与部署机各持一份；部署机侧放在 rsync 同步范围之外（见 README「直推发布」）。
+/scripts/
+/deploy/cd/push-deploy.sh
+/deploy/cloud/post-receive.hook
+
 # ============ IDE / 系统 ============
 .vscode/
 .idea/
+.trae/
 .DS_Store
 Thumbs.db

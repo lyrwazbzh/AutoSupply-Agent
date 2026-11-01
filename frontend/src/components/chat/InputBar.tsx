@@ -14,13 +14,16 @@ export default function InputBar({ onSend, disabled, queued = 0 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const handleSend = useCallback(() => {
-    if (!input.trim() || disabled) return;
+    // 生成期间仍允许提交；useChat 会把消息放进 pendingQueue，等当前轮
+    // 收到 done 后按顺序发送。此前这里直接 return，导致“会自动排队”的
+    // 提示与实际行为相反，长耗时分析期间也就无法继续追问。
+    if (!input.trim()) return;
     onSend(input);
     setInput("");
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
-  }, [input, disabled, onSend]);
+  }, [input, onSend]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -64,7 +67,7 @@ export default function InputBar({ onSend, disabled, queued = 0 }: Props) {
           </button>
         </div>
         <p className="text-center text-[11px] text-gray-400 mt-2">
-          AutoSupply Agent · Harness Engineering · Shift+Enter 换行
+          DeepAgent 智能采购助手 · 基于 Harness Engineering 架构 · Shift+Enter 换行
         </p>
       </div>
     </div>

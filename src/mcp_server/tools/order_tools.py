@@ -3,8 +3,10 @@
 order_create / order_update / order_page / order_get / order_search_details / order_statistics
 """
 import json
-from typing import Optional
+
+import httpx
 from fastmcp import FastMCP
+
 from ..http_base import erp_client
 
 
@@ -12,7 +14,7 @@ def register_order_tools(mcp: FastMCP):
     """注册采购订单管理工具到 MCP Server"""
 
     @mcp.tool()
-    async def order_create(order_data: str) -> str:
+    async def order_create(order_data: str, operation_id: str = None) -> str:
         """创建采购订单。
 
         Args:
@@ -39,11 +41,50 @@ def register_order_tools(mcp: FastMCP):
             data = json.loads(order_data) if isinstance(order_data, str) else order_data
         except json.JSONDecodeError as e:
             return json.dumps({"code": 400, "message": f"JSON解析失败: {e}", "data": None}, ensure_ascii=False)
-        result = await erp_client.post("/api/orders/create", json_data=data)
+        headers = None
+        if operation_id:
+            data.setdefault("operationId", operation_id)
+            data.setdefault("idempotencyKey", operation_id)
+            headers = {"X-Operation-Id": operation_id, "Idempotency-Key": operation_id}
+        try:
+            result = await erp_client.post(
+                "/api/orders/create", json_data=data, headers=headers
+            )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            # 请求可能已被 ERP 接收，绝不能把超时直接当成“未创建”并盲重试。
+            idem = data.get("idempotencyKey") or data.get("idempotency_key")
+            if idem:
+                try:
+                    lookup = await erp_client.get(
+                        "/api/orders/by-idempotency",
+                        params={"idempotencyKey": idem},
+                    )
+                    if lookup.get("code") == 200:
+                        lookup["message"] = "建单响应不确定，已通过幂等键回查确认"
+                        return json.dumps(lookup, ensure_ascii=False, indent=2)
+                except (httpx.TimeoutException, httpx.NetworkError):
+                    pass
+            result = {
+                "code": 202,
+                "message": f"ERP 响应不确定，禁止自动重试，请按幂等键回查: {exc}",
+                "data": {"idempotencyKey": idem, "operationStatus": "UNKNOWN"},
+            }
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     @mcp.tool()
-    async def order_update(id: int, order_data: str) -> str:
+    async def order_get_by_idempotency(idempotency_key: str) -> str:
+        """按业务幂等键回查订单，用于建单超时后的安全确认。"""
+
+        result = await erp_client.get(
+            "/api/orders/by-idempotency",
+            params={"idempotencyKey": idempotency_key},
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    @mcp.tool()
+    async def order_update(
+        id: int, order_data: str, operation_id: str = None
+    ) -> str:
         """更新采购订单。
 
         Args:
@@ -57,7 +98,13 @@ def register_order_tools(mcp: FastMCP):
             data = json.loads(order_data) if isinstance(order_data, str) else order_data
         except json.JSONDecodeError as e:
             return json.dumps({"code": 400, "message": f"JSON解析失败: {e}", "data": None}, ensure_ascii=False)
-        result = await erp_client.put(f"/api/orders/update/{id}", json_data=data)
+        headers = None
+        if operation_id:
+            data.setdefault("operationId", operation_id)
+            headers = {"X-Operation-Id": operation_id, "Idempotency-Key": operation_id}
+        result = await erp_client.put(
+            f"/api/orders/update/{id}", json_data=data, headers=headers
+        )
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     @mcp.tool()
@@ -152,7 +199,9 @@ def register_order_tools(mcp: FastMCP):
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     @mcp.tool()
-    async def order_update_status(id: int, status: int) -> str:
+    async def order_update_status(
+        id: int, status: int, operation_id: str = None
+    ) -> str:
         """更新订单状态。
 
         Args:
@@ -162,7 +211,13 @@ def register_order_tools(mcp: FastMCP):
         Returns:
             操作结果JSON
         """
+        params = {"status": status, "operationId": operation_id}
+        headers = (
+            {"X-Operation-Id": operation_id, "Idempotency-Key": operation_id}
+            if operation_id
+            else None
+        )
         result = await erp_client.patch(
-            f"/api/orders/update-status/{id}", params={"status": status}
+            f"/api/orders/update-status/{id}", params=params, headers=headers
         )
         return json.dumps(result, ensure_ascii=False, indent=2)

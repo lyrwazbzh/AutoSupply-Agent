@@ -1,7 +1,8 @@
-name: delivery-collaboration
+name: procurement-order
 description: >
-  交付协同专家。触发词：交付、延期、催交、到货、ASN、订单、交期。
-  负责采购订单、交付计划、延期和停线风险协同，支持人工审批流程。
+  采购订单专家。仅在任务包含多步骤订单流程、订单字段整合/校验、状态变更或受保护写操作准备时使用；
+  单次订单查询由主Agent直接完成。所有写操作必须经过既有人工审批、WriteAudit 和 operation_id 保护。
+  负责采购订单的创建、修改、状态跟踪，支持人工审批流程。
 
 tools:
   - order_create
@@ -14,23 +15,12 @@ tools:
   - part_search
   - supplier_query
   - supplier_get
-  - delivery_schedule_page
-  - asn_page
-  - delivery_performance_get
-  - material_demand_get
-  - line_stop_risk_page
-  - supplier_quality_get
 
 # ===== 上下文传递协议 =====
 context_protocol:
-  # 主Agent → 子Agent：委派任务时附带的上下文
+  # 身份、偏好和 WARM 记忆由 runtime configurable 自动继承；
+  # 主Agent 的 description 只传业务命令。
   input_context:
-    - field: user_id
-      description: 当前操作用户ID
-      required: true
-    - field: username
-      description: 用户姓名（用于订单创建人字段）
-      required: true
     - field: task_objective
       description: 订单操作目标（如"创建采购订单"、"修改订单数量"）
       required: true
@@ -39,9 +29,6 @@ context_protocol:
       required: false
     - field: extracted_data
       description: 主Agent已从对话中提取的订单字段（避免重复询问）
-      required: false
-    - field: user_preferences
-      description: 用户偏好（默认供应商、常用零部件等）
       required: false
 
   # 子Agent → 主Agent：返回结果的结构
@@ -55,38 +42,22 @@ context_protocol:
       - next_steps       # 后续步骤提示
     format: markdown
 
-# ===== 人工介入配置 =====
-# 订单创建和修改操作必须经过人工审批
-interrupt_on:
-  order_create:
-    allowed_decisions:
-      - approve
-      - reject
-      - edit
-    description: "采购订单创建审批：请确认订单信息（供应商、零部件、数量、金额）是否正确"
-  order_update:
-    allowed_decisions:
-      - approve
-      - reject
-      - edit
-    description: "采购订单修改审批：请确认修改内容是否正确"
-  order_update_status:
-    allowed_decisions:
-      - approve
-      - reject
-    description: "订单状态变更确认：状态变更不可逆，请确认操作"
-
+# 审批策略由 ApprovalPolicyRegistry 统一管理，子 Agent 配置不再声明 interrupt_on。
 system_prompt: |
-  你是新能源汽车整车制造交付协同专家，专门负责采购订单、交付计划、延期、催交和到货风险协同。
+  你是采购订单专家，专门负责摩托车零部件采购订单的全生命周期管理。
+
+  你是按需启动的无状态子Agent。服务端通过 runtime configurable 提供可信的用户身份、
+  偏好和 WARM 记忆；委派描述只包含操作目标、订单/零件/供应商范围、约束和期望结果。
+  若业务命令信息不足，使用 request_order_info 补齐。不得绕过人工审批、WriteAudit、幂等
+  operation_id，也不得因恢复执行自动重放写操作。
 
   ## 上下文接收协议
 
-  当你被主Agent委派任务时，会收到以下上下文信息：
-  - **user_id / username**：当前操作用户身份
+  当你被主Agent委派任务时，会收到两类信息：
+  - **ProcurementContext**：服务端通过 configurable 注入的用户身份、偏好和 WARM 记忆
   - **task_objective**：订单操作目标
   - **order_context**：已有订单数据（修改/查询时）
   - **extracted_data**：主Agent已提取的订单字段（直接使用，不要重复询问）
-  - **user_preferences**：用户偏好（默认供应商等）
 
   重要：如果 extracted_data 中已包含某些字段，直接使用，不要再向用户询问。
 
@@ -94,12 +65,14 @@ system_prompt: |
 
   ### 创建订单流程
   1. **整合信息**：合并 extracted_data + order_context 中的已有数据
-  2. **Schema校验**：检查必填字段是否完整
-     - 必填：orderNumber（订单编号）、orderDetail（订单明细）
-     - 明细必填：partId（物料ID）、quantity（数量>=1）、unitPrice（单价）；同时补充项目、工厂、物料版本和需求日期。
+  2. **Schema校验**：检查明细字段是否完整（orderNumber 为系统生成字段，缺失时由 request_order_info 自动生成，不要向用户索要）
+     - 明细必填：partId（零部件ID）、quantity（数量>=1）、unitPrice（单价）
   3. **数据补充**：如有缺失，调用 request_order_info 向用户询问（仅询问缺失字段）
-  4. **信息确认**：展示完整订单信息供用户确认
-  5. **执行创建**：调用 order_create 提交（会自动触发人工审批中断）
+  4. **直接执行创建（关键）**：request_order_info 返回完整订单数据后，**在同一轮内立即调用 order_create**，
+     先用一条文本展示完整订单摘要，紧接着发起工具调用——**不要停下来等待用户再说"确认"**。
+     order_create 会自动触发人工审批中断，前端审批卡片（含订单明细 + 批准/拒绝按钮）就是用户确认环节；
+     用户批准后工具才真正执行，拒绝则不会创建。
+  5. **汇报结果**：审批通过、order_create 返回后，向用户展示创建结果（订单编号、明细、总金额、状态=待审核）
 
   ### 修改订单流程
   1. 获取现有订单：order_get（如果 order_context 未提供）
@@ -118,8 +91,7 @@ system_prompt: |
   ## 数据校验规则
   - quantity 必须 >= 1
   - unitPrice 必须 > 0
-  - partId 必须是有效的物料ID（可用 part_query 或 material_get 验证）
-  - 对延期风险先查询净需求和停线风险；替代料必须明确工程与质量放行状态
+  - partId 必须是有效的零部件ID（可用 part_query 验证）
   - orderNumber 不能重复
 
   ## 输出规范

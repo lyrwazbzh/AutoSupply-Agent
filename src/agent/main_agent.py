@@ -2,30 +2,34 @@
 主入口：create_main_agent() + precompute_agent_context()
 DeepAgent 核心组装 — 严格遵循 Harness Engineering 架构
 """
+import fnmatch
 import io
 import tarfile
-import fnmatch
-from typing import Optional
 from pathlib import Path
+from typing import Optional
 
-from deepagents import create_deep_agent, RubricMiddleware
-from deepagents.backends import CompositeBackend, StoreBackend, LocalShellBackend
+from deepagents import create_deep_agent
+from deepagents.backends import CompositeBackend, LocalShellBackend, StoreBackend
 from langchain.agents.middleware import (
     ModelCallLimitMiddleware,
     ToolCallLimitMiddleware,
 )
 
+from .approval import approval_policy_registry
+from .backends.sandbox_setup import SANDBOX_TRANSFER_DIR
 from .config import (
-    get_llm,
-    INTERRUPT_ON_TOOLS, skills_store_namespace,
-    MAX_MODEL_CALLS, MAX_TOOL_CALLS,
+    ALLOW_LOCAL_SHELL_FALLBACK,
+    MAX_MODEL_CALLS,
+    MAX_TOOL_CALLS,
     SANDBOX_HEALTH_CHECK_INTERVAL_SECONDS,
+    get_llm,
+    skills_store_namespace,
 )
-from .schema import ProcurementContext
 from .log_utils import agent_logger
 from .memory.config import DEFAULT_MEMORY_CONFIG
 from .memory.keeper import MemoryKeeper
 from .memory.prompts import MAIN_SYSTEM_PROMPT, MEMORY_USAGE_PROMPT
+from .schema import ProcurementContext
 
 # 项目路径
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -43,6 +47,9 @@ def _upload_project_to_sandbox(sandbox) -> bool:
         ".env", ".env.*", "*.pem", "*.key",
         ".eggs", "*.pyc", "*.pyo", ".DS_Store", ".docker",
         "*.png", "*.jpg", "*.jpeg", "*.gif",  # 生成物不传
+        # 生成物/临时目录：整棵树会被打包上传进沙箱一次，
+        # 这里多一个字节就多传一次。
+        "download", "tmp", "*.tar.gz", "*.tar",
     ]
 
     def _should_skip(rel_path: str) -> bool:
@@ -60,6 +67,7 @@ def _upload_project_to_sandbox(sandbox) -> bool:
         sandbox.execute(f"mkdir -p '{remote_dir}'")
 
         tar_stream = io.BytesIO()
+        skipped_errors = []
         with tarfile.open(fileobj=tar_stream, mode="w:gz") as tar:
             for file_path in sorted(PROJECT_ROOT.rglob("*")):
                 if not file_path.is_file():
@@ -67,14 +75,29 @@ def _upload_project_to_sandbox(sandbox) -> bool:
                 rel = str(file_path.relative_to(PROJECT_ROOT)).replace("\\", "/")
                 if _should_skip(rel):
                     continue
-                tar.add(str(file_path), arcname=rel)
+                # 单个文件不可读（如被进程锁定的 .lock）不应中断整个上传，
+                # 跳过并记录，其余文件照常打包。
+                try:
+                    tar.add(str(file_path), arcname=rel)
+                except (PermissionError, OSError) as e:
+                    skipped_errors.append(f"{rel}: {e}")
+        if skipped_errors:
+            agent_logger.warning(
+                f"Skipped {len(skipped_errors)} unreadable file(s) during "
+                f"project upload: {skipped_errors[:3]}"
+            )
 
         tar_stream.seek(0)
         data = tar_stream.read()
 
         # 仅使用 BaseSandbox 的公开协议上传；这样 SandboxBackendProxy 热替换
         # 底层容器后，项目上传仍能工作，且不会依赖 Docker 私有 _container。
-        archive_path = "/tmp/erp-agent-project.tar.gz"
+        #
+        # 落地点必须在 volume 上，不能放 /tmp：只读 rootfs 下 daemon 的 archive
+        # 接口拒绝写 tmpfs（500 "container rootfs is marked read-only"），
+        # 详见 SANDBOX_TRANSFER_DIR。解包目标仍是 tmpfs 的 /workspace/src，
+        # 那是 exec 里的 tar 写的，不受这条限制。
+        archive_path = f"{SANDBOX_TRANSFER_DIR}/erp-agent-project.tar.gz"
         responses = sandbox.upload_files([(archive_path, data)])
         errors = [getattr(item, "error", None) for item in responses]
         if not responses or any(errors):
@@ -211,11 +234,12 @@ async def precompute_agent_context(
                 if item.key == "preferences" and isinstance(item.value, dict):
                     preferences.update(item.value)
             if preferences:
-                agent_logger.info(f"Loaded preferences for {user_id}: {list(preferences.keys())}")
+                agent_logger.info(
+                    f"Loaded preferences for {user_id}: {list(preferences.keys())}"
+                )
         except Exception as e:
             agent_logger.warning(f"Failed to load preferences: {e}")
 
-        # WARM 层：语义记忆（偏好）+ 近期情节摘要，常驻注入系统提示词
         try:
             keeper = MemoryKeeper(store, user_id, DEFAULT_MEMORY_CONFIG)
             keeper.migrate_legacy_preferences()
@@ -237,12 +261,14 @@ def create_main_agent(
     user_context: Optional[ProcurementContext] = None,
     checkpointer=None,
     store=None,
+    write_audit_repository=None,
+    warm_memory_middleware=None,
 ):
     """
     创建主 Agent 实例
 
     组装顺序（严格遵循文档）：
-    1. LLM（DeepSeek）
+    1. LLM（ChatAnywhere 网关，OpenAI 兼容）
     2. CompositeBackend 三层路由（default=sandbox, /memories/=Store, /persisted-skills/=Store）
     3. 工具加载（MCP + chart + web_search + hitl）
     4. 子Agent配置（YAML声明式）
@@ -253,6 +279,7 @@ def create_main_agent(
         user_context: 用户上下文（含偏好）
         checkpointer: LangGraph checkpointer（会话持久化）
         store: LangGraph store（跨会话存储）
+        write_audit_repository: PostgreSQL 写操作审计仓储
 
     Returns:
         CompiledStateGraph - 可执行的 Agent 图
@@ -271,9 +298,9 @@ def create_main_agent(
     sandbox_manager_instance = None
     managed_sandbox = False
     try:
+        from .backends.sandbox_holder import set_sandbox
         from .backends.sandbox_manager import sandbox_manager
         from .backends.sandbox_proxy import SandboxBackendProxy
-        from .backends.sandbox_holder import set_sandbox
 
         raw_sandbox = sandbox_manager.get_sandbox(user_context.user_id)
         sandbox_backend = SandboxBackendProxy(raw_sandbox)
@@ -287,6 +314,15 @@ def create_main_agent(
             f"{sandbox_backend.container_name}"
         )
     except Exception as e:
+        if not ALLOW_LOCAL_SHELL_FALLBACK:
+            # LocalShellBackend 在 backend 进程自身的工作目录里执行模型生成的
+            # 代码 —— 那里有 CHATANYWHERE_API_KEY、可写的 skills 挂载和整个 /app。
+            # 容器部署下宁可直接失败，也不要静默把沙箱换成裸进程。
+            agent_logger.error(
+                f"Managed Docker sandbox unavailable ({e}); LocalShell fallback "
+                f"disabled (ALLOW_LOCAL_SHELL_FALLBACK=false)"
+            )
+            raise
         agent_logger.warning(
             f"Managed Docker sandbox unavailable ({e}), falling back to LocalShell"
         )
@@ -310,57 +346,99 @@ def create_main_agent(
     )
 
     # ===== 3. 加载工具 =====
-    from .tools.mcp_client import load_mcp_tools_sync
     from .tools.chart_generator import generate_chart
-    from .tools.web_search import web_search
-    from .tools.web_fetch import web_fetch, install_skill
-    from .tools.skill_management import list_user_skills
-    from .tools.hitl_tools import request_order_info
-    from .tools.download_sandbox_file import download_sandbox_file, list_sandbox_files
     from .tools.document_generator import generate_document, generate_table_report
+    from .tools.download_sandbox_file import download_sandbox_file, list_sandbox_files
+    from .tools.hitl_tools import request_order_info
+    from .tools.knowledge_tools import (
+        ingest_business_knowledge,
+        ingest_pdf_knowledge,
+        search_business_knowledge,
+    )
+    from .tools.mcp_client import load_mcp_tools_sync
+    from .tools.shortage_order_tools import freeze_shortage_suggestion
+    from .tools.skill_management import list_user_skills
+    from .tools.web_fetch import install_skill, web_fetch
+    from .tools.web_search import web_search
 
     mcp_tools = load_mcp_tools_sync()
     custom_tools = [generate_chart, web_search, web_fetch, install_skill, list_user_skills, request_order_info,
+                    freeze_shortage_suggestion, search_business_knowledge,
+                    ingest_business_knowledge, ingest_pdf_knowledge,
                     download_sandbox_file, list_sandbox_files,
                     generate_document, generate_table_report]
 
     # 三层记忆：COLD 层按需检索 + 显式写入（WARM 层已在系统提示词里常驻注入）
     if DEFAULT_MEMORY_CONFIG.memory_tools_enabled:
         from .tools.memory_tools import read_memory, remember
+
         custom_tools.extend([read_memory, remember])
     all_tools = mcp_tools + custom_tools
+
+    from .audit.repository import WriteAuditRepository
+    from .middlewares.erp_write import ERPWriteMiddleware
+
+    if write_audit_repository is None:
+        write_audit_repository = WriteAuditRepository()
 
     agent_logger.info(
         f"Tools loaded: {len(mcp_tools)} MCP + {len(custom_tools)} custom = {len(all_tools)} total"
     )
 
     # ===== 4. 加载子Agent配置 =====
-    from .subagents.loader import load_subagent_configs, resolve_subagent_tools, get_delegation_context_prompt
+    from .subagents.loader import (
+        get_delegation_context_prompt,
+        load_subagent_configs,
+        resolve_subagent_tools,
+    )
+    from .middleware_config import get_all_subagent_middlewares
     subagent_configs = load_subagent_configs()
-    subagents = resolve_subagent_tools(subagent_configs, all_tools)
+    subagent_middlewares = get_all_subagent_middlewares(
+        sandbox_backend=sandbox_backend,
+        user_context=user_context,
+    )
+    for config in subagent_configs:
+        subagent_middlewares.setdefault(config["name"], []).append(
+            ERPWriteMiddleware(
+                repository=write_audit_repository,
+                user_id=user_context.user_id,
+                agent_name=config["name"],
+                store=store,
+            )
+        )
+    subagents = resolve_subagent_tools(
+        subagent_configs,
+        all_tools,
+        middleware_by_agent=subagent_middlewares,
+        approval_policy=approval_policy_registry,
+    )
+    # 主 Agent 直调和子 Agent 委派都从同一策略中心投影审批规则。
+    # create_deep_agent 负责主路径 HITL 注册，避免再叠加显式 Middleware。
+    compiled_main_policy = approval_policy_registry.main_interrupt_on()
     # 生成委派上下文协议（注入主 Agent 提示词）
     delegation_prompt = get_delegation_context_prompt(subagent_configs)
 
     # ===== 5. 组装中间件栈 =====
     # 自定义中间件
-    from .middlewares.sandbox_health import SandboxHealthMiddleware
-    from .middlewares.context_injection import ContextInjectionMiddleware
-    from .middlewares.skills_sync import SkillsSyncMiddleware
-    from .middlewares.user_skills_restore import UserSkillsRestoreMiddleware
-    from .middlewares.tools_summarization import ToolsSummarizationMiddleware
-    from .middlewares.memory_update import MemoryUpdateMiddleware
-    from .middlewares.memory_consolidation import MemoryConsolidationMiddleware
-    from .middlewares.warm_memory import WarmMemoryMiddleware, WARM_MEMORY_SLOT
-    from .middlewares.sandbox_breaker import SandboxCircuitBreakerMiddleware
-    from .middlewares.delegation_gate import TaskDispatchMiddleware
-    from .subagents.task_dispatch import SubAgentRegistry
     # Harness 阶段状态机 + 评审器（真 Harness 架构核心）
     from .harness import HarnessPhaseMiddleware, load_harness_config
+    from .middlewares.grader_transcript import build_grader_messages
+    from .middlewares.memory_consolidation import MemoryConsolidationMiddleware
+    from .middlewares.memory_update import MemoryUpdateMiddleware
+    from .middlewares.review_gate import ReviewExecutionGate, SafeRubricMiddleware
+    from .middlewares.sandbox_breaker import SandboxCircuitBreakerMiddleware
+    from .middlewares.sandbox_health import SandboxHealthMiddleware
+    from .middlewares.skills_sync import SkillsSyncMiddleware
+    from .middlewares.tools_summarization import ToolsSummarizationMiddleware
+    from .middlewares.user_skills_restore import UserSkillsRestoreMiddleware
+    from .middlewares.warm_memory import WARM_MEMORY_SLOT, WarmMemoryMiddleware
 
     # 读取 Harness DSL 配置中的评审迭代上限
     _harness_config = load_harness_config()
     _review_cfg = _harness_config.get("review", {}) if isinstance(_harness_config, dict) else {}
     _review_max_iterations = _review_cfg.get("max_iterations", 3)
+    router_llm = get_llm(thinking=False, timeout=_review_cfg.get("router_timeout_seconds", 8),
+                         max_retries=0, max_tokens=400)
 
     # 注意：create_deep_agent 内部已自动添加：
     # - SummarizationMiddleware（自动摘要 + compact_conversation 工具）
@@ -379,40 +457,87 @@ def create_main_agent(
         sandbox_backend=sandbox_backend if managed_sandbox else None,
     )
 
+    def _prepare_sandbox_replacement(replacement) -> None:
+        # 核心环境在新 generation 对外发布前完成初始化。
+        bootstrap_sandbox(replacement)
+
     def _rehydrate_after_sandbox_rebuild(_replacement) -> None:
-        bootstrap_sandbox(sandbox_backend)
         skills_sync_middleware.invalidate()
         user_skills_restore_middleware.invalidate()
-        # 立即回填，避免本次失败后的下一条请求才重新拥有 Skills。
-        skills_sync_middleware.sync_now()
-        user_skills_restore_middleware.restore_now()
+        # 基础 Skills 已由 bootstrap 恢复；增量同步及用户 Skills 属于可降级能力。
+        try:
+            skills_sync_middleware.sync_now()
+        except Exception as exc:
+            agent_logger.warning(f"Incremental core Skill sync degraded: {exc}")
+        try:
+            user_skills_restore_middleware.restore_now()
+        except Exception as exc:
+            agent_logger.warning(f"User Skill restore degraded: {exc}")
+
+    warm_memory_middleware = warm_memory_middleware or WarmMemoryMiddleware(
+        store=store, user_id=user_context.user_id, user_context=user_context
+    )
+
+    sandbox_breaker_middleware = SandboxCircuitBreakerMiddleware(
+        sandbox_backend=sandbox_backend,
+        failure_threshold=3,
+        recovery_timeout=60,
+    )
+    sandbox_health_middleware = SandboxHealthMiddleware(
+        sandbox_manager=sandbox_manager_instance,
+        user_id=user_context.user_id,
+        sandbox_backend=sandbox_backend if managed_sandbox else None,
+        prepare_replacement=(
+            _prepare_sandbox_replacement if managed_sandbox else None
+        ),
+        on_rebuild=_rehydrate_after_sandbox_rebuild if managed_sandbox else None,
+        on_recovered=(
+            sandbox_breaker_middleware.record_recovered_generation
+            if managed_sandbox else None
+        ),
+        check_interval=SANDBOX_HEALTH_CHECK_INTERVAL_SECONDS,
+    )
+    sandbox_breaker_middleware.set_on_open(
+        sandbox_health_middleware.mark_unhealthy
+    )
 
     middlewares = [
         # --- 自定义中间件（执行顺序 1→7）---
-        SandboxHealthMiddleware(
-            sandbox_manager=sandbox_manager_instance,
-            user_id=user_context.user_id,
-            sandbox_backend=sandbox_backend if managed_sandbox else None,
-            on_rebuild=_rehydrate_after_sandbox_rebuild if managed_sandbox else None,
-            check_interval=SANDBOX_HEALTH_CHECK_INTERVAL_SECONDS,
-        ),                                                            # 1. 沙箱健康检查 + 重建
-        HarnessPhaseMiddleware(),                                     # 2. 阶段状态机 + rubric 注入
-        ContextInjectionMiddleware(user_context=user_context),        # 3. 用户上下文注入
-        WarmMemoryMiddleware(store=store, user_id=user_context.user_id),
+        sandbox_health_middleware,                                    # 1. 沙箱健康检查 + 重建
+        HarnessPhaseMiddleware(
+            router_model=router_llm, store=store, user_id=user_context.user_id
+        ),                                                              # 2. 混合路由 + rubric 注入
+        warm_memory_middleware,                                        # 3. 请求级 WARM 快照
         skills_sync_middleware,                                       # 4. 基础 Skills 同步
         user_skills_restore_middleware,                               # 5. 用户 Skills 恢复
         ToolsSummarizationMiddleware(),                               # 6. 摘要监控
-        TaskDispatchMiddleware(
-            registry=SubAgentRegistry.from_configs(subagent_configs),
-            user_context=user_context,
-        ),                                                            # 6.5 task 委派：键值抽取/并发超时/SSE落库/证据核验
-        MemoryUpdateMiddleware(store=store, user_id=user_context.user_id),      # 7. 偏好提取（WARM）
-        MemoryConsolidationMiddleware(store=store, user_id=user_context.user_id),   # 7.5 情节归档 + 遗忘（COLD）
-        SandboxCircuitBreakerMiddleware(failure_threshold=3, recovery_timeout=60),  # 8. 熔断器
+        MemoryUpdateMiddleware(store=store, user_id=user_context.user_id),  # 7. 偏好提取
+        MemoryConsolidationMiddleware(
+            store=store, user_id=user_context.user_id
+        ),                                                            # 7.5 情节归档 + 遗忘
+        sandbox_breaker_middleware,  # 8. 按 sandbox_id + generation 隔离的基础设施熔断器
         # --- Harness 评审器（RubricMiddleware）---
         # 收到 rubric 后，grader 子Agent 结构化产出 satisfied/needs_revision/failed，
         # needs_revision 时自动打回模型重做，形成真实 Review 回路（非 prompt 软约束）
-        RubricMiddleware(model=grader_llm, max_iterations=_review_max_iterations),
+        # prepare_messages_for_grader：grader 只看转录尾部（框架窗口 30 条），
+        # 而一轮任务常有 30+ 次工具调用，不压缩的话带证据的 ERP 查询会被挤出
+        # 窗口，评审判「无工具证据」而永不通过。见 grader_transcript.py。
+        SafeRubricMiddleware(
+            model=grader_llm,
+            max_iterations=_review_max_iterations,
+            prepare_messages_for_grader=build_grader_messages,
+        ),
+        ReviewExecutionGate(_harness_config),  # after_agent 逆序：先升级，再审查
+        ERPWriteMiddleware(
+            repository=write_audit_repository,
+            user_id=user_context.user_id,
+            agent_name="main",
+            store=store,
+        ),  # ERP 写前校验、审计、幂等与终态落库；终态失败只对账，绝不自动重放
+        # DeepAgents 内置 task 只选择 subagent_type 并传递 description；
+        # 子 Agent 从父运行继承 configurable，由 ContextInjectionMiddleware
+        # 读取可信身份、偏好和 WARM 记忆。
+        # --- 审批由 create_deep_agent(interrupt_on=compiled_main_policy) 统一注册 ---
         # --- 框架内置中间件（调用限制）---
         ModelCallLimitMiddleware(run_limit=MAX_MODEL_CALLS),          # 模型调用上限
         ToolCallLimitMiddleware(run_limit=MAX_TOOL_CALLS),            # 工具调用上限
@@ -450,7 +575,7 @@ def create_main_agent(
         skills=None,
         memory=[str(MEMORY_DIR / "AGENTS.md")],
         backend=composite_backend,
-        interrupt_on=INTERRUPT_ON_TOOLS,
+        interrupt_on=compiled_main_policy,
         checkpointer=checkpointer,
         store=store,
         name="procurement-main-agent",

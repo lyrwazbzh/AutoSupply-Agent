@@ -5,7 +5,7 @@
 
 - **双时态**：``valid_from`` / ``invalidated_at`` 让我们能回答"用户现在偏好什么"，
   同时保留"他以前偏好过什么"——用户改口时旧值不是被删掉，而是被标记失效。
-- **可溯源**：``source`` + ``evidence`` 记录这条记忆从哪次会话、哪句话来，
+- **可溯源**：``source`` + ``tool_results`` 记录任务来源和工具执行依据，
   便于审计和排错，也是后面做"记忆可信度"的基础。
 - **可治理**：``access_count`` / ``last_accessed_at`` / ``ttl_days`` 支撑遗忘策略。
 """
@@ -25,18 +25,6 @@ MEMORY_TYPES = (SEMANTIC, EPISODIC, PROCEDURAL)
 HOT = "hot"
 WARM = "warm"
 COLD = "cold"
-
-
-def _parse_embedding(raw: Any) -> Optional[List[float]]:
-    if not isinstance(raw, list) or not raw:
-        return None
-    vectors: List[float] = []
-    for item in raw:
-        try:
-            vectors.append(float(item))
-        except (TypeError, ValueError):
-            return None
-    return vectors
 
 
 def now_iso() -> str:
@@ -66,12 +54,14 @@ class MemoryItem:
     type: str
     content: str
     summary: str = ""
+    goal: str = ""
+    outcome: str = ""
+    tool_results: List[Dict[str, Any]] = field(default_factory=list)
     key: str = ""                       # 语义记忆的冲突键（如 preferred_chart_type）
     tags: List[str] = field(default_factory=list)
-    entities: List[str] = field(default_factory=list)
+    idempotency_key: str = ""
     source: Dict[str, Any] = field(default_factory=dict)
     confidence: float = 0.6
-    evidence: str = ""
 
     valid_from: str = ""
     invalidated_at: Optional[str] = None
@@ -82,8 +72,6 @@ class MemoryItem:
     last_accessed_at: str = ""
     access_count: int = 0
     ttl_days: Optional[int] = None
-    embedding: Optional[List[float]] = None   # 写入时由 Keeper 用 API 编码 searchable_text
-    embedding_src: str = ""                   # 生成向量时的文本，内容变了要重算
 
     def __post_init__(self) -> None:
         stamp = now_iso()
@@ -95,8 +83,6 @@ class MemoryItem:
             self.updated_at = self.created_at
         if not self.valid_from:
             self.valid_from = self.created_at
-        if not self.last_accessed_at:
-            self.last_accessed_at = self.created_at
         if self.type not in MEMORY_TYPES:
             self.type = SEMANTIC
 
@@ -108,12 +94,14 @@ class MemoryItem:
             "type": self.type,
             "content": self.content,
             "summary": self.summary,
+            "goal": self.goal,
+            "outcome": self.outcome,
+            "tool_results": [dict(result) for result in self.tool_results],
             "key": self.key,
             "tags": list(self.tags),
-            "entities": list(self.entities),
+            "idempotency_key": self.idempotency_key,
             "source": dict(self.source),
             "confidence": self.confidence,
-            "evidence": self.evidence,
             "valid_from": self.valid_from,
             "invalidated_at": self.invalidated_at,
             "supersedes": self.supersedes,
@@ -122,8 +110,6 @@ class MemoryItem:
             "last_accessed_at": self.last_accessed_at,
             "access_count": self.access_count,
             "ttl_days": self.ttl_days,
-            "embedding": list(self.embedding) if self.embedding else None,
-            "embedding_src": self.embedding_src,
         }
 
     @classmethod
@@ -154,12 +140,18 @@ class MemoryItem:
             type=mtype if mtype in MEMORY_TYPES else SEMANTIC,
             content=content,
             summary=str(data.get("summary") or ""),
+            goal=str(data.get("goal") or ""),
+            outcome=str(data.get("outcome") or ""),
+            tool_results=[
+                dict(result)
+                for result in (data.get("tool_results") or [])
+                if isinstance(result, dict)
+            ],
             key=str(data.get("key") or ""),
             tags=[str(t) for t in (data.get("tags") or []) if t],
-            entities=[str(e) for e in (data.get("entities") or []) if e],
+            idempotency_key=str(data.get("idempotency_key") or ""),
             source=data.get("source") if isinstance(data.get("source"), dict) else {},
             confidence=confidence,
-            evidence=str(data.get("evidence") or ""),
             valid_from=str(data.get("valid_from") or ""),
             invalidated_at=(
                 str(data["invalidated_at"]) if data.get("invalidated_at") else None
@@ -172,8 +164,6 @@ class MemoryItem:
             last_accessed_at=str(data.get("last_accessed_at") or ""),
             access_count=access_count,
             ttl_days=ttl,
-            embedding=_parse_embedding(data.get("embedding")),
-            embedding_src=str(data.get("embedding_src") or ""),
         )
 
     # ---------- 生命周期 ----------
@@ -185,7 +175,7 @@ class MemoryItem:
         语义记忆的 ``key`` 是**逻辑冲突键**（如 preferred_chart_type），同一个 key
         会有多条历史版本共存（旧版本被标记失效），所以不能用它当 Store key，
         否则新值会直接覆盖掉旧版本，冲突追踪就失效了。
-        情节记忆用 ``ep_<thread_id>`` 作 id，保证同一会话重复归档是幂等更新。
+        情节记忆用 ``ep_<thread_id>`` 作 id，保证同一业务任务重复归档是幂等更新。
         """
         return self.id
 
@@ -226,7 +216,13 @@ class MemoryItem:
         return COLD
 
     def searchable_text(self) -> str:
-        parts = [self.summary, self.content, " ".join(self.tags), " ".join(self.entities)]
+        parts = [
+            self.summary,
+            self.content,
+            self.goal,
+            self.outcome,
+            " ".join(self.tags),
+        ]
         return " ".join(p for p in parts if p)
 
     def touch(self) -> None:

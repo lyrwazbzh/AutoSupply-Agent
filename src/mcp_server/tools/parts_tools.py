@@ -3,7 +3,9 @@
 part_query / part_search / part_by_supplier / part_page
 """
 import json
+
 from fastmcp import FastMCP
+
 from ..http_base import erp_client
 
 
@@ -92,6 +94,7 @@ def register_parts_tools(mcp: FastMCP):
         supplier_id: int = None,
         category: str = None,
         description: str = None,
+        operation_id: str = None,
     ) -> str:
         """创建新零部件。
 
@@ -123,7 +126,15 @@ def register_parts_tools(mcp: FastMCP):
             "supplierId": supplier_id,
             "category": category,
             "description": description,
+            "operationId": operation_id,
         }
         data = {k: v for k, v in data.items() if v is not None}
-        result = await erp_client.post("/api/parts/create", json_data=data)
+        headers = (
+            {"X-Operation-Id": operation_id, "Idempotency-Key": operation_id}
+            if operation_id
+            else None
+        )
+        result = await erp_client.post(
+            "/api/parts/create", json_data=data, headers=headers
+        )
         return json.dumps(result, ensure_ascii=False, indent=2)

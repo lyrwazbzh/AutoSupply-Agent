@@ -3,7 +3,9 @@
 supplier_query / supplier_page / supplier_get
 """
 import json
+
 from fastmcp import FastMCP
+
 from ..http_base import erp_client
 
 
@@ -76,6 +78,7 @@ def register_supplier_tools(mcp: FastMCP):
         address: str = None,
         credit_rating: str = None,
         status: int = 1,
+        operation_id: str = None,
     ) -> str:
         """创建新供应商。
 
@@ -101,14 +104,24 @@ def register_supplier_tools(mcp: FastMCP):
             "address": address,
             "creditRating": credit_rating,
             "status": status,
+            "operationId": operation_id,
         }
         # 移除 None 值
         data = {k: v for k, v in data.items() if v is not None}
-        result = await erp_client.post("/api/suppliers/create", json_data=data)
+        headers = (
+            {"X-Operation-Id": operation_id, "Idempotency-Key": operation_id}
+            if operation_id
+            else None
+        )
+        result = await erp_client.post(
+            "/api/suppliers/create", json_data=data, headers=headers
+        )
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     @mcp.tool()
-    async def supplier_update_status(id: int, status: int) -> str:
+    async def supplier_update_status(
+        id: int, status: int, operation_id: str = None
+    ) -> str:
         """更新供应商合作状态。
 
         Args:
@@ -118,7 +131,13 @@ def register_supplier_tools(mcp: FastMCP):
         Returns:
             操作结果JSON
         """
+        params = {"status": status, "operationId": operation_id}
+        headers = (
+            {"X-Operation-Id": operation_id, "Idempotency-Key": operation_id}
+            if operation_id
+            else None
+        )
         result = await erp_client.patch(
-            f"/api/suppliers/update-status/{id}", params={"status": status}
+            f"/api/suppliers/update-status/{id}", params=params, headers=headers
         )
         return json.dumps(result, ensure_ascii=False, indent=2)

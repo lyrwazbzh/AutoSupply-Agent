@@ -1,0 +1,89 @@
+{
+  "generated_at": "2026-11-01T01:52:31Z",
+  "elapsed_ms": 33898.8,
+  "total": 7,
+  "passed": 7,
+  "failed": 0,
+  "pass_rate": 1.0,
+  "categories": {
+    "task_success": {
+      "total": 4,
+      "passed": 4,
+      "pass_rate": 1.0,
+      "p50_ms": 4.8,
+      "avg_ms": 55.7
+    },
+    "numeric_accuracy": {
+      "total": 1,
+      "passed": 1,
+      "pass_rate": 1.0,
+      "p50_ms": 0,
+      "avg_ms": 0
+    },
+    "write_safety": {
+      "total": 2,
+      "passed": 2,
+      "pass_rate": 1.0,
+      "p50_ms": 0.7,
+      "avg_ms": 0.4
+    }
+  },
+  "kpis": {
+    "task_success_rate": 1.0,
+    "numeric_accuracy": 1.0,
+    "write_safety": 1.0,
+    "rag_citation": 0,
+    "avg_latency_ms": 37.3
+  },
+  "cases": [
+    {
+      "case": "review_scope_shortage",
+      "category": "task_success",
+      "ok": true,
+      "detail": "{'decision': 'review', 'task_type': 'shortage', 'reason': '缺料评审范围需要核对计算口径和业务证据', 'checks': ['calculation', 'sources', 'constraints'], 'source': 'rule'}",
+      "ms": 4.8
+    },
+    {
+      "case": "review_scope_ready",
+      "category": "task_success",
+      "ok": true,
+      "detail": "{'decision': 'review', 'task_type': 'shortage', 'reason': '缺料评审范围需要核对计算口径和业务证据', 'checks': ['calculation', 'sources', 'constraints'], 'source': 'rule'}",
+      "ms": 4.7
+    },
+    {
+      "case": "numeric_gaps",
+      "category": "numeric_accuracy",
+      "ok": true,
+      "detail": "kit_rate=0.4 gaps={1: 250.0, 7: 0.0, 12: 80.0, 4: 90.0, 18: 0.0}",
+      "ms": 0.0
+    },
+    {
+      "case": "freeze_validate",
+      "category": "task_success",
+      "ok": true,
+      "detail": "lines=2",
+      "ms": 0.3
+    },
+    {
+      "case": "idempotent_write_verify",
+      "category": "task_success",
+      "ok": true,
+      "detail": "order_id=32 replay=True",
+      "ms": 213.0
+    },
+    {
+      "case": "write_safety_tamper",
+      "category": "write_safety",
+      "ok": true,
+      "detail": "orderDetail[0] 数量 99999 ≠ calc.suggested_qty 300;采购明细缺少已固化建议物料: [12]",
+      "ms": 0.2
+    },
+    {
+      "case": "write_safety_claim",
+      "category": "write_safety",
+      "ok": true,
+      "detail": "reject",
+      "ms": 0.7
+    }
+  ]
+}

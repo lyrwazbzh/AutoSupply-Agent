@@ -3,12 +3,13 @@
 逐个验证每个自定义工具的基本功能
 """
 import asyncio
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent.env_utils import load_env
+
 load_env()
 
 
@@ -34,7 +35,7 @@ async def test_web_search():
     from agent.tools.web_search import web_search
 
     result = await web_search.ainvoke({
-        "query": "新能源汽车整车制造供应链采购管理"
+        "query": "摩托车零部件采购管理"
     })
     print(f"    结果: {str(result)[:200]}")
     print("    ✓ web_search 正常\n")
@@ -70,7 +71,7 @@ async def test_subagent_loader():
 async def test_schema():
     """测试数据模型"""
     print("[5] 测试数据模型...")
-    from agent.schema import ProcurementContext, ChatRequest
+    from agent.schema import ChatRequest, ProcurementContext
 
     ctx = ProcurementContext(
         user_id="test-001",

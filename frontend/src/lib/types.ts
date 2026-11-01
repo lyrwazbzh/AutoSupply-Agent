@@ -39,6 +39,11 @@ export interface SSEDoneEvent {
   interrupted: boolean;
 }
 
+export interface SSEErrorEvent {
+  type: "error";
+  message: string;
+}
+
 export interface SSEThinkingEvent {
   type: "thinking";
   status: "start" | "end";
@@ -61,25 +66,6 @@ export interface SSEPhaseEvent {
   label: string;
 }
 
-export interface SSEAgentDispatchEvent {
-  type: "agent_dispatch";
-  phase: "start" | "end";
-  call_id: string;
-  agent?: string;
-  started_at?: string;
-  finished_at?: string;
-  elapsed_ms?: number;
-  status?: string;
-  error?: string | null;
-  missing_sections?: string[];
-  evidence_gaps?: string[];
-  filled_fields?: string[];
-  active_parallel?: number;
-  max_parallel?: number;
-  timeout_s?: number;
-  description_chars?: number;
-}
-
 export type SSEEvent =
   | SSETokenEvent
   | SSEToolStartEvent
@@ -87,11 +73,11 @@ export type SSEEvent =
   | SSEToolResultEvent
   | SSEToolEndEvent
   | SSEInterruptEvent
+  | SSEErrorEvent
   | SSEDoneEvent
   | SSEThinkingEvent
   | SSETodoUpdateEvent
-  | SSEPhaseEvent
-  | SSEAgentDispatchEvent;
+  | SSEPhaseEvent;
 
 // ===== 中断数据 =====
 export interface InterruptData {
@@ -104,10 +90,7 @@ export interface InterruptData {
   order_data?: Record<string, unknown>;
   tool_name?: string;
   tool_args?: Record<string, unknown>;
-  // 制造供应链审批：RFQ、定点、订单或交付计划等
-  business_type?: string;
-  approval_summary?: Record<string, unknown>;
-  risk_items?: { level: "low" | "medium" | "high"; message: string }[];
+  operation_ids?: string[];
 }
 
 // ===== 消息类型 =====
@@ -159,6 +142,13 @@ export interface ChatRequest {
 export interface ResumeRequest {
   thread_id: string;
   resume_data: Record<string, unknown>;
+}
+
+export interface ChatStateResponse {
+  thread_id: string;
+  interrupted: boolean;
+  interrupt_data?: InterruptData | null;
+  pending?: boolean;
 }
 
 // ===== 功能卡片 =====

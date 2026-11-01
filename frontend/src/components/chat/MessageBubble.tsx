@@ -3,6 +3,7 @@
 import ReactMarkdown from "react-markdown";
 import { Bot, User } from "lucide-react";
 import { ChatMessage } from "@/lib/types";
+import { extractChartPreviews } from "@/lib/chart-preview";
 import ToolCallDisplay from "./ToolCallDisplay";
 import StreamingText from "./StreamingText";
 
@@ -18,6 +19,7 @@ export default function MessageBubble({
   showToolCalls = true,
 }: Props) {
   const isUser = message.role === "user";
+  const chartPreviews = isUser ? [] : extractChartPreviews(message.toolCalls);
 
   return (
     <div
@@ -41,6 +43,32 @@ export default function MessageBubble({
           <div className="mb-2">
             {message.toolCalls.map((tc) => (
               <ToolCallDisplay key={tc.id} toolCall={tc} />
+            ))}
+          </div>
+        )}
+
+        {chartPreviews.length > 0 && (
+          <div className="mb-3 grid grid-cols-1 gap-3">
+            {chartPreviews.map((preview) => (
+              <a
+                key={preview.url}
+                href={preview.url}
+                target="_blank"
+                rel="noreferrer"
+                className="block overflow-hidden rounded-lg border border-gray-200 bg-gray-50"
+              >
+                {/* 原生 img 可展示运行时动态生成、无需预先配置域名的图片。 */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={preview.url}
+                  alt={preview.title}
+                  loading="lazy"
+                  className="w-full h-auto object-contain"
+                />
+                <span className="block px-3 py-2 text-xs text-gray-600">
+                  {preview.title}
+                </span>
+              </a>
             ))}
           </div>
         )}

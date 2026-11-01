@@ -1,9 +1,10 @@
 """
-中间件: 情节记忆归档 + 遗忘扫描（三层记忆的 COLD 层维护）
+中间件: thread 级情节记忆归档 + 遗忘扫描（三层记忆的 COLD 层维护）
 
 与 MemoryUpdateMiddleware 的分工：
 - MemoryUpdateMiddleware 负责 WARM 层的偏好（语义记忆）
-- 本中间件负责把整轮会话压成一条**情节记忆**沉入 COLD，并周期性做遗忘扫描
+- 本中间件负责把当前 thread 对应的业务任务压成一条**情节记忆**沉入 COLD，
+  并周期性做遗忘扫描
 
 设计约束：
 - 全流程**不调用 LLM**，纯规则，延迟可忽略
@@ -21,7 +22,7 @@ from ..memory.run_config import current_thread_id
 
 
 class MemoryConsolidationMiddleware(AgentMiddleware):
-    """会话归档 + 遗忘扫描中间件。"""
+    """thread 级任务归档 + 遗忘扫描中间件。"""
 
     def __init__(self, store=None, user_id: str = "default_user",
                  config: MemoryConfig | None = None):
@@ -49,24 +50,23 @@ class MemoryConsolidationMiddleware(AgentMiddleware):
             from ..memory.extractor import summarize_episode
 
             digest = summarize_episode(messages, self._config, thread_id=thread_id)
-            # Without a stable conversation ID, skip the archive rather than
-            # overwrite every conversation with an ep_unknown record.
             if thread_id and digest and digest.get("summary"):
                 keeper.archive_episode(
-                    thread_id or digest.get("thread_id") or "unknown",
+                    thread_id,
                     goal=digest.get("goal", ""),
+                    outcome=digest.get("outcome", ""),
+                    tool_results=digest.get("tool_results"),
                     summary=digest.get("summary", ""),
                     task_type=digest.get("task_type", "general"),
                     tags=digest.get("tags"),
-                    tools=digest.get("tools"),
                     source={
                         "thread_id": thread_id,
-                        "task_type": digest.get("task_type"),
-                        "tools": digest.get("tools", [])[:10],
+                        "task_type": digest.get("task_type", "general"),
                     },
                 )
                 middleware_logger.debug(
-                    f"Episode archived: thread={thread_id}, type={digest.get('task_type')}"
+                    f"Episode archived: thread={thread_id}, "
+                    f"type={digest.get('task_type')}"
                 )
 
             forgotten = keeper.forget()

@@ -57,24 +57,32 @@ class MemoryUpdateMiddleware(AgentMiddleware):
             if not messages:
                 return None
 
-            # Only consume the latest user turn, not stale preferences from
-            # earlier turns (or another conversation resumed from a checkpoint).
-            start = next((i for i in range(len(messages) - 1, -1, -1)
-                          if getattr(messages[i], "type", "") == "human"), len(messages))
-            current_messages = messages[start:]
-            updates = extract_preferences(current_messages, self._config)
-            if self._config.llm_extraction_enabled and current_messages:
+            # 一个 thread 对应一个业务任务；语义记忆使用该任务内的全部用户消息，
+            # 不把 Agent 回复和工具结果当成用户偏好来源。
+            user_messages = [
+                message for message in messages
+                if getattr(message, "type", "") in ("human", "user")
+            ]
+            updates = extract_preferences(user_messages, self._config)
+            if self._config.llm_extraction_enabled and user_messages:
                 from ..config import get_llm
                 from ..memory.extractor import llm_extract_preferences
                 try:
-                    updates.update(llm_extract_preferences(current_messages, get_llm(thinking=False)))
+                    llm_updates = llm_extract_preferences(
+                        user_messages, get_llm(thinking=False)
+                    )
+                    # 与原版保持一致：启用 LLM 抽取时，以 LLM 对同名字段的
+                    # 判断覆盖规则结果；规则仍负责提供 LLM 未返回的字段。
+                    updates.update(llm_updates)
                 except Exception as exc:
                     middleware_logger.warning(f"LLM memory extraction failed; using rules: {exc}")
             if not updates:
                 return None
 
+            thread_id = self._thread_id(runtime)
             keeper.merge_preferences(
-                updates, source={"thread_id": self._thread_id(runtime)}
+                updates,
+                source={"thread_id": thread_id},
             )
             middleware_logger.info(f"User preferences merged: {sorted(updates)}")
         except Exception as exc:  # 记忆出错绝不能打断对话

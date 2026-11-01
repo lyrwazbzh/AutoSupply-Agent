@@ -17,6 +17,7 @@ from deepagents.backends.sandbox import (
 from langchain_core.messages import HumanMessage
 
 from src.agent.backends.sandbox_holder import (
+    DEFAULT_USER_ID,
     bind_sandbox,
     get_sandbox,
     reset_sandbox,
@@ -24,16 +25,14 @@ from src.agent.backends.sandbox_holder import (
 )
 from src.agent.backends.sandbox_proxy import SandboxBackendProxy
 from src.agent.config import skills_store_namespace
+from src.agent.harness import (
+    HarnessPhaseMiddleware,
+    load_harness_config,
+)
 from src.agent.middlewares.sandbox_health import SandboxHealthMiddleware
 from src.agent.middlewares.skills_sync import SkillsSyncMiddleware
 from src.agent.middlewares.user_skills_restore import UserSkillsRestoreMiddleware
 from src.api_view.mongodb_store import MongoDBStore
-from src.agent.harness import (
-    HarnessPhaseMiddleware,
-    load_harness_config,
-    should_use_grader,
-)
-from src.agent.harness_review import detect_task_type, review_text
 
 
 class FakeSandbox(BaseSandbox):
@@ -258,6 +257,27 @@ class IsolationTests(unittest.TestCase):
         finally:
             reset_sandbox(bob_token)
 
+    def test_request_bound_to_none_does_not_fall_back_to_default_user(self):
+        """请求内绑定为 None 时必须如实返回 None。
+
+        否则 LocalShell 降级用户（main_agent 显式 set_sandbox(None, user_id)）会落到
+        DEFAULT_USER_ID 的注册表条目，把文件写进别人的容器。
+        """
+        ghost = FakeSandbox("default-user-sandbox")
+        set_sandbox(ghost, DEFAULT_USER_ID)
+        try:
+            token = bind_sandbox("user-without-sandbox")
+            try:
+                self.assertIsNone(get_sandbox())
+            finally:
+                reset_sandbox(token)
+
+            # 非请求上下文才允许按用户查注册表
+            self.assertIs(get_sandbox(DEFAULT_USER_ID), ghost)
+        finally:
+            set_sandbox(None, DEFAULT_USER_ID)
+            self.assertIsNone(get_sandbox(DEFAULT_USER_ID))
+
 
 class MongoNamespaceTests(unittest.TestCase):
     def test_namespace_prefix_query_matches_array_segments(self):
@@ -265,21 +285,6 @@ class MongoNamespaceTests(unittest.TestCase):
             MongoDBStore._namespace_prefix_query(("persisted-skills", "alice")),
             {"namespace.0": "persisted-skills", "namespace.1": "alice"},
         )
-
-
-class _ReviewEmbedder:
-    _need = [1.0, 0.0]
-    _skip = [0.0, 1.0]
-
-    def embed_texts(self, texts):
-        out = []
-        for text in texts:
-            blob = text or ""
-            if any(token in blob for token in ("谢谢", "你好", "是什么意思")):
-                out.append(list(self._skip))
-            else:
-                out.append(list(self._need))
-        return out
 
 
 class HarnessReviewSelectionTests(unittest.TestCase):
@@ -290,54 +295,18 @@ class HarnessReviewSelectionTests(unittest.TestCase):
     def test_trivial_messages_skip_grader(self):
         for text in ("你好", "谢谢", "ERP是什么？", "库存是什么？"):
             with self.subTest(text=text):
-                self.assertFalse(
-                    should_use_grader([HumanMessage(content=text)], self.config)
-                )
                 update = self.middleware.before_agent(
                     {"messages": [HumanMessage(content=text)]}, None
                 )
+                self.assertEqual(update["review_decision"]["decision"], "skip")
                 self.assertNotIn("rubric", update)
-
-    def test_compound_definition_opens_grader(self):
-        text = "什么是 MRP，并列出本周缺料"
-        self.assertTrue(should_use_grader([HumanMessage(content=text)], self.config))
-
-    def test_part_number_opens_grader(self):
-        self.assertTrue(
-            should_use_grader([HumanMessage(content="查 SKU-001 库存")], self.config)
-        )
-
-    def test_follow_up_review_text_keeps_entity(self):
-        embedder = _ReviewEmbedder()
-        messages = [
-            HumanMessage(content="对比了恒力机械的交期"),
-            HumanMessage(content="那家还要多久到"),
-        ]
-        text = review_text(messages)
-        self.assertIn("恒力", text)
-        self.assertTrue(should_use_grader(messages, self.config, embedder))
-
-    def test_keyword_tie_uses_default_rubric(self):
-        messages = [HumanMessage(content="分析一下供应商")]
-        self.assertEqual(detect_task_type(messages, self.config), "default")
-        update = self.middleware.before_agent({"messages": messages}, None)
-        self.assertIn("完整回答", update.get("rubric", ""))
-
-    def test_oral_query_grades_with_embedder(self):
-        embedder = _ReviewEmbedder()
-        text = "这票货还要多久到"
-        self.assertTrue(
-            should_use_grader([HumanMessage(content=text)], self.config, embedder)
-        )
 
     def test_business_task_injects_matching_rubric(self):
         text = "查询库存并给出低于安全库存的补货建议"
-        self.assertTrue(
-            should_use_grader([HumanMessage(content=text)], self.config)
-        )
         update = self.middleware.before_agent(
             {"messages": [HumanMessage(content=text)]}, None
         )
+        self.assertEqual(update["review_decision"]["decision"], "review")
         self.assertEqual(update["_harness_rubric_source"], "auto")
         self.assertIn("库存", update["rubric"])
 

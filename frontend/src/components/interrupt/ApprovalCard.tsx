@@ -10,7 +10,7 @@ interface Props {
 }
 
 export default function ApprovalCard({ data, onApprove, onReject }: Props) {
-  const approvalData = data.approval_summary || data.order_data || data.tool_args || {};
+  const orderData = data.order_data || data.tool_args || {};
 
   return (
     <div className="mx-6 mb-3 animate-fade-in">
@@ -18,7 +18,7 @@ export default function ApprovalCard({ data, onApprove, onReject }: Props) {
         <div className="flex items-center gap-2 mb-3">
           <ShieldCheck size={16} className="text-blue-600" />
           <span className="text-sm font-medium text-blue-800">
-            {data.business_type ? `${data.business_type}审批确认` : "业务审批确认"}
+            订单审批确认
           </span>
         </div>
 
@@ -30,11 +30,11 @@ export default function ApprovalCard({ data, onApprove, onReject }: Props) {
         </p>
 
         {/* 订单详情 */}
-        {Object.keys(approvalData).length > 0 && (
+        {Object.keys(orderData).length > 0 && (
           <div className="mb-4 p-3 bg-white/70 rounded-lg border border-blue-100">
             <table className="w-full text-xs">
               <tbody>
-                {Object.entries(approvalData).map(([key, value]) => (
+                {Object.entries(orderData).map(([key, value]) => (
                   <tr key={key} className="border-b border-blue-50 last:border-0">
                     <td className="py-1.5 pr-3 text-gray-500 font-medium whitespace-nowrap">
                       {key}
@@ -49,14 +49,6 @@ export default function ApprovalCard({ data, onApprove, onReject }: Props) {
               </tbody>
             </table>
           </div>
-        )}
-
-        {data.risk_items && data.risk_items.length > 0 && (
-          <ul className="mb-4 space-y-1 text-xs text-amber-800">
-            {data.risk_items.map((item, index) => (
-              <li key={`${item.message}-${index}`}>[{item.level.toUpperCase()}] {item.message}</li>
-            ))}
-          </ul>
         )}
 
         {/* 审批按钮 */}

@@ -1,16 +1,10 @@
-"""COLD 层检索打分。
-
-文本通道 = BM25 字面分与向量余弦的加权；再叠时间衰减、引用频次、置信度。
-向量由 Keeper 写入 MemoryItem.embedding；本模块只算分，不访问网络。
-"""
+"""记忆检索的时间、频次评分，以及非 PostgreSQL Store 的 BM25 回退。"""
 from __future__ import annotations
 
 import math
 import re
 from datetime import datetime
 from typing import List, Optional, Sequence
-
-from .embeddings import cosine
 
 _CJK_RANGE = "\u4e00-\u9fff"
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[" + _CJK_RANGE + r"]+")
@@ -114,14 +108,7 @@ def combined_score(
     )
 
 
-def rank(
-    query: str,
-    candidates: Sequence,
-    config=None,
-    now: Optional[datetime] = None,
-    *,
-    query_embedding: Optional[Sequence[float]] = None,
-):
+def rank(query: str, candidates: Sequence, config=None, now: Optional[datetime] = None):
     """给候选记忆打分并按分数降序返回 ``(item, score)`` 列表。"""
     if not candidates:
         return []
@@ -129,36 +116,22 @@ def rank(
 
     cfg = config or DEFAULT_MEMORY_CONFIG
     query_tokens = tokenize(query)
-    has_query_tokens = bool(query_tokens)
-    has_query_vec = bool(query_embedding)
-
-    if not has_query_tokens and not has_query_vec:
+    if not query_tokens:
         return []
 
     docs = [tokenize(item.searchable_text()) for item in candidates]
-    raw = bm25(query_tokens, docs) if has_query_tokens else [0.0] * len(candidates)
+    raw = bm25(query_tokens, docs)
     norm = normalize(raw)
-
-    lex = max(0.0, getattr(cfg, "weight_lexical", 0.5))
-    sem = max(0.0, getattr(cfg, "weight_semantic", 0.5))
-    mix = lex + sem
-    if mix <= 0:
-        lex, sem, mix = 1.0, 0.0, 1.0
-    lex, sem = lex / mix, sem / mix
-    min_cosine = float(getattr(cfg, "min_cosine", 0.32))
 
     now_dt = now or datetime.now()
     scored = []
-    for item, text_norm, raw_score in zip(candidates, norm, raw):
-        semantic_score = cosine(query_embedding, getattr(item, "embedding", None))
-        if raw_score <= 0 and semantic_score < min_cosine:
+    for item, text_score, raw_score in zip(candidates, norm, raw):
+        # 一个查询词都没命中的直接排除：否则时间衰减/置信度这些"先验分"
+        # 会把完全不相关的记忆托过阈值，检索就失去意义了。
+        if raw_score <= 0:
             continue
-        if has_query_vec:
-            channel = lex * text_norm + sem * semantic_score
-        else:
-            channel = text_norm
         score = combined_score(
-            channel,
+            text_score,
             item.age_days(now_dt),
             item.access_count,
             item.confidence,

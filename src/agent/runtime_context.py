@@ -8,7 +8,6 @@ from __future__ import annotations
 from contextvars import ContextVar, Token
 from typing import Any
 
-
 _current_user_id: ContextVar[str] = ContextVar(
     "erp_agent_current_user_id", default="default_user"
 )
@@ -17,7 +16,10 @@ _current_store: ContextVar[Any | None] = ContextVar(
 )
 
 
-def bind_runtime(user_id: str, store: Any | None) -> tuple[Token[str], Token[Any | None]]:
+def bind_runtime(
+    user_id: str,
+    store: Any | None,
+) -> tuple[Token[str], Token[Any | None]]:
     """绑定用户与 Store，供在本请求中运行的工具读取。"""
     return _current_user_id.set(user_id), _current_store.set(store)
 

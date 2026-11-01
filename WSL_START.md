@@ -1,50 +1,62 @@
 # WSL 修复版启动与回退
 
+## 混合审查更新
+
+当前默认使用 `review.strategy: hybrid`：明确场景按规则判断，模糊请求调用现有 DeepSeek 模型，执行记录可升级审查。无需新增 Key；模糊请求会增加一次有超时限制的路由调用。修改 `src/agent/harness_config.yaml` 后重启后端生效。
+
+可测试“你好”“什么是库存，请查询缺货零件”“沿用刚才的方案，把第二家的量翻倍”。检查日志 Review route 与 Harness trace 中的 review_decision。订单写入仍须审批；写工具或子任务委派后评审未通过，不自动重放整轮任务。
+
+离线回归：`.venv/bin/python -m unittest src.test.test_hybrid_review -v`。
+本次修改前代码标签为 `review-before-hybrid-20260917`，可用独立 git worktree 对照；不要使用硬重置覆盖本地改动。
+
 ## 本次修复
 
 - 从真实 LangGraph 配置读取 thread_id，缺少 ID 时跳过归档，避免 ep_unknown 覆盖历史。
 - 每次模型调用动态注入当前用户 WARM 摘要，限制为 4000 字符；不再使用创建 Agent 时的静态快照。
 - 记忆配置读取 .env；可选 LLM 抽取接入主链路，默认关闭，开启会产生额外模型调用。
 - 规则抽取跳过否定和明确临时表达，只处理最新用户轮次，避免旧会话偏好反复覆盖。
-- 新增真实框架的离线集成测试，无需付费模型、MongoDB 或 Docker。
+- 新增真实框架的离线集成测试，无需付费模型、PostgreSQL 或 Docker。
 
 ## 本机目录
 
-新版：`/home/administrator/projects/ERP-AGENT-open-source`
+新版：`/home/administrator/projects/Agent-Harness`
 
 旧版：`/home/administrator/projects/ERP-AGENT`，未覆盖，原有未提交改动保留。
 
-新版复制了旧版 .env（不加入 Git），通过 .venv 和 frontend/node_modules 符号链接复用旧版依赖。
-暂时不要删除旧目录，也不要在共享环境里升级依赖。要独立部署时请新建虚拟环境并安装 requirements.txt，前端执行 npm ci。
+新版复制了旧版 .env（不加入 Git），Python 的 .venv 仍通过符号链接复用旧版环境。
+前端 node_modules 已改为新版目录内的独立实体目录，不再链接到旧项目；Turbopack 会拒绝指向项目根目录之外的 node_modules。迁移时确认了两份 package-lock.json 一致，再复制已有依赖；全新安装请执行 npm ci。
+暂时不要删除旧目录，也不要在共享 Python 环境里升级依赖。要完全独立部署时请新建虚拟环境并安装 requirements.txt。
 
 ## 启动前
 
 先启动 Windows Docker Desktop，并在 Settings → Resources → WSL Integration 中启用 Ubuntu。
-在 WSL 执行 `docker version`，应同时看到 Client 和 Server。需要 MongoDB 服务可用，且 .env 中地址正确。
-如果已有 MongoDB 容器，启动原容器，不要删除已有数据库或数据卷。
+在 WSL 执行 `docker version`，应同时看到 Client 和 Server。需要 PostgreSQL 服务可用，且 `.env` 中 `DATABASE_URL` 正确。
+如果已有 PostgreSQL 容器，启动原容器，不要删除已有数据库或数据卷。
 
-本次检查时 Docker 在 WSL 不可用，因此尚未验证真实 Docker/MongoDB/模型的完整链路。
+本次检查时 Docker 在 WSL 不可用，因此尚未验证真实 Docker/PostgreSQL/模型的完整链路。
 
 ## 三个 WSL 终端分别启动
 
 终端 1：MCP 服务
 
 ```bash
-cd ~/projects/ERP-AGENT-open-source
+cd ~/projects/Agent-Harness
 .venv/bin/python -m src.mcp_server.server_main
 ```
 
 终端 2：后端（先确认 MCP 已启动）
 
 ```bash
-cd ~/projects/ERP-AGENT-open-source
+cd ~/projects/Agent-Harness
 .venv/bin/python -m src.api_view.web_main
 ```
 
 终端 3：前端
 
 ```bash
-cd ~/projects/ERP-AGENT-open-source/frontend
+cd ~/projects/Agent-Harness/frontend
+source ~/.nvm/nvm.sh
+nvm use 22
 npm run dev
 ```
 
@@ -55,7 +67,7 @@ npm run dev
 先执行离线测试：
 
 ```bash
-cd ~/projects/ERP-AGENT-open-source
+cd ~/projects/Agent-Harness
 .venv/bin/python -m src.test.test_memory_layer
 .venv/bin/python -m unittest src.test.test_memory_integration -v
 ```
@@ -81,5 +93,5 @@ git diff memory-before-fixes-20260917 memory-fixed-20260917 --stat
 git worktree add ../ERP-AGENT-memory-before memory-before-fixes-20260917
 ```
 
-新工作目录需自行配置 .env 和依赖。代码回退不会回滚 MongoDB 数据；重要数据请单独备份。
+新工作目录需自行配置 `.env` 和依赖。代码回退不会回滚 PostgreSQL 数据；重要数据请单独备份。
 本次仅作本地 Git 管理，没有推送 GitHub。

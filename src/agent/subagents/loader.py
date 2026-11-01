@@ -3,13 +3,14 @@
 核心职责：
 1. 读取 configs/*.yaml 并校验必填字段
 2. 将 tools 字符串通过子串匹配映射为实际工具对象
-3. 解析 interrupt_on 配置
-4. 将 context_protocol 注入到主Agent系统提示词
+3. 将 context_protocol 注入到主Agent系统提示词
 """
-import yaml  # 导入 YAML 解析库，用于读取 .yaml 配置文件
 from pathlib import Path  # 导入路径库，用于处理文件路径
-from deepagents import SubAgent  # 导入子Agent类型（用于类型注解）
+
+import yaml  # 导入 YAML 解析库，用于读取 .yaml 配置文件
 from langchain_core.tools import BaseTool  # 导入工具基类，用于类型注解
+
+from ..approval import ApprovalPolicyRegistry
 from ..log_utils import agent_logger  # 导入日志工具
 
 # 配置文件目录：当前文件所在目录下的 configs 文件夹
@@ -106,50 +107,6 @@ def build_output_contract_prompt(config: dict) -> str:
     return "\n".join(lines)
 
 
-def _parse_interrupt_on(config: dict) -> dict | None:
-    """解析 YAML 中的 interrupt_on 配置为框架格式
-    
-    interrupt_on 用于配置人工审批流程：
-    当子Agent调用某些工具时，需要等待人工审批才能继续
-    
-    YAML 格式示例：
-    interrupt_on:
-      delete_record:
-        allowed_decisions: ["approve", "reject"]
-        description: "删除记录需要管理员审批"
-    
-    Args:
-        config: 子Agent配置字典
-    
-    Returns:
-        解析后的 interrupt_on 字典，如果没有配置则返回 None
-    """
-    # 从配置中获取 interrupt_on 字段（可能不存在）
-    raw = config.get("interrupt_on")
-    
-    # 如果没有配置，直接返回 None
-    if not raw:
-        return None
-    
-    # 解析后的结果字典
-    parsed = {}
-    
-    # 遍历每个工具名称及其配置
-    for tool_name, tool_config in raw.items():
-        # 检查工具配置是否为字典格式
-        if isinstance(tool_config, dict):
-            # 构建框架需要的格式
-            parsed[tool_name] = {
-                # 允许的决策列表（默认 approve 和 reject）
-                "allowed_decisions": tool_config.get("allowed_decisions", ["approve", "reject"]),
-            }
-            # 如果配置中有描述，也一并添加
-            if "description" in tool_config:
-                parsed[tool_name]["description"] = tool_config["description"]
-    
-    return parsed
-
-
 def load_subagent_configs() -> list[dict]:
     """读取 configs/*.yaml，校验必填字段
     
@@ -184,7 +141,12 @@ def load_subagent_configs() -> list[dict]:
     return configs
 
 
-def resolve_subagent_tools(configs: list[dict], all_tools: list[BaseTool]) -> list:
+def resolve_subagent_tools(
+    configs: list[dict],
+    all_tools: list[BaseTool],
+    middleware_by_agent: dict[str, list] | None = None,
+    approval_policy: ApprovalPolicyRegistry | None = None,
+) -> list:
     """将 tools 字符串通过子串匹配映射为实际工具对象
     
     匹配规则：pattern in tool.name（子串包含匹配）
@@ -237,9 +199,6 @@ def resolve_subagent_tools(configs: list[dict], all_tools: list[BaseTool]) -> li
                 if tool not in matched_tools:
                     matched_tools.append(tool)
         
-        # 解析 interrupt_on 配置
-        interrupt_on = _parse_interrupt_on(config)
-
         # 校验 output_format 契约结构（非法则记录错误，仍继续创建但契约不注入）
         output_contract = ""
         if _validate_output_format(config):
@@ -253,9 +212,18 @@ def resolve_subagent_tools(configs: list[dict], all_tools: list[BaseTool]) -> li
             "tools": matched_tools,
         }
         
-        # 如果有 interrupt_on 配置，添加到规格中
-        if interrupt_on:
-            subagent_spec["interrupt_on"] = interrupt_on
+        # 审批属于业务治理规则，不再从子 Agent YAML 读取；只投影统一
+        # ApprovalPolicyRegistry 中与该子 Agent 工具集合对应的策略子集。
+        if approval_policy is not None:
+            subagent_interrupt_on = approval_policy.subset_for_tools(
+                getattr(tool, "name", "") for tool in matched_tools
+            )
+            if subagent_interrupt_on:
+                subagent_spec["interrupt_on"] = subagent_interrupt_on
+
+        agent_middleware = (middleware_by_agent or {}).get(config["name"], [])
+        if agent_middleware:
+            subagent_spec["middleware"] = agent_middleware
         
         # 添加到结果列表
         subagents.append(subagent_spec)
@@ -291,28 +259,30 @@ def get_delegation_context_prompt(configs: list[dict]) -> str:
         
         # 构建该子Agent的协议说明行
         lines = [f"\n### 委派给 {config['name']} 时的上下文传递要求"]
-        lines.append("在 `description` 中按行写入 `字段名: 值`（英文字段名与下表一致）。")
-
+        
         # 遍历每个上下文字段定义
         for field_def in input_ctx:
             field = field_def.get("field", "")  # 字段名
             desc = field_def.get("description", "")  # 字段描述
             required = field_def.get("required", False)  # 是否必填
-
+            
             # 根据是否必填添加标记
             marker = "**[必填]**" if required else "[可选]"
-
+            
             # 添加字段说明行
             lines.append(f"- {marker} `{field}`: {desc}")
-
+        
         # 将该子Agent的协议说明添加到节列表
         sections.append("\n".join(lines))
-
+    
     # 如果有协议说明，组装成完整的提示词片段
     if sections:
         return (
             "\n## 子Agent委派上下文协议\n"
-            "user_id / username / user_preferences 可由服务端注入；其余必填须在 description 写真实值。\n"
+            "`task` 只选择 `subagent_type` 并传递业务命令 `description`。"
+            "`user_id`、`username`、`user_preferences` 与 WARM 记忆由父运行的 "
+            "`configurable` 自动继承，并由子Agent上下文中间件注入。"
+            "主Agent只需写清业务目标、已知实体、数据范围、约束和期望输出。\n"
             + "\n".join(sections)
         )
     else:

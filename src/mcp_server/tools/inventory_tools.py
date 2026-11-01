@@ -3,7 +3,9 @@
 inventory_warning / inventory_page / inventory_check / inventory_inbound / inventory_outbound
 """
 import json
+
 from fastmcp import FastMCP
+
 from ..http_base import erp_client
 
 
@@ -62,6 +64,7 @@ def register_inventory_tools(mcp: FastMCP):
         part_id: int,
         quantity: int,
         warehouse_location: str = None,
+        operation_id: str = None,
     ) -> str:
         """执行入库操作。
 
@@ -77,12 +80,22 @@ def register_inventory_tools(mcp: FastMCP):
             "partId": part_id,
             "quantity": quantity,
             "warehouseLocation": warehouse_location,
+            "operationId": operation_id,
         }
-        result = await erp_client.post("/api/inventory/inbound", params=params)
+        headers = (
+            {"X-Operation-Id": operation_id, "Idempotency-Key": operation_id}
+            if operation_id
+            else None
+        )
+        result = await erp_client.post(
+            "/api/inventory/inbound", params=params, headers=headers
+        )
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     @mcp.tool()
-    async def inventory_outbound(part_id: int, quantity: int) -> str:
+    async def inventory_outbound(
+        part_id: int, quantity: int, operation_id: str = None
+    ) -> str:
         """执行出库操作。
 
         Args:
@@ -95,8 +108,16 @@ def register_inventory_tools(mcp: FastMCP):
         params = {
             "partId": part_id,
             "quantity": quantity,
+            "operationId": operation_id,
         }
-        result = await erp_client.post("/api/inventory/outbound", params=params)
+        headers = (
+            {"X-Operation-Id": operation_id, "Idempotency-Key": operation_id}
+            if operation_id
+            else None
+        )
+        result = await erp_client.post(
+            "/api/inventory/outbound", params=params, headers=headers
+        )
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     @mcp.tool()

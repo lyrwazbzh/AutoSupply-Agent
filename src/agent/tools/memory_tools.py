@@ -15,7 +15,7 @@ from ..runtime_context import get_current_store, get_current_user_id
 
 
 @tool
-def read_memory(query: str, limit: int = 5, context: str = "") -> str:
+def read_memory(query: str, limit: int = 5) -> str:
     """检索与当前问题相关的历史记忆（跨会话）。
 
     当出现以下情况时先调用本工具，再回答：
@@ -26,7 +26,6 @@ def read_memory(query: str, limit: int = 5, context: str = "") -> str:
     Args:
         query: 检索意图，用自然语言描述要找什么
         limit: 返回条数，默认 5
-        context: 指代消解用的上文（最近用户原话或助手摘要）；可留空，系统会用 WARM 摘要
 
     Returns:
         命中的历史记忆列表（含类型、日期、相关度），没有命中会明确说明。
@@ -38,11 +37,7 @@ def read_memory(query: str, limit: int = 5, context: str = "") -> str:
     user_id = get_current_user_id()
     try:
         keeper = MemoryKeeper(store, user_id, DEFAULT_MEMORY_CONFIG)
-        return keeper.search_text(
-            query,
-            k=max(1, min(int(limit or 5), 20)),
-            context=context or "",
-        )
+        return keeper.search_text(query, k=max(1, min(int(limit or 5), 20)))
     except Exception as exc:
         return f"检索历史记忆失败: {exc}"
 
@@ -86,7 +81,6 @@ def remember(content: str, key: str = "", memory_type: str = "semantic") -> str:
         else:
             item = keeper.upsert_semantic(
                 key=key or content[:40], content=content, confidence=0.9,
-                evidence="用户显式要求记住",
             )
         if item is None:
             return "记忆写入失败。"

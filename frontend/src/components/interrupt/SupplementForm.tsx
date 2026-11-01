@@ -63,7 +63,7 @@ export default function SupplementForm({ data, onSubmit }: Props) {
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
-            placeholder="输入补充信息，如：零部件ID为P001，数量100，单价25.5"
+            placeholder="输入补充信息，如：零件ID=1，数量=100，单价=25.5"
             className="flex-1 px-3 py-2 text-sm border border-amber-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-400/30 bg-white"
           />
           <button

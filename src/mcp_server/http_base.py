@@ -2,10 +2,12 @@
 HTTP 基础客户端模块
 httpx AsyncClient 单例（连接池、超时），封装 GET/POST/PUT/PATCH/DELETE
 """
-import httpx
 import json
-from typing import Any, Optional
-from .server_config import ERP_BASE_URL, HTTP_TIMEOUT, HTTP_MAX_CONNECTIONS
+from typing import Optional
+
+import httpx
+
+from .server_config import ERP_BASE_URL, HTTP_MAX_CONNECTIONS, HTTP_TIMEOUT
 
 
 class ERPHttpClient:
@@ -37,45 +39,65 @@ class ERPHttpClient:
             )
         return self._client
 
-    async def get(self, path: str, params: Optional[dict] = None) -> dict:
+    async def get(
+        self, path: str, params: Optional[dict] = None, headers: Optional[dict] = None
+    ) -> dict:
         """GET 请求"""
         # 过滤掉 None 值的参数
         if params:
             params = {k: v for k, v in params.items() if v is not None}
-        response = await self.client.get(path, params=params)
+        response = await self.client.get(path, params=params, headers=headers)
         return self._handle_response(response)
 
-    async def post(self, path: str, json_data: Optional[dict] = None, params: Optional[dict] = None) -> dict:
+    async def post(
+        self,
+        path: str,
+        json_data: Optional[dict] = None,
+        params: Optional[dict] = None,
+        headers: Optional[dict] = None,
+    ) -> dict:
         """POST 请求"""
         if params:
             params = {k: v for k, v in params.items() if v is not None}
-        response = await self.client.post(path, json=json_data, params=params)
+        response = await self.client.post(
+            path, json=json_data, params=params, headers=headers
+        )
         return self._handle_response(response)
 
-    async def put(self, path: str, json_data: Optional[dict] = None, params: Optional[dict] = None) -> dict:
+    async def put(
+        self,
+        path: str,
+        json_data: Optional[dict] = None,
+        params: Optional[dict] = None,
+        headers: Optional[dict] = None,
+    ) -> dict:
         """PUT 请求"""
         if params:
             params = {k: v for k, v in params.items() if v is not None}
-        response = await self.client.put(path, json=json_data, params=params)
+        response = await self.client.put(
+            path, json=json_data, params=params, headers=headers
+        )
         return self._handle_response(response)
 
-    async def patch(self, path: str, params: Optional[dict] = None) -> dict:
+    async def patch(
+        self, path: str, params: Optional[dict] = None, headers: Optional[dict] = None
+    ) -> dict:
         """PATCH 请求"""
         if params:
             params = {k: v for k, v in params.items() if v is not None}
-        response = await self.client.patch(path, params=params)
+        response = await self.client.patch(path, params=params, headers=headers)
         return self._handle_response(response)
 
-    async def delete(self, path: str) -> dict:
+    async def delete(self, path: str, headers: Optional[dict] = None) -> dict:
         """DELETE 请求"""
-        response = await self.client.delete(path)
+        response = await self.client.delete(path, headers=headers)
         return self._handle_response(response)
 
     def _handle_response(self, response: httpx.Response) -> dict:
         """统一响应处理"""
         try:
             data = response.json()
-            if response.status_code == 200:
+            if 200 <= response.status_code < 300:
                 return data
             else:
                 return {

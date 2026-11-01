@@ -1,19 +1,26 @@
 """
-图表生成工具（Harness — 沙箱内安全执行）
-26种图表类型合并为单一工具，在 Docker 沙箱内执行 matplotlib 生成 PNG。
+图表生成工具（Harness — 沙箱优先执行）
+26种图表类型合并为单一工具，优先在 Docker 沙箱内执行 matplotlib 生成 PNG。
 
 核心设计（Harness 思想）：
-- 所有图表必须在 Docker 沙箱内生成（/workspace/charts/）
+- 优先在 Docker 沙箱内生成（/workspace/charts/）
 - 用户需要下载时，通过 download_sandbox_file 工具从沙箱提取到本地
-- 沙箱不可用时返回错误，不降级到宿主机执行
+- 本机开发且允许 LocalShell 回退时，使用固定脚本生成临时 Artifact
 """
 import json
+import subprocess
+import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
+
 from langchain_core.tools import tool
 
-from ..log_utils import agent_logger
+from ...artifacts import artifact_url, save_artifact_bytes
 from ..backends.sandbox_holder import get_sandbox
+from ..config import ALLOW_LOCAL_SHELL_FALLBACK, PUBLIC_BASE_URL
+from ..log_utils import agent_logger
+from ..runtime_context import get_current_user_id
 
 CHART_TYPES = [
     "bar", "horizontal_bar", "stacked_bar", "grouped_bar",
@@ -38,12 +45,15 @@ import json
 import sys
 import os
 
-for font in ['SimHei', 'Microsoft YaHei', 'WenQuanYi Micro Hei', 'DejaVu Sans']:
-    try:
+# 字体不能像以前那样 try 赋值选第一个 —— rcParams 赋值永远不会抛异常，
+# 那个循环恒选 SimHei；SimHei 在 Linux 沙箱镜像里不存在，绘制时静默回退
+# DejaVu，中文全部渲染成方框。这里改成按 fontManager 里实际可用的选。
+from matplotlib import font_manager
+_available = {f.name for f in font_manager.fontManager.ttflist}
+for font in ['Microsoft YaHei', 'SimHei', 'WenQuanYi Micro Hei', 'Noto Sans CJK SC', 'DejaVu Sans']:
+    if font in _available:
         plt.rcParams['font.sans-serif'] = [font]
         break
-    except:
-        continue
 plt.rcParams['axes.unicode_minus'] = False
 
 params_path = sys.argv[1]
@@ -250,13 +260,27 @@ def generate_chart(
         return f"数据格式错误: {e}。data 必须是有效的 JSON 列表。"
 
     sandbox = get_sandbox()
-    if sandbox is None:
-        return "错误: 沙箱不可用。请确保 Docker 沙箱容器已启动。"
-
-    # 沙箱内路径
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in title[:20])
     output_name = f"chart_{chart_type}_{safe_title}_{timestamp}.png"
+
+    if sandbox is None:
+        if not ALLOW_LOCAL_SHELL_FALLBACK:
+            return (
+                "错误: 沙箱不可用，且本地回退已禁用"
+                "（ALLOW_LOCAL_SHELL_FALLBACK=false）。"
+            )
+        return _generate_chart_locally(
+            output_name=output_name,
+            chart_type=chart_type,
+            data_list=data_list,
+            title=title,
+            x_field=x_field,
+            y_field=y_field,
+            series_field=series_field,
+        )
+
+    # 沙箱内路径
     charts_dir = "/workspace/charts"
     output_path = f"{charts_dir}/{output_name}"
     params_filename = f"_params_{timestamp}.json"
@@ -283,11 +307,27 @@ def generate_chart(
         sandbox.write_file(params_path, json.dumps(params, ensure_ascii=False))
         sandbox.write_file(script_path, CHART_SCRIPT)
 
-        # 安装依赖（仅首次，后续复用缓存）
-        sandbox.execute("pip install -q matplotlib numpy 2>/dev/null || true", timeout=60)
+        # 检查 matplotlib/numpy 是否已安装（预热阶段或上次调用已装则跳过）
+        check = sandbox.execute(
+            "python -c 'import matplotlib, numpy' 2>/dev/null && echo INSTALLED || echo MISSING",
+            timeout=15,
+        )
+        if "MISSING" in check.output:
+            # 冷装 matplotlib+numpy 实测要 1 分钟以上（PIP_TARGET 指向 volume，首装无缓存）
+            install = sandbox.execute(
+                "pip install -q matplotlib numpy 2>&1 | tail -3",
+                timeout=600,
+            )
+            if install.exit_code != 0:
+                return (
+                    f"图表生成失败: matplotlib/numpy 安装超时或失败（exit {install.exit_code}）。\n"
+                    f"这通常是沙箱到 PyPI 的网络出口慢或不通。\n"
+                    f"pip 输出: {install.output[:200] if install.output else '(无)'}\n"
+                    f"建议: 检查生产机 Docker 网络出口，或预装 matplotlib/numpy 到沙箱镜像。"
+                )
 
         # 在沙箱内执行图表生成
-        result = sandbox.execute(f"python {script_path} {params_path}", timeout=30)
+        result = sandbox.execute(f"python {script_path} {params_path}", timeout=120)
 
         # 清理临时文件
         sandbox.execute(f"rm -f {params_path} {script_path} 2>/dev/null || true")
@@ -319,4 +359,80 @@ def generate_chart(
 
     except Exception as e:
         agent_logger.error(f"Chart generation error: {e}")
+        return f"图表生成异常: {str(e)}"
+
+
+def _generate_chart_locally(
+    *,
+    output_name: str,
+    chart_type: str,
+    data_list: list,
+    title: str,
+    x_field: str,
+    y_field: str,
+    series_field: str,
+) -> str:
+    """用固定脚本在本机开发环境生成图表。
+
+    模型只能提供 JSON 数据和展示字段；脚本内容、解释器与输出目录都由应用控制，
+    不把模型文本拼进 shell 命令。生产环境可通过关闭 LocalShell 回退禁用此路径。
+    """
+    try:
+        with tempfile.TemporaryDirectory(prefix="agent-harness-chart-") as temp_dir:
+            temp_root = Path(temp_dir)
+            output_path = temp_root / Path(output_name).name
+            params_path = temp_root / "params.json"
+            script_path = temp_root / "chart.py"
+            params = {
+                "chart_type": chart_type,
+                "data": data_list,
+                "title": title,
+                "output_path": str(output_path),
+                "x_field": x_field,
+                "y_field": y_field,
+                "series_field": series_field,
+            }
+            params_path.write_text(
+                json.dumps(params, ensure_ascii=False), encoding="utf-8"
+            )
+            script_path.write_text(CHART_SCRIPT, encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(script_path), str(params_path)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                check=False,
+            )
+            if result.returncode != 0 or "OK:" not in result.stdout:
+                details = (result.stderr or result.stdout or "未知错误")[:500]
+                return f"图表生成失败: {details}"
+            if not output_path.is_file():
+                return f"图表生成后文件未找到: {output_path}"
+
+            file_id, artifact_path = save_artifact_bytes(
+                get_current_user_id(), output_name, output_path.read_bytes()
+            )
+            file_size = artifact_path.stat().st_size
+            download_url = artifact_url(
+                PUBLIC_BASE_URL, file_id, artifact_path.name
+            )
+            agent_logger.info(
+                f"Chart generated locally: {artifact_path.name} ({file_size} bytes)"
+            )
+            return (
+                "✅ 图表生成成功!\n"
+                f"标题: {title}\n"
+                f"类型: {chart_type}\n"
+                f"数据点: {len(data_list)}\n"
+                f"文件大小: {file_size / 1024:.1f} KB\n"
+                f"下载链接: {download_url}\n"
+                f"临时路径: {artifact_path}\n"
+                "(注: Docker 沙箱不可用，使用受限的本地固定脚本生成)"
+            )
+    except subprocess.TimeoutExpired:
+        return "图表生成失败: 本地渲染超过 120 秒"
+    except Exception as e:
+        agent_logger.error(f"Local chart generation error: {e}")
         return f"图表生成异常: {str(e)}"

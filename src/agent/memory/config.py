@@ -1,7 +1,7 @@
 """三层记忆（HOT / WARM / COLD）的配置。
 
-只依赖标准库，方便在不装 langchain / pymongo 的环境里单独跑测试。
-所有参数都可用环境变量覆盖，默认值按"单机 + MongoDB"的规模给出。
+只依赖标准库，方便在不装 langchain / 数据库驱动的环境里单独跑测试。
+所有参数都可用环境变量覆盖，默认值按单机部署规模给出。
 """
 from __future__ import annotations
 
@@ -52,19 +52,10 @@ class MemoryConfig:
 
     # --- 打分 ---
     half_life_days: float = 30.0        # 召回时的时间衰减半衰期
-    weight_text: float = 0.6            # 文本相关度权重（其内再拆字面 / 向量）
-    weight_recency: float = 0.2
-    weight_access: float = 0.1
-    weight_confidence: float = 0.1
-    weight_lexical: float = 0.7         # 文本通道里 BM25 占比
-    weight_semantic: float = 0.3        # 文本通道里余弦占比
-    min_cosine: float = 0.32            # 字面 0 命中时，余弦达到此值仍可召回
-
-    # --- 检索改写 / 嵌入 API ---
-    query_rewrite_llm: bool = False     # True 时改写再调一次主模型
-    embedding_base_url: str = ""        # 例如 https://api.openai.com/v1
-    embedding_api_key: str = ""
-    embedding_model: str = "text-embedding-3-small"
+    weight_text: float = 0.6            # 文本相关度权重
+    weight_recency: float = 0.2         # 新鲜度权重
+    weight_access: float = 0.1          # 被引用频次权重
+    weight_confidence: float = 0.1      # 置信度权重
 
     # --- 整合 / 遗忘 ---
     sweep_interval_seconds: int = 900   # 遗忘扫描的最小间隔，避免每轮都全量扫描
@@ -100,24 +91,15 @@ class MemoryConfig:
             max_warm_episodes=_env_int("MEMORY_MAX_WARM_EPISODES", 5),
             llm_extraction_enabled=_env_bool("MEMORY_LLM_EXTRACTION", False),
             memory_tools_enabled=_env_bool("MEMORY_TOOLS_ENABLED", True),
-            query_rewrite_llm=_env_bool("MEMORY_QUERY_REWRITE_LLM", False),
-            embedding_base_url=os.getenv("MEMORY_EMBEDDING_BASE_URL", "") or "",
-            embedding_api_key=(
-                os.getenv("MEMORY_EMBEDDING_API_KEY")
-                or os.getenv("OPENAI_API_KEY")
-                or ""
-            ),
-            embedding_model=os.getenv("MEMORY_EMBEDDING_MODEL", "text-embedding-3-small"),
-            weight_lexical=_env_float("MEMORY_WEIGHT_LEXICAL", 0.7),
-            weight_semantic=_env_float("MEMORY_WEIGHT_SEMANTIC", 0.3),
-            min_cosine=_env_float("MEMORY_MIN_COSINE", 0.32),
         )
 
 
 # Load .env when the optional application dependency is installed; the pure
 # memory unit tests can still run with only the standard library.
 try:
-    from .. import env_utils as _env_utils
+    # Imported for its side effect (loading .env), not for the name itself —
+    # removing it would silently stop .env from being read on this path.
+    from .. import env_utils as _env_utils  # noqa: F401
 except ModuleNotFoundError as exc:
     if exc.name != "dotenv":
         raise

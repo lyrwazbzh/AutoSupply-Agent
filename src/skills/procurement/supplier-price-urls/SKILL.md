@@ -14,7 +14,7 @@ version: 1.0.0
 
 | 供应商 | 报价系统URL | 备注 |
 |--------|------------|------|
-| 华胜机械制造 | https://example.com/huasheng/quote | 新能源汽车热管理零部件 |
+| 华胜机械制造 | https://example.com/huasheng/quote | 摩托车发动机配件 |
 | 恒达配件 | https://example.com/hengda/price | 制动系统配件 |
 | 金轮零部件 | https://example.com/jinlun/catalog | 传动系统配件 |
 | 远航橡塑 | https://example.com/yuanhang/quote | 密封件/橡胶件 |

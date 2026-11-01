@@ -10,13 +10,13 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langgraph.checkpoint.memory import InMemorySaver
 
-from src.test.test_memory_layer import FakeStore, Msg
-from src.agent.memory.keeper import MemoryKeeper
-from src.agent.memory.extractor import extract_preferences
 from src.agent.memory.config import MemoryConfig
+from src.agent.memory.extractor import extract_preferences
+from src.agent.memory.keeper import MemoryKeeper
 from src.agent.middlewares.memory_consolidation import MemoryConsolidationMiddleware
 from src.agent.middlewares.memory_update import MemoryUpdateMiddleware
-from src.agent.middlewares.warm_memory import WarmMemoryMiddleware, WARM_MEMORY_SLOT
+from src.agent.middlewares.warm_memory import WARM_MEMORY_SLOT, WarmMemoryMiddleware
+from src.test.test_memory_layer import FakeStore, Msg
 
 
 class Capture(AgentMiddleware):
@@ -33,26 +33,39 @@ class Capture(AgentMiddleware):
 
 
 class MemoryIntegrationTests(unittest.TestCase):
-    def test_real_async_graph_keeps_separate_threads_and_refreshes_memory(self):
+    def test_real_async_graph_keeps_threads_separate_and_refreshes_memory(self):
         async def run():
             store, capture = FakeStore(), Capture()
             keeper = MemoryKeeper(store, 'u1')
             keeper.upsert_semantic('note', 'first-memory')
             agent = create_agent(
-                model=FakeListChatModel(responses=['done']),
+                model=FakeListChatModel(responses=['done', 'done', 'done']),
                 system_prompt='Keep this instruction. ' + WARM_MEMORY_SLOT,
                 middleware=[WarmMemoryMiddleware(store, 'u1'), capture,
                             MemoryUpdateMiddleware(store, 'u1'),
                             MemoryConsolidationMiddleware(store, 'u1')],
                 checkpointer=InMemorySaver(),
             )
-            for tid, question in [('A', 'Compare suppliers'), ('B', 'Check inventory')]:
+            turns = [
+                ('A', 'Compare suppliers'),
+                ('A', 'Check inventory'),
+                ('B', 'Search orders'),
+            ]
+            for tid, question in turns:
                 await agent.ainvoke({'messages': [('user', question)]},
                                     config={'configurable': {'thread_id': tid}})
                 keeper.upsert_semantic('note', 'second-memory')
             episodes = keeper.list_items('episodic')
-            self.assertEqual({i.id for i in episodes}, {'ep_A', 'ep_B'})
+            self.assertEqual(
+                {i.id for i in episodes},
+                {'ep_A', 'ep_B'},
+            )
             self.assertEqual({i.source['thread_id'] for i in episodes}, {'A', 'B'})
+            self.assertEqual(
+                {i.goal for i in episodes},
+                {'Compare suppliers', 'Search orders'},
+            )
+            self.assertEqual({i.outcome for i in episodes}, {'done'})
             self.assertIn('first-memory', capture.prompts[0])
             self.assertIn('second-memory', capture.prompts[1])
             self.assertNotIn('first-memory', capture.prompts[1])
@@ -78,19 +91,28 @@ class MemoryIntegrationTests(unittest.TestCase):
         self.assertEqual(MemoryKeeper(store, 'u1').list_items('episodic'), [])
 
     def test_negation_correction_and_temporary_requests(self):
-        for text in ['以后不要用饼图', '这次用饼图', '以后不用柱状图']:
-            self.assertNotIn('preferred_chart_type', extract_preferences([Msg('human', text)]))
+        for text in ['以后不要用饼图', '以后不用柱状图']:
+            self.assertIsNone(
+                extract_preferences([Msg('human', text)])['preferred_chart_type']
+            )
+        self.assertNotIn(
+            'preferred_chart_type', extract_preferences([Msg('human', '这次用饼图')])
+        )
         result = extract_preferences([Msg('human', '以后不要用饼图，改成柱状图')])
         self.assertEqual(result['preferred_chart_type'], 'bar')
 
-    def test_old_turn_does_not_overwrite_newer_preference(self):
+    def test_all_user_turns_are_considered_and_latest_preference_wins(self):
         from langgraph.runtime import Runtime
         store = FakeStore()
         keeper = MemoryKeeper(store, 'u1')
         keeper.merge_preferences({'preferred_chart_type': 'bar'})
         MemoryUpdateMiddleware(store, 'u1').after_agent(
-            {'messages': [Msg('human', '以后用饼图'), Msg('ai', 'ok'), Msg('human', '你好')]}, Runtime())
-        self.assertEqual(keeper.load_preferences()['preferred_chart_type'], 'bar')
+            {'messages': [
+                Msg('human', '以后用饼图'),
+                Msg('ai', 'ok'),
+                Msg('human', '后来改成折线图'),
+            ]}, Runtime())
+        self.assertEqual(keeper.load_preferences()['preferred_chart_type'], 'line')
 
     def test_env_defaults_are_loaded(self):
         from src.agent.memory import config
@@ -107,10 +129,17 @@ class MemoryIntegrationTests(unittest.TestCase):
         store = FakeStore()
         middleware = MemoryUpdateMiddleware(store, 'u1', MemoryConfig(llm_extraction_enabled=True))
         with patch('src.agent.config.get_llm', return_value=object()), patch(
-            'src.agent.memory.extractor.llm_extract_preferences', return_value={'preferred_language': 'en'}
+            'src.agent.memory.extractor.llm_extract_preferences',
+            return_value={'preferred_chart_type': 'bar', 'preferred_language': 'en'},
         ) as extract:
-            middleware.after_agent({'messages': [Msg('human', 'Remember my language')]}, Runtime())
+            middleware.after_agent(
+                {'messages': [Msg('human', '以后用饼图，Remember my language')]},
+                Runtime(),
+            )
             extract.assert_called_once()
+        self.assertEqual(
+            MemoryKeeper(store, 'u1').load_preferences()['preferred_chart_type'], 'bar'
+        )
         self.assertEqual(MemoryKeeper(store, 'u1').load_preferences()['preferred_language'], 'en')
         with patch('src.agent.config.get_llm', side_effect=RuntimeError('offline')):
             middleware.after_agent({'messages': [Msg('human', '以后用饼图')]}, Runtime())

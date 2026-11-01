@@ -1,16 +1,16 @@
 """
 AgentLoader 单例
-持有 agent 实例、MongoDB 连接、create_config、save/get_display_messages
+持有 agent 实例、PostgreSQL 资源、create_config、save/get_display_messages
 """
 import asyncio
 import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
-from datetime import datetime
 
+from ..agent.audit.repository import WriteAuditRepository
 from ..agent.log_utils import web_logger
-from ..agent.schema import ProcurementContext
-from .web_config import get_db
+from ..agent.schema import PROCUREMENT_CONTEXT_CONFIG_KEY, ProcurementContext
+from .app_repository import AppRepository
 
 
 @dataclass
@@ -21,6 +21,8 @@ class AgentSession:
     username: str
     agent: Any
     run_lock: asyncio.Lock
+    warm_memory_middleware: Any
+    user_context: ProcurementContext
 
 
 class AgentLoader:
@@ -38,11 +40,14 @@ class AgentLoader:
         if self._initialized:
             return
         self._initialized = True
-        # ``agent`` 保留为旧代码的兼容字段；新链路一律使用 ``get_session``。
         self.agent = None
         self._checkpointer = None
         self._store = None
-        self._mongo_client = None
+        self._resources_ready = False
+        self._pg_pool = None
+        self._async_pg_pool = None
+        self._app_repository: AppRepository | None = None
+        self._write_audit_repository: WriteAuditRepository | None = None
         self._sessions: dict[str, AgentSession] = {}
         self._resources_lock: asyncio.Lock | None = None
         self._sessions_lock: asyncio.Lock | None = None
@@ -50,36 +55,45 @@ class AgentLoader:
         web_logger.info("AgentLoader initialized")
 
     async def _ensure_resources(self):
-        """初始化所有用户共享的 MongoDB Store / Checkpointer。"""
-        if self._store is not None:
+        """初始化所有用户共享的 PostgreSQL Store / Checkpointer。"""
+        if self._resources_ready:
             return
 
         if self._resources_lock is None:
             self._resources_lock = asyncio.Lock()
 
         async with self._resources_lock:
-            if self._store is not None:
+            if self._resources_ready:
                 return
             await asyncio.to_thread(self._initialize_resources_sync)
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+            from ..database import get_async_pg_pool
+
+            self._async_pg_pool = await get_async_pg_pool()
+            self._checkpointer = AsyncPostgresSaver(self._async_pg_pool)
+            await self._checkpointer.setup()
+            self._resources_ready = True
 
     def _initialize_resources_sync(self):
         """阻塞式资源初始化，调用方须放在线程池中。"""
         web_logger.info("Initializing shared Agent resources...")
         try:
-            from langgraph.checkpoint.mongodb import MongoDBSaver
-            from .mongodb_store import MongoDBStore
-            from .web_config import MONGODB_URI, MONGODB_DB_NAME
+            from langgraph.store.postgres import PostgresStore
 
-            # 生产级存储：MongoDB 持久化
-            from pymongo import MongoClient
-            mongo_client = MongoClient(MONGODB_URI)
-            self._checkpointer = MongoDBSaver(mongo_client)
-            self._mongo_client = mongo_client
-            self._store = MongoDBStore(
-                uri=MONGODB_URI,
-                db_name=MONGODB_DB_NAME,
-                collection_name="langgraph_store",
+            from ..database import (
+                get_pg_pool,
+                setup_database,
+                setup_memory_search_schema,
             )
+
+            setup_database()
+            self._pg_pool = get_pg_pool()
+            self._store = PostgresStore(self._pg_pool)
+            self._store.setup()
+            setup_memory_search_schema()
+            self._app_repository = AppRepository()
+            self._write_audit_repository = WriteAuditRepository()
             web_logger.info("Shared Agent resources initialized")
         except Exception as e:
             web_logger.error(f"Failed to initialize shared Agent resources: {e}")
@@ -90,6 +104,22 @@ class AgentLoader:
         await self._ensure_resources()
         if user_id is not None:
             await self.get_session(user_id, username)
+
+    async def shutdown(self) -> None:
+        """Close both PostgreSQL pools and discard agents bound to them."""
+        from ..database import close_async_pg_pool, close_pg_pool
+
+        self._sessions.clear()
+        self.agent = None
+        self._checkpointer = None
+        self._store = None
+        self._app_repository = None
+        self._write_audit_repository = None
+        self._pg_pool = None
+        self._async_pg_pool = None
+        self._resources_ready = False
+        await close_async_pg_pool()
+        await asyncio.to_thread(close_pg_pool)
 
     async def get_session(self, user_id: str, username: str = "用户") -> AgentSession:
         """获取用户独享的 Agent 会话，避免不同用户共享 Sandbox/中间件状态。"""
@@ -109,7 +139,7 @@ class AgentLoader:
                 if existing is not None:
                     return existing
 
-            agent = await asyncio.to_thread(
+            agent, warm_memory_middleware, user_context = await asyncio.to_thread(
                 self._build_agent_for_user, user_id, username
             )
             session = AgentSession(
@@ -117,6 +147,8 @@ class AgentLoader:
                 username=username,
                 agent=agent,
                 run_lock=asyncio.Lock(),
+                warm_memory_middleware=warm_memory_middleware,
+                user_context=user_context,
             )
             async with self._sessions_lock:
                 self._sessions[user_id] = session
@@ -128,27 +160,52 @@ class AgentLoader:
             return session
 
     def _build_agent_for_user(self, user_id: str, username: str):
-        """在线程池中构建 Agent；其中包含 Docker/Mongo 同步 I/O。"""
+        """在线程池中构建 Agent；其中包含 Docker/PostgreSQL 同步 I/O。"""
         from ..agent.main_agent import create_main_agent
+        from ..agent.middlewares.warm_memory import WarmMemoryMiddleware
 
-        context = ProcurementContext(user_id=user_id, username=username)
-        return create_main_agent(
+        context = ProcurementContext(
+            user_id=user_id,
+            username=username,
+        )
+        warm_memory_middleware = WarmMemoryMiddleware(
+            store=self._store,
+            user_id=user_id,
+            user_context=context,
+        )
+        agent = create_main_agent(
             user_context=context,
             checkpointer=self._checkpointer,
             store=self._store,
+            write_audit_repository=self._write_audit_repository,
+            warm_memory_middleware=warm_memory_middleware,
         )
+        return agent, warm_memory_middleware, context
 
     @property
     def store(self):
         """供请求级工具上下文读取的共享 Store。"""
         return self._store
 
+    @property
+    def write_audit_repository(self) -> WriteAuditRepository:
+        if self._write_audit_repository is None:
+            raise RuntimeError("Agent resources are not initialized")
+        return self._write_audit_repository
+
     def create_config(self, thread_id: str, user_id: str = "default_user") -> dict:
-        """创建 LangGraph 运行配置"""
+        """创建 LangGraph 配置并附带服务端生成的请求级采购上下文。"""
+        session = self._sessions.get(user_id)
+        context = (
+            session.user_context
+            if session is not None
+            else ProcurementContext(user_id=user_id)
+        )
         return {
             "configurable": {
                 "thread_id": thread_id,
                 "user_id": user_id,
+                PROCUREMENT_CONTEXT_CONFIG_KEY: context.model_dump(mode="json"),
             }
         }
 
@@ -157,81 +214,58 @@ class AgentLoader:
         return str(uuid.uuid4())
 
     async def save_display_messages(self, thread_id: str, messages: list):
-        """保存前端展示消息到 MongoDB"""
-        db = get_db()
-        await db.display_messages.update_one(
-            {"thread_id": thread_id},
-            {"$set": {"messages": messages, "updated_at": datetime.now().isoformat()}},
-            upsert=True,
+        """保存前端展示消息。"""
+        await self._ensure_resources()
+        await asyncio.to_thread(
+            self._app_repository.save_display_messages, thread_id, messages
         )
 
     async def get_display_messages(self, thread_id: str) -> list:
         """获取前端展示消息"""
-        db = get_db()
-        doc = await db.display_messages.find_one({"thread_id": thread_id})
-        return doc.get("messages", []) if doc else []
+        await self._ensure_resources()
+        return await asyncio.to_thread(
+            self._app_repository.get_display_messages, thread_id
+        )
 
     async def save_conversation(self, thread_id: str, user_id: str, title: str = "新对话"):
         """保存/更新会话记录"""
-        db = get_db()
-        await db.conversations.update_one(
-            {"thread_id": thread_id},
-            {"$set": {"user_id": user_id, "title": title, "updated_at": datetime.now().isoformat()},
-             "$setOnInsert": {"created_at": datetime.now().isoformat()}},
-            upsert=True,
+        await self._ensure_resources()
+        await asyncio.to_thread(
+            self._app_repository.save_conversation,
+            thread_id,
+            user_id,
+            title,
         )
 
     async def get_conversations(self, user_id: str) -> list:
         """获取用户的会话列表"""
-        db = get_db()
-        cursor = db.conversations.find({"user_id": user_id}).sort("updated_at", -1)
-        conversations = []
-        async for doc in cursor:
-            doc["_id"] = str(doc["_id"])
-            conversations.append(doc)
-        return conversations
+        await self._ensure_resources()
+        return await asyncio.to_thread(
+            self._app_repository.get_conversations, user_id
+        )
 
     async def get_conversation_user_id(self, thread_id: str) -> str | None:
         """查询会话归属，供 resume/state 选择正确的用户 Agent。"""
-        db = get_db()
-        doc = await db.conversations.find_one({"thread_id": thread_id}, {"user_id": 1})
-        return doc.get("user_id") if doc else None
+        await self._ensure_resources()
+        return await asyncio.to_thread(
+            self._app_repository.get_conversation_user_id, thread_id
+        )
 
     async def delete_conversation(self, thread_id: str):
         """删除会话"""
-        db = get_db()
-        await db.conversations.delete_one({"thread_id": thread_id})
-        await db.display_messages.delete_one({"thread_id": thread_id})
-        await db.harness_traces.delete_one({"thread_id": thread_id})
-        await db.dispatch_traces.delete_one({"thread_id": thread_id})
+        await self._ensure_resources()
+        await asyncio.to_thread(self._app_repository.delete_conversation, thread_id)
 
     async def save_harness_trace(self, thread_id: str, trace: list):
-        """保存 Harness 阶段流转 trace 到 MongoDB（可观测/审计）
+        """保存 Harness 阶段流转 trace（可观测/审计）。
 
         记录 Planning → Executing → Review → Result 各阶段的流转时间线，
         以及评审器的结构化判定结果，支持事后审计"哪一步卡住了"。
         """
-        db = get_db()
-        await db.harness_traces.update_one(
-            {"thread_id": thread_id},
-            {"$set": {"trace": trace, "updated_at": datetime.now().isoformat()}},
-            upsert=True,
+        await self._ensure_resources()
+        await asyncio.to_thread(
+            self._app_repository.save_harness_trace, thread_id, trace
         )
-
-    async def save_dispatch_trace(self, thread_id: str, events: list):
-        """保存 task 委派 start/end 事件到 MongoDB（并行重叠与审计）。"""
-        db = get_db()
-        await db.dispatch_traces.update_one(
-            {"thread_id": thread_id},
-            {"$set": {"events": events, "updated_at": datetime.now().isoformat()}},
-            upsert=True,
-        )
-
-    async def get_dispatch_trace(self, thread_id: str) -> list:
-        """读取会话的委派事件审计轨迹。"""
-        db = get_db()
-        doc = await db.dispatch_traces.find_one({"thread_id": thread_id})
-        return doc.get("events", []) if doc else []
 
 
 # 全局单例

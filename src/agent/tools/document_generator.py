@@ -13,21 +13,21 @@
 - 数据导出 → JSON
 - 会议纪要 → Markdown / HTML
 """
-import os
-import json
 import csv
 import io
-from pathlib import Path
+import json
 from datetime import datetime
+
 from langchain_core.tools import tool
 
+from ...artifacts import artifact_url, save_artifact_text
+from ..backends.sandbox_holder import get_sandbox
+from ..config import PUBLIC_BASE_URL
 from ..log_utils import agent_logger
-from ..backends.sandbox_holder import get_sandbox, has_sandbox
+from ..runtime_context import get_current_user_id
 
 # 沙箱内输出目录
 SANDBOX_OUTPUT_DIR = "/workspace/output"
-# 本地回退目录
-LOCAL_DOWNLOAD_DIR = Path(__file__).parent.parent.parent / "download"
 
 
 @tool
@@ -233,12 +233,12 @@ def _write_to_sandbox_or_local(filename: str, content: str, title: str, format_n
         except Exception as e:
             agent_logger.warning(f"Sandbox write failed ({e}), falling back to local")
 
-    # 回退：写入本地
-    LOCAL_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    file_path = LOCAL_DOWNLOAD_DIR / filename
-    file_path.write_text(content, encoding="utf-8")
+    # 回退：写入当前用户的临时 Artifact 目录
+    file_id, file_path = save_artifact_text(
+        get_current_user_id(), filename, content
+    )
     file_size = file_path.stat().st_size
-    download_url = f"http://localhost:8000/api/download/{file_path.name}"
+    download_url = artifact_url(PUBLIC_BASE_URL, file_id, file_path.name)
 
     agent_logger.info(f"Document generated locally: {file_path.name} ({file_size} bytes)")
     return (

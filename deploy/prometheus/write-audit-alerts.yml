@@ -1,0 +1,38 @@
+groups:
+  - name: erp-write-audit
+    rules:
+      - alert: ERPWriteNeedsManualReconciliation
+        expr: increase(erp_write_reconcile_total{outcome="manual_required"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ERP 写操作进入人工对账"
+          description: "自动回查仍无法确认 ERP 终态；请按 operation_id 查看写审计日志。"
+
+      - alert: ERPWriteReconciliationRepeatedlyDeferred
+        expr: increase(erp_write_reconcile_total{outcome="deferred"}[15m]) >= 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ERP 写操作对账持续不确定"
+          description: "15 分钟内至少 3 次回查未得到确定终态。"
+
+      - alert: ERPWriteReconciliationWorkerError
+        expr: increase(erp_write_reconcile_total{outcome="worker_error"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ERP 写操作补偿任务无法读取 PostgreSQL 队列"
+          description: "检查 PostgreSQL 连接与 audit.reconcile_jobs；写操作会保持 fail-closed。"
+
+      - alert: ERPWriteAuditPersistenceFailure
+        expr: increase(erp_write_audit_failure_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ERP 写审计持久化失败"
+          description: "前置失败时写入已阻断；终态失败时禁止重放并交由补偿任务对账。"
