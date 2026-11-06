@@ -1,11 +1,12 @@
-# autosupply-agent
+# AutoSupply-Agent
 
 面向汽车与摩托车零部件采购场景的全栈 Agent 系统。项目以 DeepAgents 与 LangGraph
 为执行底座，通过 Planning、Executing、Review、Result 四阶段 Harness 编排采购分析、
 供应商查询、库存操作和采购订单处理，并以 MCP 隔离 Agent 与 ERP 接口。
 
 系统同时提供规则优先、LLM 兜底的质量评审，写操作前人工审批，写后持久化审计与对账，
-以及用户级 Docker 沙箱、三层记忆、SSE 前端和容器化部署能力。
+以及用户级 Docker 沙箱、三层记忆、SSE 前端和容器化部署能力。本地联调默认对接仓库内
+`java_erp`（Spring Boot 采购 ERP）；Compose 全栈仍可使用行为一致的 Mock ERP。
 
 ## 核心能力
 
@@ -18,13 +19,16 @@
 - **主 Agent 与两个子 Agent**：主 Agent 通过 DeepAgents 的 `task` 工具按需选择采购分析或
   订单操作子 Agent；服务端从可信 `configurable` 自动注入用户身份、偏好和 WARM 记忆，
   不要求主 Agent 在委派文本中重复传递上下文。
-- **MCP 采购网关**：FastMCP 封装供应商、零部件、订单、库存四组工具，通过 HTTP
-  对接外部 ERP；仓库自带行为一致的 Mock ERP，可脱离未开源业务系统运行。
+- **MCP 采购网关**：FastMCP 封装供应商、零部件、订单、库存四组工具，通过 HTTP 对接 ERP；
+  契约为 `{code,message,data}`，业务错误保持 HTTP 200 + `body.code`。
+- **Java ERP 写契约**：`java_erp` 提供订单幂等键、同键不同 payload → `409`、
+  `GET /api/operations/{id}` 回查、`by-idempotency` 回查，以及订单/供应商状态与库存 CAS；
+  可选 Redis Lua 出库热路径与 `local_message` / RocketMQ 旁路（开关见 `java_erp/README.md`）。
 - **审批、评审与审计分层**：审批在 ERP 写入前阻断执行，Rubric 在执行后检查结果质量，
   写审计则持久化操作事实。三者职责独立，但主 Agent 直调和子 Agent 调用共享同一审批策略中心。
-- **通用写治理**：订单、库存、供应商和零部件写入统一生成操作记录与追加式审计事件；
-  使用 `thread_id + tool_call_id` 保证调用幂等，ERP 终态未知时进入补偿对账，不因审计保存失败重复写入；
-  错误拦截率 100%。
+- **通用写治理与结果审计**：订单、库存、供应商和零部件写入统一生成操作记录与追加式审计事件；
+  使用 `thread_id + tool_call_id` 保证调用幂等，ERP 终态未知时进入补偿对账，不因审计保存失败重复写入。
+  Result 阶段对写声明做门禁：有写声明须有回执、失败后不得再声称成功、最终答案须被回执覆盖。
 - **三层记忆**：HOT 使用 LangGraph checkpoint，WARM 在每次新请求或 HITL resume 时生成请求级快照，
   COLD 使用 PostgreSQL 中文全文检索与 pgvector 召回，通过 RRF 融合并维护访问频次、TTL、容量和冲突失效。
 - **用户级安全沙箱**：每个用户领取独立 Docker 沙箱，应用只读根文件系统、tmpfs、资源上限、
@@ -53,7 +57,7 @@ flowchart LR
     MAIN --> MCP[FastMCP Gateway]
     ANALYST --> MCP
     ORDER --> MCP
-    MCP --> ERP[External ERP / Mock ERP]
+    MCP --> ERP[java_erp / Mock ERP]
 
     MAIN --> PROXY[Sandbox Proxy]
     PROXY --> DIND[Docker-in-Docker]
@@ -91,9 +95,9 @@ ERP 写工具
   └─ ApprovalPolicyRegistry
       └─ LangGraph interrupt
           ├─ reject  → REJECTED，不调用 ERP
-          └─ approve → 写审计预登记 → ERP 调用
+          └─ approve → 写审计预登记 → ERP 调用（operationId / 幂等键）
                            ├─ 明确成功/失败 → 保存终态
-                           └─ UNKNOWN       → 补偿任务查询 ERP → 对账或人工处理
+                           └─ UNKNOWN       → 补偿任务拉取 /api/operations 或 by-idempotency → 对账或人工处理
 ```
 
 ## 技术栈
@@ -102,6 +106,7 @@ ERP 写工具
 |---|---|
 | Agent | DeepAgents 0.7、LangGraph 1.2、LangChain、OpenAI-compatible LLM |
 | API / 工具 | FastAPI、SSE、FastMCP、HTTPX |
+| ERP | `java_erp`：Spring Boot 3.1、JDK 17、MyBatis-Plus、MySQL；Compose 可选 Mock ERP |
 | 数据 | PostgreSQL 16、pgvector、zhparser、LangGraph PostgresSaver / Store |
 | 沙箱 | Docker SDK、Docker-in-Docker、seccomp、用户级资源隔离 |
 | 前端 | Next.js 16、React 19、TypeScript、Tailwind CSS 4 |
@@ -111,7 +116,7 @@ ERP 写工具
 ## 目录结构
 
 ```text
-autosupply-agent/
+AutoSupply-Agent/
 ├─ src/
 │  ├─ agent/
 │  │  ├─ main_agent.py             主 Agent、工具、子 Agent 与中间件组装
@@ -119,9 +124,9 @@ autosupply-agent/
 │  │  ├─ review_policy.py          规则优先、LLM 兜底的统一评审路由
 │  │  ├─ harness_config.yaml       阶段、路由配置与预设 Rubric
 │  │  ├─ approval.py               写工具审批策略唯一来源
-│  │  ├─ audit/                    写操作审计、状态机、对账与补偿任务
+│  │  ├─ audit/                    写操作审计、状态机、对账、补偿与结果审计
 │  │  ├─ backends/                 Docker 沙箱、预热池、Proxy 与生命周期管理
-│  │  ├─ middlewares/              评审、写治理、记忆、Skills 与沙箱中间件
+│  │  ├─ middlewares/              评审、写治理、结果审计、记忆、Skills 与沙箱中间件
 │  │  ├─ subagents/                采购分析 / 订单操作 YAML 配置
 │  │  ├─ memory/                   Semantic / Episodic / Procedural 三类记忆
 │  │  ├─ knowledge/                采购知识检索、RRF、证据与有界补搜
@@ -133,7 +138,7 @@ autosupply-agent/
 │  ├─ artifacts.py                 用户隔离临时文件与 TTL 清理
 │  └─ database.py                  PostgreSQL 连接池及应用 Schema 初始化
 ├─ frontend/                       Next.js 16 Web 前端
-├─ java_erp/                       Java 采购 ERP（本地联调默认 :8080）
+├─ java_erp/                       Spring Boot 采购 ERP（本地默认 :8080；Harness 写契约）
 ├─ deploy/
 │  ├─ postgres/                    pgvector + zhparser PostgreSQL 镜像
 │  ├─ mock-erp/                    可独立运行的采购 ERP 替身（Compose 默认）
@@ -153,7 +158,7 @@ autosupply-agent/
 ## 环境要求
 
 - Docker Engine 24+ 与 Docker Compose v2
-- 本地开发：Python 3.11、Node.js 22、npm 10+
+- 本地开发：Python 3.11、Node.js 22、npm 10+；联调 `java_erp` 另需 JDK 17、Maven、MySQL
 - 至少 4 GB 可用内存；增加预热沙箱数量时需要同步增加资源
 - 可用的 OpenAI-compatible LLM Key；默认配置使用 ChatAnywhere
 - Linux 服务器建议使用 ext4，或启用 `ftype=1` 的 xfs
@@ -166,8 +171,8 @@ Frontend、Docker 沙箱、Prometheus、Grafana 和 Nginx。
 ### 1. 准备配置
 
 ```bash
-git clone https://github.com/farhub-wq/autosupply-agent.git
-cd autosupply-agent
+git clone https://github.com/lyrwazbzh/AutoSupply-Agent.git
+cd AutoSupply-Agent
 
 cp deploy/.env.example deploy/.env
 cp deploy/nginx.env.example deploy/nginx.env
@@ -268,11 +273,13 @@ docker build -f deploy/sandbox/Dockerfile \
 分别启动四个进程：
 
 ```bash
-# 终端 1：Java ERP（需本机 MySQL；见 java_erp/README.md）
+# 终端 1：Java ERP（需本机 MySQL；完整说明见 java_erp/README.md）
 cd java_erp && mvn spring-boot:run
+# 可选冒烟：powershell -File java_erp/scripts/smoke_harness.ps1
+#           再执行 java_erp/docs/verify_invariants.sql
 
-# 或临时用 Mock ERP：python deploy/mock-erp/erp_mock_server.py
-# 并设置 ERP_BASE_URL=http://localhost:8081
+# 备选：Mock ERP（将 .env 中 ERP_BASE_URL 改为 http://localhost:8081）
+# python deploy/mock-erp/erp_mock_server.py
 
 # 终端 2：MCP
 python -m src.mcp_server.server_main
@@ -286,6 +293,17 @@ cd frontend && npm run dev
 
 本地模式访问 <http://localhost:3000/>。`MCP_SERVER_URL`、`ERP_BASE_URL`（默认
 `http://localhost:8080` 指向 `java_erp`）、`DATABASE_URL` 和 `SANDBOX_IMAGE` 以根目录 `.env` 为准。
+
+## ERP 后端选择
+
+| 模式 | 地址 | 适用 |
+|---|---|---|
+| `java_erp`（本地默认） | `ERP_BASE_URL=http://localhost:8080` | 幂等、operations 回查、状态/库存 CAS、可选 Redis/MQ |
+| Mock ERP（Compose 默认） | Compose 内 `mock-erp:8081`；本机进程可用 `:8081` | 无 MySQL 时快速起全栈 |
+
+供应商状态以 Java 枚举为准：`1=合作中, 2=已终止, 3=审核中`（历史 `0` 写库前归一为 `2`）。
+订单 `status=0` 或缺省写库前归一为 `1`（待审核）。接口细节见 [java_erp/README.md](java_erp/README.md)
+与 [java_erp/docs/API_DOCUMENTATION.md](java_erp/docs/API_DOCUMENTATION.md)。
 
 ## 记忆与知识检索
 
@@ -405,10 +423,12 @@ GitHub Actions 使用同一份可复用门禁，覆盖：
 - [构建、发布与回滚](deploy/cd/README.md)
 - [PostgreSQL 备份、恢复与演练](deploy/dr/README.md)
 - [CI 集成栈与数据库门禁](deploy/ci/README.md)
+- [Java ERP 联调、写契约与冒烟](java_erp/README.md)
 - [采购查询与错误拦截评测方案](eval.md)
 
 ## 来源与致谢
 
+- 仓库：[lyrwazbzh/AutoSupply-Agent](https://github.com/lyrwazbzh/AutoSupply-Agent)
 - Agent 框架：[DeepAgents](https://github.com/langchain-ai/deepagents) 与
   [LangGraph](https://github.com/langchain-ai/langgraph)
 - 工具协议：[Model Context Protocol](https://modelcontextprotocol.io/)
