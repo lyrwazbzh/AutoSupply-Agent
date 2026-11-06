@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.2.0](https://github.com/lyrwazbzh/AutoSupply-Agent/compare/v1.1.2...v1.2.0) (2026-11-06)
+
+
+### 新功能
+
+* update agent implementation ([67981b4](https://github.com/lyrwazbzh/AutoSupply-Agent/commit/67981b46f656c9c4ca3b4be88d46cdd4ccd567b5))
+* update AutoSupply-Agent ([b38b6af](https://github.com/lyrwazbzh/AutoSupply-Agent/commit/b38b6afa1cce3f2d768bd579a5280d77ae874d83))
+* wire java_erp as Harness backend and drop shortage surface ([ed580b0](https://github.com/lyrwazbzh/AutoSupply-Agent/commit/ed580b06bc06d58f896eb1b273b54757489deecc))
+
+
+### 文档
+
+* align root README with java_erp and current harness ([22ab01f](https://github.com/lyrwazbzh/AutoSupply-Agent/commit/22ab01fb4d6a57096e3edd062518cfb585215ae7))
+
 ## [1.1.2](https://github.com/farhub-wq/Agent-Harness/compare/v1.1.1...v1.1.2) (2026-10-09)
 
 
