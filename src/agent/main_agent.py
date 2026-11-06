@@ -356,14 +356,13 @@ def create_main_agent(
         search_business_knowledge,
     )
     from .tools.mcp_client import load_mcp_tools_sync
-    from .tools.shortage_order_tools import freeze_shortage_suggestion
     from .tools.skill_management import list_user_skills
     from .tools.web_fetch import install_skill, web_fetch
     from .tools.web_search import web_search
 
     mcp_tools = load_mcp_tools_sync()
     custom_tools = [generate_chart, web_search, web_fetch, install_skill, list_user_skills, request_order_info,
-                    freeze_shortage_suggestion, search_business_knowledge,
+                    search_business_knowledge,
                     ingest_business_knowledge, ingest_pdf_knowledge,
                     download_sandbox_file, list_sandbox_files,
                     generate_document, generate_table_report]
@@ -423,14 +422,12 @@ def create_main_agent(
     # Harness 阶段状态机 + 评审器（真 Harness 架构核心）
     from .harness import HarnessPhaseMiddleware, load_harness_config
     from .middlewares.grader_transcript import build_grader_messages
-    from .middlewares.memory_consolidation import MemoryConsolidationMiddleware
-    from .middlewares.memory_update import MemoryUpdateMiddleware
+    from .middlewares.memory_lifecycle import MemoryLifecycleMiddleware
     from .middlewares.review_gate import ReviewExecutionGate, SafeRubricMiddleware
+    from .middlewares.result_audit import ResultAuditMiddleware
     from .middlewares.sandbox_breaker import SandboxCircuitBreakerMiddleware
     from .middlewares.sandbox_health import SandboxHealthMiddleware
-    from .middlewares.skills_sync import SkillsSyncMiddleware
-    from .middlewares.tools_summarization import ToolsSummarizationMiddleware
-    from .middlewares.user_skills_restore import UserSkillsRestoreMiddleware
+    from .middlewares.skills_lifecycle import SkillsLifecycleMiddleware
     from .middlewares.warm_memory import WARM_MEMORY_SLOT, WarmMemoryMiddleware
 
     # 读取 Harness DSL 配置中的评审迭代上限
@@ -445,16 +442,12 @@ def create_main_agent(
     # - FilesystemMiddleware, SkillsMiddleware, SubAgentMiddleware
     # - TodoListMiddleware, PatchToolCallsMiddleware, MemoryMiddleware
     # 我们只需添加自定义中间件 + 调用限制
-    # 沙箱重建后不仅替换底层 Docker 连接，还要重新填充项目、基础 Skills 和
-    # 用户持久化 Skills。两个中间件持有同一个稳定 Proxy，缓存必须一起失效。
-    skills_sync_middleware = SkillsSyncMiddleware(
+    # 沙箱重建后替换 Proxy 底层并重填项目 / 基础 Skills / 用户 Skills。
+    skills_lifecycle_middleware = SkillsLifecycleMiddleware(
         skills_dir=SKILLS_DIR,
         sandbox_backend=sandbox_backend if managed_sandbox else None,
-    )
-    user_skills_restore_middleware = UserSkillsRestoreMiddleware(
         store=store,
         user_id=user_context.user_id,
-        sandbox_backend=sandbox_backend if managed_sandbox else None,
     )
 
     def _prepare_sandbox_replacement(replacement) -> None:
@@ -462,15 +455,14 @@ def create_main_agent(
         bootstrap_sandbox(replacement)
 
     def _rehydrate_after_sandbox_rebuild(_replacement) -> None:
-        skills_sync_middleware.invalidate()
-        user_skills_restore_middleware.invalidate()
+        skills_lifecycle_middleware.invalidate()
         # 基础 Skills 已由 bootstrap 恢复；增量同步及用户 Skills 属于可降级能力。
         try:
-            skills_sync_middleware.sync_now()
+            skills_lifecycle_middleware.sync_now()
         except Exception as exc:
             agent_logger.warning(f"Incremental core Skill sync degraded: {exc}")
         try:
-            user_skills_restore_middleware.restore_now()
+            skills_lifecycle_middleware.restore_now()
         except Exception as exc:
             agent_logger.warning(f"User Skill restore degraded: {exc}")
 
@@ -502,45 +494,27 @@ def create_main_agent(
     )
 
     middlewares = [
-        # --- 自定义中间件（执行顺序 1→7）---
-        sandbox_health_middleware,                                    # 1. 沙箱健康检查 + 重建
-        HarnessPhaseMiddleware(
-            router_model=router_llm, store=store, user_id=user_context.user_id
-        ),                                                              # 2. 混合路由 + rubric 注入
-        warm_memory_middleware,                                        # 3. 请求级 WARM 快照
-        skills_sync_middleware,                                       # 4. 基础 Skills 同步
-        user_skills_restore_middleware,                               # 5. 用户 Skills 恢复
-        ToolsSummarizationMiddleware(),                               # 6. 摘要监控
-        MemoryUpdateMiddleware(store=store, user_id=user_context.user_id),  # 7. 偏好提取
-        MemoryConsolidationMiddleware(
-            store=store, user_id=user_context.user_id
-        ),                                                            # 7.5 情节归档 + 遗忘
-        sandbox_breaker_middleware,  # 8. 按 sandbox_id + generation 隔离的基础设施熔断器
-        # --- Harness 评审器（RubricMiddleware）---
-        # 收到 rubric 后，grader 子Agent 结构化产出 satisfied/needs_revision/failed，
-        # needs_revision 时自动打回模型重做，形成真实 Review 回路（非 prompt 软约束）
-        # prepare_messages_for_grader：grader 只看转录尾部（框架窗口 30 条），
-        # 而一轮任务常有 30+ 次工具调用，不压缩的话带证据的 ERP 查询会被挤出
-        # 窗口，评审判「无工具证据」而永不通过。见 grader_transcript.py。
+        sandbox_health_middleware,                      # 沙箱探活 / 重建
+        HarnessPhaseMiddleware(router_model=router_llm),  # 是否评审 + task_type + rubric
+        warm_memory_middleware,                         # 请求级 WARM 快照
+        skills_lifecycle_middleware,                    # 基础 Skills 同步 + 用户 Skills 恢复
+        MemoryLifecycleMiddleware(store=store, user_id=user_context.user_id),
+        sandbox_breaker_middleware,                     # 沙箱工具熔断
+        ResultAuditMiddleware(store=store, user_id=user_context.user_id),
         SafeRubricMiddleware(
             model=grader_llm,
             max_iterations=_review_max_iterations,
             prepare_messages_for_grader=build_grader_messages,
         ),
-        ReviewExecutionGate(_harness_config),  # after_agent 逆序：先升级，再审查
+        ReviewExecutionGate(_harness_config),           # after 逆序：先升级再审查
         ERPWriteMiddleware(
             repository=write_audit_repository,
             user_id=user_context.user_id,
             agent_name="main",
             store=store,
-        ),  # ERP 写前校验、审计、幂等与终态落库；终态失败只对账，绝不自动重放
-        # DeepAgents 内置 task 只选择 subagent_type 并传递 description；
-        # 子 Agent 从父运行继承 configurable，由 ContextInjectionMiddleware
-        # 读取可信身份、偏好和 WARM 记忆。
-        # --- 审批由 create_deep_agent(interrupt_on=compiled_main_policy) 统一注册 ---
-        # --- 框架内置中间件（调用限制）---
-        ModelCallLimitMiddleware(run_limit=MAX_MODEL_CALLS),          # 模型调用上限
-        ToolCallLimitMiddleware(run_limit=MAX_TOOL_CALLS),            # 工具调用上限
+        ),
+        ModelCallLimitMiddleware(run_limit=MAX_MODEL_CALLS),
+        ToolCallLimitMiddleware(run_limit=MAX_TOOL_CALLS),
     ]
 
     # ===== 6. 构建系统提示词 =====
@@ -565,7 +539,7 @@ def create_main_agent(
 
     # ===== 7. 创建 Agent =====
     # ❌ 不传 skills 参数（框架内置 SkillsMiddleware 无法处理含中文路径）
-    # ✅ Skills 通过 _load_skills_prompt 注入 system_prompt + SkillsSyncMiddleware 同步到沙箱
+    # ✅ Skills 通过 _load_skills_prompt 注入 system_prompt + SkillsLifecycleMiddleware 同步到沙箱
     agent = create_deep_agent(
         model=llm,
         tools=all_tools,

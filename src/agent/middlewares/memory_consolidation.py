@@ -54,14 +54,14 @@ class MemoryConsolidationMiddleware(AgentMiddleware):
                 keeper.archive_episode(
                     thread_id,
                     goal=digest.get("goal", ""),
-                    outcome=digest.get("outcome", ""),
-                    tool_results=digest.get("tool_results"),
                     summary=digest.get("summary", ""),
                     task_type=digest.get("task_type", "general"),
                     tags=digest.get("tags"),
+                    tools=digest.get("tools"),
                     source={
                         "thread_id": thread_id,
-                        "task_type": digest.get("task_type", "general"),
+                        "task_type": digest.get("task_type"),
+                        "tools": digest.get("tools", [])[:10],
                     },
                 )
                 middleware_logger.debug(

@@ -1,0 +1,98 @@
+# Java
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+*.log
+
+# Maven
+target/
+.mvn/
+mvnw
+mvnw.cmd
+.mvn/wrapper/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+*.swp
+*.swo
+*~
+.DS_Store
+.vscode/
+*.code-workspace
+
+# Eclipse
+.settings/
+.classpath
+.project
+.metadata/
+bin/
+
+# NetBeans
+/nbproject/private/
+/nbproject/
+/build/
+
+# Build
+out/
+build/
+.gradle/
+
+# Logs
+logs/
+*.log
+log/
+
+# Database
+*.db
+*.sqlite
+*.h2.db
+
+# Local overrides only（仓库内保留 application.yml 作为 Harness 默认）
+application-local.yml
+application-local.properties
+
+# Uploads
+uploads/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+
+# System files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Documentation
+docs/_build/
+
+# Claude Code
+.claude/
+
+# Package Files
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
+# Virtual Machine
+*.vdi
+*.vbox
+*.vbox-prev

@@ -466,6 +466,91 @@ class WriteAuditRepository:
             manual_job=outcome == "MANUAL_REQUIRED",
         )
 
+    def list_manual_required(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """运维台：待人工处理的写操作队列。"""
+        with self.pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM audit.write_operations
+                WHERE status = 'MANUAL_REQUIRED'
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (max(1, min(int(limit), 500)),),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def resolve_manual(
+        self,
+        operation_id: str,
+        *,
+        resolution: str,
+        actor_id: str,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """运维确认人工处理完毕并结案。
+
+        resolution:
+        - succeeded → MANUAL_RESOLVED_SUCCEEDED（视为已落账，可幂等回放结果）
+        - not_applied → MANUAL_RESOLVED_NOT_APPLIED（允许用户新请求重试）
+        - abandoned → MANUAL_RESOLVED_ABANDONED（结案，禁止静默重试）
+        """
+        mapping = {
+            "succeeded": "MANUAL_RESOLVED_SUCCEEDED",
+            "not_applied": "MANUAL_RESOLVED_NOT_APPLIED",
+            "abandoned": "MANUAL_RESOLVED_ABANDONED",
+        }
+        status = mapping.get((resolution or "").strip().lower())
+        if status is None:
+            raise ValueError(
+                "resolution must be one of: succeeded, not_applied, abandoned"
+            )
+        if not (actor_id or "").strip():
+            raise ValueError("actor_id is required")
+
+        with self.pool.connection() as conn:
+            with conn.transaction(), conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM audit.write_operations WHERE operation_id = %s FOR UPDATE",
+                    (operation_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise KeyError(f"unknown write operation: {operation_id}")
+                operation = dict(row)
+                if operation.get("status") != "MANUAL_REQUIRED":
+                    raise ValueError(
+                        f"operation status is {operation.get('status')}, "
+                        "only MANUAL_REQUIRED can be resolved"
+                    )
+                self._update_operation(cur, operation_id, status=status)
+                self._insert_event(
+                    cur,
+                    operation=operation,
+                    event_type="manual_resolved",
+                    event_key=f"manual_resolved:{uuid.uuid4().hex}",
+                    actor_id=actor_id.strip(),
+                    detail={
+                        "resolution": resolution.strip().lower(),
+                        "note": (note or "")[:2000],
+                        "status": status,
+                    },
+                )
+                cur.execute(
+                    """
+                    UPDATE audit.reconcile_jobs
+                    SET job_status = 'DONE', locked_by = NULL, locked_at = NULL,
+                        updated_at = now()
+                    WHERE operation_id = %s
+                    """,
+                    (operation_id,),
+                )
+                cur.execute(
+                    "SELECT * FROM audit.write_operations WHERE operation_id = %s",
+                    (operation_id,),
+                )
+                return dict(cur.fetchone())
+
     def _transition(
         self,
         operation_id: str,

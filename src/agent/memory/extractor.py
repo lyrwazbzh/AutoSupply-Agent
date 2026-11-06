@@ -113,36 +113,6 @@ def _tool_name_of(message: Any) -> str:
     return str(name) if isinstance(name, str) else ""
 
 
-def _collect_tool_results(messages: Sequence[Any]) -> List[Dict[str, Any]]:
-    calls: Dict[str, dict] = {}
-    for message in messages:
-        for call in _tool_calls_of(message):
-            call_id = str(call.get("id") or "")
-            if call_id:
-                calls[call_id] = call
-
-    results: List[Dict[str, Any]] = []
-    for message in messages:
-        if _role_of(message) != "tool":
-            continue
-        call_id = str(getattr(message, "tool_call_id", "") or "")
-        call = calls.get(call_id)
-        status = getattr(message, "status", None)
-        if call is None or status not in ("success", "error"):
-            continue
-        args = dict(call.get("args") or {})
-        metadata = getattr(message, "additional_kwargs", None)
-        if isinstance(metadata, dict) and metadata.get("write_operation_id"):
-            args.setdefault("operation_id", str(metadata["write_operation_id"]))
-        results.append({
-            "tool": str(call.get("name") or _tool_name_of(message)),
-            "args": args,
-            "status": status,
-            "result": getattr(message, "content", None),
-        })
-    return results
-
-
 # ---------------------------------------------------------------- 偏好抽取
 
 def _has_trigger(text: str) -> bool:
@@ -317,7 +287,7 @@ def summarize_episode(
     config: Optional[MemoryConfig] = None,
     thread_id: str = "",
 ) -> Dict[str, Any]:
-    """把当前 thread（一个完整业务任务）压成一条情节记忆。"""
+    """把当前 thread 压成一条情节记忆（轻摘要：首问 + 末答 + 工具名）。"""
     cfg = config or DEFAULT_MEMORY_CONFIG
     window = list(messages or [])
     if not window:
@@ -337,8 +307,15 @@ def summarize_episode(
                 outcome = text
                 break
 
-    tool_results = _collect_tool_results(window)
-    tools = list(dict.fromkeys(result["tool"] for result in tool_results))
+    tools: List[str] = []
+    for message in window:
+        for call in _tool_calls_of(message):
+            name = str(call.get("name") or "")
+            if name and name not in tools:
+                tools.append(name)
+        standalone = _tool_name_of(message)
+        if standalone and _role_of(message) == "tool" and standalone not in tools:
+            tools.append(standalone)
 
     limit = max(80, cfg.episode_summary_chars)
     summary_parts = []
@@ -355,12 +332,10 @@ def summarize_episode(
 
     return {
         "goal": goal[:200],
-        "outcome": outcome[:limit],
         "summary": summary,
         "task_type": task_type,
         "tags": tags,
         "tools": tools[:20],
-        "tool_results": tool_results,
         "turns": sum(1 for m in window if _role_of(m) in ("human", "user")),
         "thread_id": thread_id,
     }

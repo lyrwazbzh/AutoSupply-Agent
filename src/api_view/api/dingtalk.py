@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from ..dingtalk_channel import (
     DingTalkStreamConsumer,
     parse_approval_callback,
-    publish_shortage_approval,
+    publish_approval,
     verify_dingtalk_sign,
 )
 
@@ -32,8 +32,8 @@ async def dingtalk_health():
 
 @router.post("/approvals/push")
 async def push_approval(body: FreezePushBody):
-    """渲染并推送缺料审批卡（webhook/robot/dry_run）。"""
-    return publish_shortage_approval(
+    """渲染并推送采购审批卡（webhook/robot/dry_run）。"""
+    return publish_approval(
         thread_id=body.thread_id,
         frozen_suggestion=body.frozen_suggestion,
         userid=body.dingtalk_userid,

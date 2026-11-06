@@ -245,52 +245,6 @@ def seed() -> None:
     store._seq["order"] = 31
 
 
-def seed_shortage() -> None:
-    """缺料主链种子：车型 A-125 BOM / 计划 / 在途 / 库存覆盖。"""
-    from shortage_seed import (
-        BOM_ROWS,
-        BOM_VERSION,
-        INVENTORY_OVERRIDE,
-        PLANT_ID,
-        PROCUREMENT_PROFILE,
-        VEHICLE_MODEL,
-        build_open_pos,
-        build_plans,
-    )
-
-    store.vehicles = [
-        {
-            "vehicleModel": VEHICLE_MODEL,
-            "name": "车型A-125",
-            "plantIds": [PLANT_ID],
-            "bomVersion": BOM_VERSION,
-        }
-    ]
-    store.bom_lines = [
-        {
-            "vehicleModel": VEHICLE_MODEL,
-            "bomVersion": BOM_VERSION,
-            "partId": row["partId"],
-            "qtyPerVehicle": row["qtyPerVehicle"],
-            "partCode": row["partCode"],
-            "partName": row["partName"],
-        }
-        for row in BOM_ROWS
-    ]
-    store.production_plans = build_plans(NOW)
-    store.open_pos = build_open_pos(NOW)
-    store.procurement_profiles = {
-        pid: dict(profile) for pid, profile in PROCUREMENT_PROFILE.items()
-    }
-
-    for part_id, qty in INVENTORY_OVERRIDE.items():
-        inv = find_inventory_by_part(part_id)
-        if inv is not None:
-            inv["currentQuantity"] = qty
-            inv["lastUpdateTime"] = NOW.strftime("%Y-%m-%d %H:%M:%S")
-            inv["allocated"] = 0
-
-
 seed()
 
 
@@ -363,9 +317,6 @@ def in_range(ts: str, start: Optional[str], end: Optional[str]) -> bool:
     return True
 
 
-seed_shortage()
-
-
 app = FastAPI(title="Mock ERP Backend", version="1.0.0")
 
 
@@ -376,10 +327,7 @@ async def root():
         "suppliers": len(store.suppliers),
         "parts": len(store.parts),
         "orders": len(store.orders),
-        "vehicles": len(store.vehicles),
-        "bomLines": len(store.bom_lines),
-        "productionPlans": len(store.production_plans),
-        "openPos": len(store.open_pos),
+        "inventory": len(store.inventory),
     })
 
 
@@ -647,7 +595,7 @@ async def orders_create(payload: dict = Body(...)):
                 "idempotencyKey": idem,
                 "payloadHash": payload_hash,
                 "status": "SENDING",
-                "calc_run_id": payload.get("calc_run_id"),
+                "evidence_id": payload.get("evidence_id"),
                 "suggestion_id": payload.get("suggestion_id"),
             }
         order_id = store.next_id("order")
@@ -660,7 +608,7 @@ async def orders_create(payload: dict = Body(...)):
             "status": int(payload.get("status", 0)),
             "orderTime": order_time,
             "remark": payload.get("remark", ""),
-            "calc_run_id": payload.get("calc_run_id"),
+            "evidence_id": payload.get("evidence_id"),
             "suggestion_id": payload.get("suggestion_id"),
             "idempotencyKey": idem,
             "payloadHash": payload.get("payloadHash") or payload_hash,
@@ -875,7 +823,7 @@ async def orders_update_status(
 # ============================================================
 
 def inventory_view(inv: dict) -> dict:
-    # allocated 缺料口径字段；历史种子默认 0
+    # allocated 字段；历史种子默认 0
     if "allocated" not in inv:
         inv["allocated"] = 0
     part = find_part(inv["partId"])
@@ -1001,185 +949,9 @@ async def inventory_get(iid: int):
         return fail(f"库存记录不存在: {iid}", 404)
     return ok(inventory_view(inv))
 
-
-# ============================================================
-# 缺料主链 /api/shortage/*
-# ============================================================
-
-@app.get("/api/shortage/vehicles")
-async def shortage_vehicles():
-    return ok(list(store.vehicles))
-
-
-@app.get("/api/shortage/bom")
-async def shortage_bom(vehicleModel: str = Query(...)):
-    rows = [b for b in store.bom_lines if b["vehicleModel"] == vehicleModel]
-    if not rows:
-        return fail(f"未找到车型 BOM: {vehicleModel}", 404)
-    enriched = []
-    for row in rows:
-        part = find_part(row["partId"])
-        enriched.append({
-            **row,
-            "unit": part["unit"] if part else "",
-            "purchasePrice": part["purchasePrice"] if part else 0,
-            "supplierId": part["supplierId"] if part else None,
-        })
-    return ok({
-        "vehicleModel": vehicleModel,
-        "bomVersion": rows[0].get("bomVersion"),
-        "lines": enriched,
-    })
-
-
-@app.get("/api/shortage/production-plan")
-async def shortage_production_plan(
-    vehicleModel: str = Query(...),
-    plantId: str = Query(...),
-    fromDate: Optional[str] = None,
-    toDate: Optional[str] = None,
-):
-    rows = [
-        p for p in store.production_plans
-        if p["vehicleModel"] == vehicleModel and p["plantId"] == plantId
-    ]
-    if fromDate:
-        rows = [p for p in rows if p["planDate"] >= fromDate[:10]]
-    if toDate:
-        rows = [p for p in rows if p["planDate"] <= toDate[:10]]
-    return ok(rows)
-
-
-@app.get("/api/shortage/open-pos")
-async def shortage_open_pos(partId: Optional[int] = None):
-    rows = list(store.open_pos)
-    if partId is not None:
-        rows = [r for r in rows if r["partId"] == partId]
-    return ok(rows)
-
-
-@app.get("/api/shortage/context")
-async def shortage_context(
-    vehicleModel: str = Query(...),
-    plantId: str = Query(...),
-    horizonDays: int = Query(7),
-    asOf: Optional[str] = None,
-):
-    """组装缺料计算所需快照（供 Agent/MCP 侧 shortage_engine 使用）。"""
-    as_of = (asOf or NOW.strftime("%Y-%m-%d"))[:10]
-    horizon = max(1, horizonDays)
-    end = (datetime.strptime(as_of, "%Y-%m-%d") + timedelta(days=horizon - 1)).strftime("%Y-%m-%d")
-
-    bom_rows = [b for b in store.bom_lines if b["vehicleModel"] == vehicleModel]
-    if not bom_rows:
-        return fail(f"未找到车型 BOM: {vehicleModel}", 404)
-    bom_lines = []
-    for row in bom_rows:
-        part = find_part(row["partId"])
-        bom_lines.append({
-            **row,
-            "unit": part["unit"] if part else "",
-            "purchasePrice": part["purchasePrice"] if part else 0,
-            "priceRef": f"parts:{row['partId']}:purchasePrice:{NOW.strftime('%Y-%m-%d')}",
-            "supplierId": part["supplierId"] if part else None,
-        })
-    bom_data = {
-        "vehicleModel": vehicleModel,
-        "bomVersion": bom_rows[0].get("bomVersion"),
-        "lines": bom_lines,
-    }
-
-    plans = [
-        p for p in store.production_plans
-        if p["vehicleModel"] == vehicleModel
-        and p["plantId"] == plantId
-        and as_of <= p["planDate"] <= end
-    ]
-
-    part_ids = [line["partId"] for line in bom_data["lines"]]
-    inventory_rows = []
-    supplier_rows = []
-    for pid in part_ids:
-        inv = find_inventory_by_part(pid)
-        part = find_part(pid)
-        if inv:
-            inventory_rows.append({
-                "partId": pid,
-                "onHand": inv["currentQuantity"],
-                "allocated": inv.get("allocated", 0),
-                "inventoryId": inv["id"],
-                "unit": part["unit"] if part else "",
-                "inventoryStatus": "available",
-            })
-        else:
-            inventory_rows.append({
-                "partId": pid, "onHand": 0, "allocated": 0, "inventoryId": None,
-            })
-        if part:
-            supplier = find_supplier(part["supplierId"])
-            profile = store.procurement_profiles.get(
-                pid, {"leadTimeDays": 7, "moq": 1, "orderMultiple": 1}
-            )
-            supplier_rows.append({
-                "partId": pid,
-                "supplierId": part["supplierId"],
-                "supplierName": supplier["name"] if supplier else "",
-                "status": supplier["status"] if supplier else 0,
-                "creditRating": supplier["creditRating"] if supplier else "",
-                "leadTimeDays": profile["leadTimeDays"],
-                "moq": profile["moq"],
-                "orderMultiple": profile.get("orderMultiple", 1),
-                "maxOrderQty": profile.get("maxOrderQty"),
-            })
-
-    open_pos = [
-        {
-            "partId": r["partId"],
-            "quantity": r["quantity"],
-            "expectedDate": r["expectedDate"],
-            "orderNumber": r["orderNumber"],
-            "orderStatus": r["status"],
-            "unit": (find_part(r["partId"]) or {}).get("unit", ""),
-            "receivedQty": 0,
-        }
-        for r in store.open_pos
-        if r["partId"] in part_ids
-    ]
-
-    return ok({
-        "vehicleModel": vehicleModel,
-        "plantId": plantId,
-        "asOf": as_of,
-        "horizonDays": horizon,
-        "windowEnd": end,
-        "caliberVersion": "shortage-口径/v2",
-        "sourceVersions": {
-            "bom": bom_rows[0].get("bomVersion"),
-            "inventory": f"mock:{as_of}",
-            "openPos": f"mock:{as_of}",
-            "supplierConstraints": "mock:v2",
-        },
-        "sourceReadTimes": {
-            "bom": NOW.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "plans": NOW.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "inventory": NOW.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "openPos": NOW.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "suppliers": NOW.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        },
-        "bom": bom_data,
-        "plans": plans,
-        "inventory": inventory_rows,
-        "openPos": open_pos,
-        "suppliers": supplier_rows,
-    })
-
-
 if __name__ == "__main__":
     print(f"[mock-erp] 种子数据: {len(store.suppliers)} 供应商 / "
           f"{len(store.parts)} 零部件 / {len(store.orders)} 订单 / "
           f"{len(store.inventory)} 库存记录")
-    print(f"[mock-erp] 缺料种子: {len(store.vehicles)} 车型 / "
-          f"{len(store.bom_lines)} BOM行 / {len(store.production_plans)} 计划 / "
-          f"{len(store.open_pos)} 在途")
     print("[mock-erp] 监听 http://0.0.0.0:8081")
     uvicorn.run(app, host="0.0.0.0", port=8081)

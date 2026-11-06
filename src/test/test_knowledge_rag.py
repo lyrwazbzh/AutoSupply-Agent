@@ -54,7 +54,7 @@ class HybridRetrieveTests(unittest.TestCase):
 
     def test_bm25_index_ranks_title(self):
         idx = get_bm25_index(self.store.all())
-        hits = idx.search("缺料补货采购 SOP", top_k=3)
+        hits = idx.search("采购补货 SOP", top_k=3)
         self.assertTrue(hits)
         self.assertEqual(hits[0][0].id, "sop-po-002")
 

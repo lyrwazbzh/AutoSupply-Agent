@@ -1,7 +1,8 @@
 """三层记忆（HOT/WARM/COLD）的验证测试。
 
-设计原则：**不依赖 MongoDB、Docker、LLM API、langchain**，用内存假 Store 跑，
-所以 `python -m src.test.test_memory_layer` 在任何 Python 3.10+ 上都能跑通。
+设计原则：**不依赖 Docker、LLM API、langchain**；CRUD/冲突/遗忘用内存假 Store。
+Keeper 生产路径只认 PG 检索索引；涉及 ``search`` 的用例通过 shim 把
+``postgres_search`` 接到假 Store（不在 Keeper 内保留双路径）。
 
 覆盖：
 - P0 修复：偏好合并不再丢字段、提取维度补全
@@ -19,8 +20,10 @@ from __future__ import annotations
 
 import sys
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import List, Optional
+from unittest.mock import patch
 
 from src.agent.memory import (
     MemoryConfig,
@@ -50,8 +53,33 @@ class FakeItem:
         self.value = value
 
 
+@contextmanager
+def _pg_search_shim(keeper: MemoryKeeper):
+    """单测用：把 PG 召回/touch/index 接到当前 FakeStore 上的 keeper。"""
+
+    def recall_lanes(user_id, query, *, limit, config, query_embedding=None, now=None):
+        items = [item for item in keeper.all_items() if item.is_valid(now)]
+        lane = items[: max(1, int(limit))]
+        return lane, lane
+
+    def touch(user_id, items):
+        for item in items:
+            item.touch()
+            keeper.put(item)
+
+    with (
+        patch("src.agent.memory.postgres_search.index_item"),
+        patch(
+            "src.agent.memory.postgres_search.recall_ranked_lanes",
+            side_effect=recall_lanes,
+        ),
+        patch("src.agent.memory.postgres_search.touch_items", side_effect=touch),
+    ):
+        yield
+
+
 class FakeStore:
-    """最小 BaseStore 替身：只实现 get/put/search/delete。"""
+    """最小 Store 替身：只实现 get/put/search/delete（测 CRUD，不测真 PG SQL）。"""
 
     def __init__(self, fail: bool = False):
         self.data = {}
@@ -338,7 +366,8 @@ def test_old_episodes_demote_out_of_warm():
     assert [i.key for i in recent] == ["t-new"], [i.key for i in recent]
 
     # 但老会话仍在 COLD，可被检索到
-    hits = keeper.search("老会话")
+    with _pg_search_shim(keeper):
+        hits = keeper.search("老会话")
     assert any(h[0].key == "t-old" for h in hits), hits
 
 
@@ -362,7 +391,7 @@ def test_episode_archive_updates_one_task_per_thread():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1")
     keeper.archive_episode("t-1", summary="处理中")
-    keeper.archive_episode("t-1", summary="完成缺料分析")
+    keeper.archive_episode("t-1", summary="完成采购分析")
 
     episodes = keeper.list_items("episodic")
     assert len(episodes) == 1
@@ -391,20 +420,19 @@ def test_episode_summary_shape():
     digest = summarize_episode(messages, thread_id="t-9")
     assert digest["task_type"] == "supplier", digest
     assert digest["goal"] == "查询恒力机械的信用和供货能力", digest
-    assert digest["outcome"] == "恒力机械信用评级 AA，交期最短。", digest
     assert "恒力机械" in digest["summary"], digest
+    assert "恒力机械信用评级 AA" in digest["summary"], digest
     assert "supplier_page" in digest["tools"], digest
-    assert digest["tool_results"][0]["status"] == "success", digest
-    assert digest["tool_results"][0]["args"]["supplier_id"] == "S001", digest
+    assert "tool_results" not in digest, digest
 
 
 @test
 def test_episode_summary_uses_full_thread():
     messages = [
-        Msg("human", "分析缺料"),
+        Msg("human", "分析采购订单"),
         Msg("ai", "", tool_calls=[{"id": "call-old", "name": "inventory_warning", "args": {}}]),
         Msg("tool", "old", tool_call_id="call-old", status="success"),
-        Msg("ai", "缺料分析完成"),
+        Msg("ai", "采购分析完成"),
         Msg("human", "比较供应商"),
         Msg("ai", "", tool_calls=[{"id": "call-new", "name": "supplier_page", "args": {}}]),
         Msg("tool", "new", tool_call_id="call-new", status="success"),
@@ -412,10 +440,10 @@ def test_episode_summary_uses_full_thread():
     ]
 
     digest = summarize_episode(messages, thread_id="t-1")
-    assert digest["goal"] == "分析缺料", digest
-    assert digest["outcome"] == "供应商比较完成", digest
+    assert digest["goal"] == "分析采购订单", digest
+    assert "供应商比较完成" in digest["summary"], digest
     assert digest["tools"] == ["inventory_warning", "supplier_page"], digest
-    assert [item["result"] for item in digest["tool_results"]] == ["old", "new"], digest
+    assert "tool_results" not in digest, digest
 
 
 # ---------------------------------------------------------------- 遗忘
@@ -428,8 +456,9 @@ def test_forget_removes_expired_items():
     keeper.archive_episode("t-old", summary="很久以前")
     stale = keeper.get("episodic", "ep_t-old")
     stale.created_at = _iso(90)
+    stale.updated_at = _iso(90)  # TTL 按 updated_at；绕过 keeper.put 以免被刷新
     stale.ttl_days = 30
-    keeper.put(stale)
+    store.put(episodic_ns("u1"), stale.store_key, stale.to_dict())
 
     keeper.archive_episode("t-new", summary="最近")
 
@@ -437,6 +466,26 @@ def test_forget_removes_expired_items():
     assert stats["expired"] == 1, stats
     assert keeper.get("episodic", "ep_t-old") is None
     assert keeper.get("episodic", "ep_t-new") is not None
+
+
+@test
+def test_archive_refresh_extends_ttl():
+    """同 thread 再次归档会刷新 updated_at，从而按 TTL 续期。"""
+    store = FakeStore()
+    keeper = MemoryKeeper(store, "u1", _cfg(episode_ttl_days=30))
+    keeper.archive_episode("t-1", summary="初稿")
+    item = keeper.get("episodic", "ep_t-1")
+    item.created_at = _iso(90)
+    item.updated_at = _iso(90)
+    store.put(episodic_ns("u1"), item.store_key, item.to_dict())
+
+    assert keeper.get("episodic", "ep_t-1").is_expired()
+
+    keeper.archive_episode("t-1", summary="续写后的摘要")
+    refreshed = keeper.get("episodic", "ep_t-1")
+    assert refreshed is not None
+    assert not refreshed.is_expired()
+    assert refreshed.summary == "续写后的摘要"
 
 
 @test
@@ -502,7 +551,8 @@ def test_search_ranks_by_relevance():
     keeper.archive_episode("t-1", summary="对比了三家供应商的供货能力，恒力机械交期最短")
     keeper.archive_episode("t-2", summary="生成了库存预警报表")
 
-    hits = keeper.search("供应商对比")
+    with _pg_search_shim(keeper):
+        hits = keeper.search("供应商对比")
     assert hits, "没有召回任何记忆"
     assert "供应商" in hits[0][0].summary, hits[0][0].summary
 
@@ -513,7 +563,8 @@ def test_search_ignores_irrelevant_memories():
     keeper = MemoryKeeper(store, "u1")
     keeper.archive_episode("t-1", summary="生成了库存预警报表")
 
-    assert keeper.search("供应商信用评级") == [], "完全不相关的记忆不应被召回"
+    with _pg_search_shim(keeper):
+        assert keeper.search("供应商信用评级") == [], "完全不相关的记忆不应被召回"
 
 
 @test
@@ -522,7 +573,8 @@ def test_search_touches_access_count():
     keeper = MemoryKeeper(store, "u1")
     keeper.archive_episode("t-1", summary="对比了三家供应商")
 
-    keeper.search("供应商")
+    with _pg_search_shim(keeper):
+        keeper.search("供应商")
     item = keeper.get("episodic", "ep_t-1")
     assert item.access_count >= 1, item.access_count
 
@@ -532,7 +584,8 @@ def test_search_text_is_human_readable():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1")
     keeper.archive_episode("t-1", summary="对比了三家供应商")
-    text = keeper.search_text("供应商")
+    with _pg_search_shim(keeper):
+        text = keeper.search_text("供应商")
     assert text.startswith("检索到的历史记忆"), text
     assert "相关度" in text
 
@@ -540,8 +593,9 @@ def test_search_text_is_human_readable():
 @test
 def test_bm25_and_tokenizer():
     tokens = scoring.tokenize("对比供应商SupplierA")
-    # 中文按字 + 二元组切分，所以出现的是"供应"/"应商"而不是"供应商"三字串
-    assert "供应" in tokens and "应商" in tokens, tokens
+    # jieba 精确模式：中文成词，英文整词小写
+    assert "供应商" in tokens, tokens
+    assert "对比" in tokens, tokens
     assert "suppliera" in tokens, tokens
     docs = [["a", "b"], ["a", "c", "d"], ["z"]]
     scores = scoring.bm25(["a"], docs)

@@ -39,7 +39,7 @@ def register_supplier_tools(mcp: FastMCP):
             current: 当前页码，默认1
             size: 每页大小，默认10
             name: 供应商名称（可选，模糊匹配）
-            status: 合作状态（可选）：1=合作中, 0=已停止
+            status: 合作状态（可选）：1=合作中, 2=已终止, 3=审核中（历史 0 由 ERP 归一为 2）
             credit_rating: 信用评级（可选）：A/B/C/D
 
         Returns:
@@ -90,7 +90,7 @@ def register_supplier_tools(mcp: FastMCP):
             email: 邮箱
             address: 地址
             credit_rating: 信用评级 A/B/C/D
-            status: 合作状态 1=合作中 0=停止
+            status: 合作状态 1=合作中, 2=已终止, 3=审核中（历史 0 由 ERP 归一为 2）
 
         Returns:
             创建结果JSON
@@ -126,7 +126,7 @@ def register_supplier_tools(mcp: FastMCP):
 
         Args:
             id: 供应商ID
-            status: 新状态 1=合作中 0=已停止
+            status: 新状态 1=合作中, 2=已终止, 3=审核中（历史 0 由 ERP 归一为 2）
 
         Returns:
             操作结果JSON

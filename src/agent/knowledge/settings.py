@@ -26,10 +26,10 @@ def _int(name: str, default: int) -> int:
         return default
 
 
-# Embedding / Reranker 独立推理服务（OpenAI 兼容）；不可用时自动降级
+# 向量 / Reranker 均为知识侧独立配置（不读 MEMORY_EMBEDDING_*）
 EMBEDDING_SERVER_URL = os.getenv("KNOWLEDGE_EMBEDDING_URL", "").rstrip("/")
 RERANKER_SERVER_URL = os.getenv("KNOWLEDGE_RERANKER_URL", "").rstrip("/")
-EMBEDDING_MODEL = os.getenv("KNOWLEDGE_EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_MODEL = os.getenv("KNOWLEDGE_EMBEDDING_MODEL") or "text-embedding-3-small"
 RERANKER_MODEL = os.getenv("KNOWLEDGE_RERANKER_MODEL", "reranker")
 
 RERANKER_ENABLED = _bool("KNOWLEDGE_RERANKER_ENABLED", True)

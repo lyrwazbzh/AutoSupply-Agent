@@ -3,11 +3,11 @@
 一条记忆 = 一个可序列化的 dict，存在 LangGraph Store 里。
 设计要点：
 
-- **双时态**：``valid_from`` / ``invalidated_at`` 让我们能回答"用户现在偏好什么"，
-  同时保留"他以前偏好过什么"——用户改口时旧值不是被删掉，而是被标记失效。
-- **可溯源**：``source`` + ``tool_results`` 记录任务来源和工具执行依据，
-  便于审计和排错，也是后面做"记忆可信度"的基础。
-- **可治理**：``access_count`` / ``last_accessed_at`` / ``ttl_days`` 支撑遗忘策略。
+- **双时态**：``valid_from`` / ``invalidated_at`` 区分当前生效值与历史版本；
+  历史版本只通过 ``MemoryKeeper.semantic_history`` 读取，不进入 ``read_memory`` / ``search``。
+- **可溯源**：``source`` + ``evidence`` 记录这条记忆从哪次会话、哪句话来。
+- **可治理**：``access_count`` / ``last_accessed_at`` / ``ttl_days`` 支撑遗忘；
+  TTL 从 ``updated_at``（缺省则 ``created_at``）起算，写入/归档会刷新 ``updated_at`` 从而续期。
 """
 from __future__ import annotations
 
@@ -46,6 +46,15 @@ def new_id(prefix: str = "mem") -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
+def _parse_embedding(raw: Any) -> Optional[List[float]]:
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return None
+    try:
+        return [float(x) for x in raw]
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class MemoryItem:
     """一条记忆。"""
@@ -54,14 +63,13 @@ class MemoryItem:
     type: str
     content: str
     summary: str = ""
-    goal: str = ""
-    outcome: str = ""
-    tool_results: List[Dict[str, Any]] = field(default_factory=list)
     key: str = ""                       # 语义记忆的冲突键（如 preferred_chart_type）
     tags: List[str] = field(default_factory=list)
+    entities: List[str] = field(default_factory=list)
     idempotency_key: str = ""
     source: Dict[str, Any] = field(default_factory=dict)
     confidence: float = 0.6
+    evidence: str = ""
 
     valid_from: str = ""
     invalidated_at: Optional[str] = None
@@ -72,6 +80,8 @@ class MemoryItem:
     last_accessed_at: str = ""
     access_count: int = 0
     ttl_days: Optional[int] = None
+    embedding: Optional[List[float]] = None   # 写入时由 Keeper 编码 searchable_text
+    embedding_src: str = ""                   # 生成向量时的文本，内容变了要重算
 
     def __post_init__(self) -> None:
         stamp = now_iso()
@@ -94,14 +104,13 @@ class MemoryItem:
             "type": self.type,
             "content": self.content,
             "summary": self.summary,
-            "goal": self.goal,
-            "outcome": self.outcome,
-            "tool_results": [dict(result) for result in self.tool_results],
             "key": self.key,
             "tags": list(self.tags),
+            "entities": list(self.entities),
             "idempotency_key": self.idempotency_key,
             "source": dict(self.source),
             "confidence": self.confidence,
+            "evidence": self.evidence,
             "valid_from": self.valid_from,
             "invalidated_at": self.invalidated_at,
             "supersedes": self.supersedes,
@@ -110,6 +119,8 @@ class MemoryItem:
             "last_accessed_at": self.last_accessed_at,
             "access_count": self.access_count,
             "ttl_days": self.ttl_days,
+            "embedding": list(self.embedding) if self.embedding else None,
+            "embedding_src": self.embedding_src,
         }
 
     @classmethod
@@ -140,18 +151,13 @@ class MemoryItem:
             type=mtype if mtype in MEMORY_TYPES else SEMANTIC,
             content=content,
             summary=str(data.get("summary") or ""),
-            goal=str(data.get("goal") or ""),
-            outcome=str(data.get("outcome") or ""),
-            tool_results=[
-                dict(result)
-                for result in (data.get("tool_results") or [])
-                if isinstance(result, dict)
-            ],
             key=str(data.get("key") or ""),
             tags=[str(t) for t in (data.get("tags") or []) if t],
+            entities=[str(e) for e in (data.get("entities") or []) if e],
             idempotency_key=str(data.get("idempotency_key") or ""),
             source=data.get("source") if isinstance(data.get("source"), dict) else {},
             confidence=confidence,
+            evidence=str(data.get("evidence") or ""),
             valid_from=str(data.get("valid_from") or ""),
             invalidated_at=(
                 str(data["invalidated_at"]) if data.get("invalidated_at") else None
@@ -164,6 +170,8 @@ class MemoryItem:
             last_accessed_at=str(data.get("last_accessed_at") or ""),
             access_count=access_count,
             ttl_days=ttl,
+            embedding=_parse_embedding(data.get("embedding")),
+            embedding_src=str(data.get("embedding_src") or ""),
         )
 
     # ---------- 生命周期 ----------
@@ -183,12 +191,13 @@ class MemoryItem:
         return bool(self.invalidated_at)
 
     def is_expired(self, now: Optional[datetime] = None) -> bool:
+        """TTL 从最近写入时间起算：优先 ``updated_at``，否则 ``created_at``。"""
         if not self.ttl_days:
             return False
-        created = _parse_iso(self.created_at)
-        if created is None:
+        anchor = _parse_iso(self.updated_at) or _parse_iso(self.created_at)
+        if anchor is None:
             return False
-        return (now or datetime.now()) > created + timedelta(days=self.ttl_days)
+        return (now or datetime.now()) > anchor + timedelta(days=self.ttl_days)
 
     def is_valid(self, now: Optional[datetime] = None) -> bool:
         return not self.is_invalidated() and not self.is_expired(now)
@@ -200,14 +209,17 @@ class MemoryItem:
         return max(0.0, ((now or datetime.now()) - created).total_seconds() / 86400.0)
 
     def tier(self, warm_episode_days: int = 7, now: Optional[datetime] = None) -> str:
-        """判断当前应处在哪一层。
+        """判断当前应处在哪一层（用于 WARM 注入与统计）。
 
         - 语义记忆（有效）→ WARM，常驻注入
-        - 情节记忆在 ``warm_episode_days`` 内 → WARM，否则沉到 COLD
-        - 程序记忆 → COLD，按需检索（避免把经验无脑塞进系统提示词）
-        - 已失效 / 已过期 → COLD（只作为历史留档）
+        - 情节记忆在 ``warm_episode_days`` 内 → WARM，否则仅可通过 ``search`` / ``read_memory`` 召回
+        - 程序记忆 → 仅可通过 ``search`` / ``read_memory`` 召回
+        - 已失效条目 → 不参与 WARM / ``search``；用 ``semantic_history`` 查历史版本
+        - 已过期条目 → 由 ``forget`` 硬删除
         """
-        if not self.is_valid(now):
+        if self.is_invalidated():
+            return COLD
+        if self.is_expired(now):
             return COLD
         if self.type == SEMANTIC:
             return WARM
@@ -219,9 +231,8 @@ class MemoryItem:
         parts = [
             self.summary,
             self.content,
-            self.goal,
-            self.outcome,
             " ".join(self.tags),
+            " ".join(self.entities),
         ]
         return " ".join(p for p in parts if p)
 

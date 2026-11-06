@@ -16,12 +16,14 @@ from ..runtime_context import get_current_store, get_current_user_id
 
 @tool
 def read_memory(query: str, limit: int = 5) -> str:
-    """检索与当前问题相关的历史记忆（跨会话）。
+    """检索与当前问题相关的、仍有效的历史记忆（跨会话）。
 
     当出现以下情况时先调用本工具，再回答：
     - 用户提到"上次""之前""之前那家供应商"等跨会话指代
     - 用户问起过去做过的分析、下过的订单、得出的结论
     - 需要沿用用户此前表达过的偏好或约定
+
+    本工具只召回未失效条目；同一偏好 key 被替换后的旧版本不在结果中。
 
     Args:
         query: 检索意图，用自然语言描述要找什么

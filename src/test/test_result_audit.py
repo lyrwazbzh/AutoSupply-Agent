@@ -16,74 +16,126 @@ except ModuleNotFoundError:
     _HARNESS = False
 
 
+def _tool(name: str, payload: dict, tool_call_id: str = "1") -> ToolMessage:
+    return ToolMessage(
+        content=json.dumps(payload, ensure_ascii=False),
+        name=name,
+        tool_call_id=tool_call_id,
+    )
+
+
 class ResultAuditorTests(unittest.TestCase):
-    def test_reject_shortage_numbers_without_calc(self):
-        state = {
-            "messages": [
-                HumanMessage(content="分析车型 A-125 工厂 PLANT-HZ 缺料"),
-                AIMessage(
-                    content="缺口 250，建议量 300，齐套率 0.4。以下为缺料分析结论摘要。"
-                    + "x" * 50
-                ),
-            ],
-        }
-        audit = ResultAuditor().audit(state)
-        self.assertEqual(audit.action, "reject")
-        self.assertTrue(any(f.code == "shortage_without_calc" for f in audit.findings))
-
-    def test_pass_with_calc_snapshot_alignment(self):
-        calc = {
-            "calc_run_id": "run-1",
-            "caliber_version": "shortage-口径/v1",
-            "kit_rate": 0.4,
-            "lines": [
-                {"part_id": 1, "net_gap": 250, "suggested_qty": 300, "demand_qty": 400},
-            ],
-            "total_gap_amount": 100.0,
-            "gap_part_count": 3,
-            "demand_part_count": 5,
-        }
-        state = {
-            "calc_snapshots": {"run-1": calc},
-            "messages": [
-                ToolMessage(
-                    content=json.dumps({"code": 200, "data": calc}, ensure_ascii=False),
-                    name="shortage_calc",
-                    tool_call_id="1",
-                ),
-                AIMessage(
-                    content="缺口 250，建议量 300，齐套率 0.4。calc_run_id=run-1"
-                ),
-            ],
-        }
-        audit = ResultAuditor().audit(state)
-        self.assertNotEqual(audit.action, "reject")
-        self.assertIn("run-1", audit.calc_run_ids)
-
     def test_reject_write_claim_without_tool(self):
         state = {
-            "messages": [AIMessage(content="订单已创建成功，单号 PO001")],
+            "messages": [AIMessage(content="订单已创建成功，单号 PO20260101001")],
         }
         audit = ResultAuditor().audit(state)
         self.assertEqual(audit.action, "reject")
+        self.assertTrue(any(f.code == "write_claim_without_tool" for f in audit.findings))
+
+    def test_reject_inventory_claim_without_tool(self):
+        state = {"messages": [AIMessage(content="入库成功，数量已更新")]}
+        audit = ResultAuditor().audit(state)
+        self.assertEqual(audit.action, "reject")
+        self.assertTrue(any(f.code == "write_claim_without_tool" for f in audit.findings))
+
+    def test_reject_claim_after_write_failure(self):
+        state = {
+            "messages": [
+                _tool(
+                    "order_create",
+                    {"code": 400, "message": "库存不足", "data": None},
+                ),
+                AIMessage(content="订单已创建成功"),
+            ],
+        }
+        audit = ResultAuditor().audit(state)
+        self.assertEqual(audit.action, "reject")
+        self.assertTrue(
+            any(f.code == "claim_after_write_failure" for f in audit.findings)
+        )
+
+    def test_pass_when_order_tool_succeeded(self):
+        state = {
+            "messages": [
+                _tool(
+                    "order_create",
+                    {
+                        "code": 200,
+                        "message": "success",
+                        "data": {
+                            "id": 1,
+                            "orderNumber": "PO20260101001",
+                            "totalAmount": 510.0,
+                        },
+                    },
+                ),
+                AIMessage(
+                    content="订单已创建成功，单号 PO20260101001，金额 510.00 元"
+                ),
+            ],
+        }
+        audit = ResultAuditor().audit(state)
+        self.assertEqual(audit.action, "pass")
+
+    def test_reject_answer_value_not_in_receipt(self):
+        state = {
+            "messages": [
+                _tool(
+                    "order_create",
+                    {
+                        "code": 200,
+                        "message": "success",
+                        "data": {
+                            "id": 1,
+                            "orderNumber": "PO20260101001",
+                            "totalAmount": 510.0,
+                        },
+                    },
+                ),
+                AIMessage(
+                    content="订单已创建成功，单号 PO99999999，金额 999.00 元"
+                ),
+            ],
+        }
+        audit = ResultAuditor().audit(state)
+        self.assertEqual(audit.action, "reject")
+        codes = {f.code for f in audit.findings}
+        self.assertIn("answer_value_not_in_receipt", codes)
+
+    def test_warn_on_write_tool_error_without_success_claim(self):
+        state = {
+            "messages": [
+                _tool(
+                    "inventory_outbound",
+                    {"code": 400, "message": "库存不足", "data": None},
+                ),
+                AIMessage(content="出库失败，当前库存不足，请确认数量后重试。"),
+            ],
+        }
+        audit = ResultAuditor().audit(state)
+        self.assertEqual(audit.action, "warn")
+        self.assertTrue(any(f.code == "write_tool_error" for f in audit.findings))
+
 
 @unittest.skipUnless(_HARNESS, "langchain/deepagents 未安装")
 class HarnessReviewWireTests(unittest.TestCase):
     def test_before_agent_injects_review_route_and_rubric(self):
         mw = HarnessPhaseMiddleware()
         state = {
-            "messages": [HumanMessage(content="分析未来7天缺料风险并提出补货建议")],
+            "messages": [HumanMessage(content="分析近 7 天采购订单金额趋势并提出建议")],
         }
         updates = mw.before_agent(state, runtime=None)
         self.assertNotIn("intent", updates)
         self.assertTrue(updates.get("rubric"))
         self.assertEqual(updates["review_decision"]["source"], "rule")
-        self.assertEqual(updates["review_decision"]["task_type"], "shortage")
+        self.assertEqual(updates["review_decision"]["task_type"], "analysis")
 
-    def test_shortage_config_present(self):
+    def test_core_task_types_present(self):
         cfg = load_harness_config()
-        self.assertIn("shortage", cfg.get("task_types", {}))
-        self.assertIn("shortage", cfg.get("rubrics", {}))
+        for key in ("analysis", "order", "inventory", "supplier"):
+            self.assertIn(key, cfg.get("task_types", {}))
+            self.assertIn(key, cfg.get("rubrics", {}))
 
 
 if __name__ == "__main__":

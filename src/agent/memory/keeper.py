@@ -4,8 +4,8 @@
 这样"读改写合并""冲突消解""遗忘"这些规则只有一份实现，不会出现两个
 写入方互相覆盖（这正是 P0 要修的那个 Bug 的根因）。
 
-对 Store 的要求只有四个方法：``get/put/search/delete``，
-所以既能接 PostgreSQL Store，也能在测试里接一个纯内存的假 Store。
+对 Store 的要求：LangGraph ``PostgresStore``（``get/put/search/delete``），
+检索索引列由 ``postgres_search`` 维护。
 """
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from . import namespaces as ns
 from . import scoring
 from .config import DEFAULT_MEMORY_CONFIG, MemoryConfig
+from .embeddings import Embedder, build_http_embedder
+from .rewrite import llm_rewrite_query, rewrite_retrieval_query
 from .types import (
     COLD,
     EPISODIC,
@@ -91,10 +93,25 @@ def reset_sweep_state() -> None:
 class MemoryKeeper:
     """一位用户的记忆管家。"""
 
-    def __init__(self, store: Any, user_id: str, config: Optional[MemoryConfig] = None):
+    def __init__(
+        self,
+        store: Any,
+        user_id: str,
+        config: Optional[MemoryConfig] = None,
+        *,
+        embedder: Optional[Embedder] = None,
+    ):
         self._store = store
         self.user_id = user_id or "default_user"
         self.config = config or DEFAULT_MEMORY_CONFIG
+        if embedder is not None:
+            self._embedder = embedder
+        else:
+            self._embedder = build_http_embedder(
+                self.config.embedding_base_url,
+                self.config.embedding_api_key,
+                self.config.embedding_model,
+            )
 
     # ============================================================
     # 基础读写
@@ -111,22 +128,53 @@ class MemoryKeeper:
         if not self.available or item is None:
             return None
         item.updated_at = now_iso()
+        self._refresh_embedding(item)
         try:
             self._store.put(self.namespace(item.type), item.store_key, item.to_dict())
         except Exception:
             return None
-        if self._is_postgres_store:
-            try:
-                from .postgres_search import index_item
+        try:
+            from .postgres_search import index_item
 
-                index_item(self.user_id, item)
-            except Exception:
-                pass
+            index_item(self.user_id, item, self.config)
+        except Exception:
+            # 正文已落库；索引稍后可重建，不阻断写入。
+            pass
         return item
 
-    @property
-    def _is_postgres_store(self) -> bool:
-        return self._store.__class__.__module__.startswith("langgraph.store.postgres")
+    def _refresh_embedding(self, item: MemoryItem) -> None:
+        """searchable_text 变化时写入 embedding；无 embedder 或失败则跳过。"""
+        if self._embedder is None or item is None:
+            return
+        src = item.searchable_text()
+        if not src.strip():
+            return
+        if item.embedding and item.embedding_src == src:
+            return
+        try:
+            vectors = self._embedder.embed_texts([src])
+        except Exception:
+            return
+        if not vectors or not vectors[0]:
+            return
+        item.embedding = [float(x) for x in vectors[0]]
+        item.embedding_src = src
+
+    def _rewrite_query(self, query: str, context: str = "") -> str:
+        ctx = (context or "").strip() or self.build_warm_brief(touch=False)
+        llm_fn = llm_rewrite_query if self.config.query_rewrite_llm else None
+        return rewrite_retrieval_query(query, ctx, llm_fn=llm_fn)
+
+    def _embed_query(self, text: str) -> Optional[List[float]]:
+        if self._embedder is None or not (text or "").strip():
+            return None
+        try:
+            vectors = self._embedder.embed_texts([text])
+        except Exception:
+            return None
+        if not vectors or not vectors[0]:
+            return None
+        return [float(x) for x in vectors[0]]
 
     def get(self, memory_type: str, key: str) -> Optional[MemoryItem]:
         if not self.available:
@@ -185,13 +233,14 @@ class MemoryKeeper:
         *,
         summary: str = "",
         confidence: float = 0.7,
+        evidence: str = "",
         source: Optional[dict] = None,
         idempotency_key: str = "",
     ) -> Optional[MemoryItem]:
         """写入一条语义记忆。
 
-        同 key 的旧值不会被删除，而是被标记 ``invalidated_at`` 沉入 COLD，
-        新值成为 WARM 里唯一有效版本——用户"改口"时历史仍可追溯。
+        同 key 已有生效值且内容变化时：旧条标记 ``invalidated_at``，新条成为唯一生效版本。
+        旧版保留在 Store 中，仅 ``semantic_history(key)`` 可读；``search`` / ``read_memory`` 不召回。
         """
         if not self.available or not key:
             return None
@@ -217,6 +266,7 @@ class MemoryKeeper:
                 source=source or {},
                 idempotency_key=idempotency_key,
                 confidence=confidence,
+                evidence=evidence,
             )
             current.invalidate(by=replacement.id)
             self.put(current)
@@ -231,6 +281,7 @@ class MemoryKeeper:
                 source=source or {},
                 idempotency_key=idempotency_key,
                 confidence=confidence,
+                evidence=evidence,
             )
         return self.put(replacement)
 
@@ -246,12 +297,13 @@ class MemoryKeeper:
         return candidates[0]
 
     def semantic_history(self, key: str) -> List[MemoryItem]:
+        """按 key 返回全部语义版本（含已失效），新→旧；供审计/追溯，不经 COLD 检索。"""
         items = [i for i in self.list_items(SEMANTIC) if i.key == key]
         items.sort(key=lambda i: i.created_at, reverse=True)
         return items
 
     def invalidate_semantic(self, key: str) -> Optional[MemoryItem]:
-        """取消当前有效偏好；历史版本保留，但不再进入 WARM。"""
+        """取消当前有效偏好；条目保留供 ``semantic_history``，并退出 WARM / search。"""
         current = self.active_semantic(key)
         if current is None:
             return None
@@ -267,11 +319,10 @@ class MemoryKeeper:
         thread_id: str,
         *,
         goal: str = "",
-        outcome: str = "",
-        tool_results: Optional[Sequence[dict]] = None,
         summary: str = "",
         task_type: str = "general",
         tags: Optional[Sequence[str]] = None,
+        tools: Optional[Sequence[str]] = None,
         source: Optional[dict] = None,
     ) -> Optional[MemoryItem]:
         if not self.available or not thread_id:
@@ -284,11 +335,6 @@ class MemoryKeeper:
         if existing is not None:
             existing.summary = summary or existing.summary
             existing.content = summary or existing.content
-            existing.goal = goal or existing.goal
-            existing.outcome = outcome or existing.outcome
-            existing.tool_results = [
-                dict(result) for result in (tool_results or existing.tool_results)
-            ]
             existing.tags = sorted(set(list(existing.tags) + list(tags or [])))
             existing.idempotency_key = f"episode:{thread_id}"
             existing.source = source or existing.source
@@ -300,9 +346,6 @@ class MemoryKeeper:
             type=EPISODIC,
             content=summary or goal or "（无摘要）",
             summary=_clip(summary or goal, self.config.episode_summary_chars),
-            goal=goal,
-            outcome=outcome,
-            tool_results=[dict(result) for result in (tool_results or [])],
             key=thread_id,
             tags=sorted(set(["episode", task_type] + list(tags or []))),
             idempotency_key=f"episode:{thread_id}",
@@ -311,29 +354,6 @@ class MemoryKeeper:
             ttl_days=ttl,
         )
         return self.put(item)
-
-    def update_episode_tool_result(
-        self,
-        thread_id: str,
-        operation_id: str,
-        *,
-        status: str,
-        result: Any,
-    ) -> Optional[MemoryItem]:
-        """用写操作对账终态更新原任务中的对应工具结果。"""
-        item = self.get(EPISODIC, f"ep_{thread_id}")
-        if item is None:
-            return None
-        for tool_result in item.tool_results:
-            args = tool_result.get("args")
-            if not isinstance(args, dict):
-                continue
-            if str(args.get("operation_id") or "") != operation_id:
-                continue
-            tool_result["status"] = status
-            tool_result["result"] = result
-            return self.put(item)
-        return None
 
     def recent_episodes(self, days: Optional[int] = None,
                         now: Optional[datetime] = None) -> List[MemoryItem]:
@@ -455,6 +475,7 @@ class MemoryKeeper:
                     field,
                     str(merged[field]),
                     confidence=0.8,
+                    evidence=str(updates[field]),
                     source=source or {},
                     idempotency_key=(
                         f"{idempotency_scope}:{field}" if idempotency_scope else ""
@@ -513,18 +534,36 @@ class MemoryKeeper:
         return "\n".join(lines)
 
     def _record_access(self, items: Sequence[MemoryItem]) -> None:
-        if self._is_postgres_store:
-            from .postgres_search import touch_items
+        from .postgres_search import touch_items
 
+        try:
             touch_items(self.user_id, list(items))
-            return
-        for item in items:
-            item.touch()
-            self.put(item)
+        except Exception:
+            pass
 
     # ============================================================
     # COLD 检索
     # ============================================================
+
+    def _cold_lanes(
+        self,
+        query: str,
+        *,
+        limit: int,
+        query_embedding: Optional[List[float]] = None,
+        now: Optional[datetime] = None,
+    ) -> tuple[List[MemoryItem], List[MemoryItem]]:
+        """PG：有效性过滤后的关键词 BM25 Top-k / 向量 Top-k。"""
+        from .postgres_search import recall_ranked_lanes
+
+        return recall_ranked_lanes(
+            self.user_id,
+            query,
+            limit=limit,
+            config=self.config,
+            query_embedding=query_embedding,
+            now=now,
+        )
 
     def search(
         self,
@@ -533,40 +572,41 @@ class MemoryKeeper:
         k: Optional[int] = None,
         now: Optional[datetime] = None,
         touch: bool = True,
+        context: str = "",
     ) -> List[Tuple[MemoryItem, float]]:
-        """COLD 层按需检索：PostgreSQL 关键词 + pgvector + RRF。"""
+        """COLD：改写 → 双路 Top-k → RRF 归一化 channel → combined_score。"""
         if not self.available or not query:
             return []
+        rewritten = self._rewrite_query(query, context)
+        if not rewritten:
+            return []
         limit = k or self.config.retrieval_k
-        if self._is_postgres_store:
-            from .postgres_search import hybrid_search
-
-            return hybrid_search(
-                self.user_id,
-                query,
-                k=limit,
-                config=self.config,
-                touch=touch,
-            )
-
-        # 非 PostgreSQL 假 Store 仅用于本地轻量运行。
         now_dt = now or datetime.now()
-        candidates = [
-            item for item in self.all_items()
-            if not item.is_invalidated()
-        ]
-        if not candidates:
+        query_embedding = self._embed_query(rewritten)
+        try:
+            keyword_lane, vector_lane = self._cold_lanes(
+                rewritten,
+                limit=limit,
+                query_embedding=query_embedding,
+                now=now_dt,
+            )
+        except Exception:
+            return []
+        if not keyword_lane and not vector_lane:
             return []
 
-        ranked = scoring.rank(query, candidates, self.config, now_dt)
+        ranked = scoring.rank_from_lanes(
+            keyword_lane,
+            vector_lane,
+            self.config,
+            now_dt,
+            top_n=limit,
+        )
         floor = self.config.min_retrieval_score
-        hits = [(item, score) for item, score in ranked if score >= floor]
-        hits = hits[:limit]
+        hits = [(item, score) for item, score in ranked if score >= floor][:limit]
 
-        if touch:
-            for item, _ in hits:
-                item.touch()
-                self.put(item)
+        if touch and hits:
+            self._record_access([item for item, _ in hits])
         return hits
 
     def search_text(
@@ -574,8 +614,9 @@ class MemoryKeeper:
         query: str,
         *,
         k: Optional[int] = None,
+        context: str = "",
     ) -> str:
-        hits = self.search(query, k=k)
+        hits = self.search(query, k=k, context=context)
         if not hits:
             return "没有找到相关的历史记忆。"
         lines = []
@@ -666,14 +707,14 @@ class MemoryKeeper:
             item = self.archive_episode(
                 thread_id,
                 goal=digest.get("goal", ""),
-                outcome=digest.get("outcome", ""),
-                tool_results=digest.get("tool_results"),
                 summary=digest.get("summary", ""),
                 task_type=digest.get("task_type", "general"),
                 tags=digest.get("tags"),
+                tools=digest.get("tools"),
                 source={
                     "thread_id": thread_id,
-                    "task_type": digest.get("task_type", "general"),
+                    "task_type": digest.get("task_type"),
+                    "tools": digest.get("tools", [])[:10],
                 },
             )
             result["episode"] = item.to_dict() if item else None
@@ -703,7 +744,7 @@ class MemoryKeeper:
             if field in legacy and legacy[field]:
                 if self.upsert_semantic(
                     field, str(legacy[field]), confidence=0.6,
-                    source={"migrated": True},
+                    evidence="迁移自历史偏好", source={"migrated": True},
                 ):
                     created += 1
         return created

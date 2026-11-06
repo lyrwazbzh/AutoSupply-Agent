@@ -2,8 +2,8 @@
 
 分层：
     HOT  = 当前会话上下文（LangGraph Checkpointer，不在本模块内）
-    WARM = 语义记忆 + 近期情节，常驻注入 system_prompt
-    COLD = 全部历史归档 / 程序记忆，按需检索（read_memory 工具）
+    WARM = 有效语义记忆 + 近期情节，常驻注入 system_prompt
+    COLD = 有效情节/程序等的按需检索（read_memory）；失效语义版仅 semantic_history
 
 对外只需要两个东西：``MemoryKeeper``（读写门面）和 ``MemoryConfig``（参数）。
 本包不依赖具体数据库驱动，可以独立测试。

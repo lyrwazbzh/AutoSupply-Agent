@@ -38,7 +38,11 @@ class MemoryConfig:
     # --- 分层 ---
     warm_episode_days: int = 7          # 情节记忆停留 WARM 层的天数，超过后只在 COLD 按需检索
     retrieval_k: int = 5                # COLD 层单次检索返回条数
-    min_retrieval_score: float = 0.08   # COLD 检索最低相关度，低于此值视为噪声
+    # 召回：有效记忆上关键词 BM25 Top-k ∪ 向量 Top-k（k=retrieval_k）
+    # 融合：RRF → max 归一化得 channel ∈[0,1]
+    # combined_score = w_text*channel + w_recency*recency + w_access*access + w_confidence*confidence
+    # 0.15 ≈ 要求 channel 约 ≥0.1 的新记忆，或更高 channel 的偏旧记忆，才能进入结果
+    min_retrieval_score: float = 0.15
 
     # --- 生命周期 ---
     episode_ttl_days: int = 90          # 情节记忆保留天数，过期后遗忘（硬删除）
@@ -52,10 +56,17 @@ class MemoryConfig:
 
     # --- 打分 ---
     half_life_days: float = 30.0        # 召回时的时间衰减半衰期
-    weight_text: float = 0.6            # 文本相关度权重
+    weight_text: float = 0.6            # combined_score 中 RRF-channel 权重
     weight_recency: float = 0.2         # 新鲜度权重
     weight_access: float = 0.1          # 被引用频次权重
     weight_confidence: float = 0.1      # 置信度权重
+    min_cosine: float = 0.32            # 与 smart-car 相同：BM25=0 时，余弦低於此则整条丢弃
+
+    # --- 检索改写 / 嵌入 API ---
+    query_rewrite_llm: bool = False     # True 时改写再调一次主模型
+    embedding_base_url: str = ""        # 例如 https://api.openai.com/v1
+    embedding_api_key: str = ""
+    embedding_model: str = "text-embedding-3-small"
 
     # --- 整合 / 遗忘 ---
     sweep_interval_seconds: int = 900   # 遗忘扫描的最小间隔，避免每轮都全量扫描
@@ -72,7 +83,7 @@ class MemoryConfig:
         return cls(
             warm_episode_days=_env_int("MEMORY_WARM_EPISODE_DAYS", 7),
             retrieval_k=_env_int("MEMORY_RETRIEVAL_K", 5),
-            min_retrieval_score=_env_float("MEMORY_MIN_RETRIEVAL_SCORE", 0.08),
+            min_retrieval_score=_env_float("MEMORY_MIN_RETRIEVAL_SCORE", 0.15),
             episode_ttl_days=_env_int("MEMORY_EPISODE_TTL_DAYS", 90),
             semantic_ttl_days=(
                 _env_int("MEMORY_SEMANTIC_TTL_DAYS", 0) or None
@@ -85,12 +96,27 @@ class MemoryConfig:
             max_recent_queries=_env_int("MEMORY_MAX_RECENT_QUERIES", 5),
             max_recent_suppliers=_env_int("MEMORY_MAX_RECENT_SUPPLIERS", 10),
             half_life_days=_env_float("MEMORY_HALF_LIFE_DAYS", 30.0),
+            weight_text=_env_float("MEMORY_WEIGHT_TEXT", 0.6),
+            weight_recency=_env_float("MEMORY_WEIGHT_RECENCY", 0.2),
+            weight_access=_env_float("MEMORY_WEIGHT_ACCESS", 0.1),
+            weight_confidence=_env_float("MEMORY_WEIGHT_CONFIDENCE", 0.1),
             sweep_interval_seconds=_env_int("MEMORY_SWEEP_INTERVAL_SECONDS", 900),
             episode_summary_chars=_env_int("MEMORY_EPISODE_SUMMARY_CHARS", 400),
             warm_brief_chars=_env_int("MEMORY_WARM_BRIEF_CHARS", 160),
             max_warm_episodes=_env_int("MEMORY_MAX_WARM_EPISODES", 5),
             llm_extraction_enabled=_env_bool("MEMORY_LLM_EXTRACTION", False),
             memory_tools_enabled=_env_bool("MEMORY_TOOLS_ENABLED", True),
+            query_rewrite_llm=_env_bool("MEMORY_QUERY_REWRITE_LLM", False),
+            embedding_base_url=os.getenv("MEMORY_EMBEDDING_BASE_URL") or "",
+            embedding_api_key=(
+                os.getenv("MEMORY_EMBEDDING_API_KEY")
+                or os.getenv("OPENAI_API_KEY")
+                or ""
+            ),
+            embedding_model=(
+                os.getenv("MEMORY_EMBEDDING_MODEL") or "text-embedding-3-small"
+            ),
+            min_cosine=_env_float("MEMORY_MIN_COSINE", 0.32),
         )
 
 

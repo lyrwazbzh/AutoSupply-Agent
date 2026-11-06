@@ -16,7 +16,7 @@ from prometheus_client import Counter, Gauge
 
 from ...mcp_server.server_config import ERP_BASE_URL
 from ..log_utils import middleware_logger
-from ..memory.keeper import MemoryKeeper
+from .notify import notify_manual_required
 from .repository import WriteAuditRepository
 
 RECONCILE_INTERVAL_SECONDS = max(
@@ -41,10 +41,8 @@ class WriteReconciler:
     def __init__(
         self,
         repository: WriteAuditRepository | None = None,
-        store: Any = None,
     ) -> None:
         self.repository = repository or WriteAuditRepository()
-        self.store = store
 
     async def run(self, stop_event: asyncio.Event) -> None:
         async with httpx.AsyncClient(
@@ -92,7 +90,6 @@ class WriteReconciler:
                     outcome="RECONCILED_SUCCEEDED",
                     detail={"attempt": attempt, "erp_status": data, "result": result},
                 )
-                await self._sync_memory(job, status="success", result=result)
                 RECONCILE_TOTAL.labels("succeeded").inc()
                 return
 
@@ -105,11 +102,6 @@ class WriteReconciler:
                     operation_id,
                     outcome="NOT_APPLIED",
                     detail={"attempt": attempt, "erp_status": data},
-                )
-                await self._sync_memory(
-                    job,
-                    status="error",
-                    result={"operationStatus": "NOT_APPLIED", "data": data},
                 )
                 RECONCILE_TOTAL.labels("not_applied").inc()
                 return
@@ -134,11 +126,6 @@ class WriteReconciler:
                 detail={"attempt": attempt},
                 error=error[:4000],
             )
-            await self._sync_memory(
-                job,
-                status="error",
-                result={"operationStatus": "MANUAL_REQUIRED", "error": error[:4000]},
-            )
             MANUAL_REQUIRED.inc()
             RECONCILE_TOTAL.labels("manual_required").inc()
             middleware_logger.critical(
@@ -147,6 +134,20 @@ class WriteReconciler:
                 attempt,
                 error,
             )
+            try:
+                operation = (
+                    dict(job["operation"])
+                    if isinstance(job.get("operation"), dict)
+                    else {}
+                )
+                operation.setdefault("operation_id", operation_id)
+                notify_manual_required(operation, error=error[:4000])
+            except Exception as notify_exc:
+                middleware_logger.warning(
+                    "Failed to notify MANUAL_REQUIRED operation=%s: %s",
+                    operation_id,
+                    notify_exc,
+                )
             return
 
         retry_seconds = min(1800, 30 * (2 ** (attempt - 1)))
@@ -159,22 +160,3 @@ class WriteReconciler:
             retry_seconds=retry_seconds,
         )
         RECONCILE_TOTAL.labels("deferred").inc()
-
-    async def _sync_memory(
-        self, job: dict[str, Any], *, status: str, result: Any
-    ) -> None:
-        if self.store is None:
-            return
-        operation = job.get("operation") or {}
-        thread_id = str(operation.get("thread_id") or "")
-        user_id = str(operation.get("user_id") or "")
-        if not thread_id or not user_id:
-            return
-        keeper = MemoryKeeper(self.store, user_id)
-        await asyncio.to_thread(
-            keeper.update_episode_tool_result,
-            thread_id,
-            str(job["operation_id"]),
-            status=status,
-            result=result,
-        )

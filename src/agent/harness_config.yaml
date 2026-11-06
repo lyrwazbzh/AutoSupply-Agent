@@ -17,15 +17,14 @@ phases:
 
 # 评审器配置（由 RubricMiddleware 消费）
 review:
-  mode: auto                 # auto / always / never；auto 统一使用规则优先、LLM 兜底
+  mode: auto                 # auto / always / never；auto 对简单对话跳过 grader
+  strategy: hybrid           # hybrid：明确场景规则，模糊场景模型；rules：兼容本地规则
   router_timeout_seconds: 8  # 路由超时保守审查；独立调用最多一次，不自动重试
   max_iterations: 3          # 单次 rubric 最多评审迭代次数
   model: null                # 使用主 LLM；可覆盖为 provider:model
 
-# 评审范围关键词（仅用于选择固定 rubric，不负责业务或工具分流）
+# 任务类型识别关键词（规则命中选 rubric；模糊场景由 LLM 判定 task_type）
 task_types:
-  shortage:
-    keywords: [缺料, 齐套, 缺料风险, 短缺, 车型补货, 物料补货]
   analysis:
     keywords: [分析, 对比, 统计, 趋势, 报表, 图表, 报告, 评估]
   order:
@@ -50,14 +49,6 @@ rubrics:
     3. 按用户要求的格式输出分析结果，不强制完整报告
     4. 仅当用户要求图表时检查图表生成及类型适配
     5. 分析结论有明确的数据支撑，采购建议可执行
-
-  shortage: |
-    1. 缺车型或工厂时先澄清，未擅自假设槽位
-    2. 缺口、建议量、齐套率来自 verified_facts / verified_summary，回答含 calc_run_id 与口径版本
-    3. 未对业务指标做模型心算或改数
-    4. v2 按日峰值缺口处理延迟到货，MOQ 与包装倍数分离，风险日期可解释
-    5. 涉及写单时已走人工审批；载荷摘要、有效期、供应商和价格来源未被修改
-    6. 结论与工具证据、不可变计算记录一致
 
   order: |
     1. 提取了完整的订单字段（orderNumber、orderDetail、数量、单价）

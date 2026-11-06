@@ -5,32 +5,30 @@ from __future__ import annotations
 import unittest
 
 from src.api_view.dingtalk_channel import (
-    DingTalkCardPublisher,
     DingTalkStreamConsumer,
     map_dingtalk_user,
     parse_approval_callback,
-    publish_shortage_approval,
+    publish_approval,
     render_approval_card,
     verify_dingtalk_sign,
 )
-from src.agent.shortage.suggestion import freeze_shortage_suggestion
 
 
-def _calc():
+def _frozen():
     return {
-        "calc_run_id": "run-ding",
-        "caliber_version": "shortage-口径/v1",
-        "vehicle_model": "A-125",
-        "plant_id": "PLANT-HZ",
-        "lines": [
-            {
-                "part_id": 1,
-                "part_code": "P-EN-0001",
-                "net_gap": 10,
-                "suggested_qty": 20,
-                "purchase_price": 25.5,
-            }
-        ],
+        "suggestion_id": "sug-demo",
+        "evidence_id": "",
+        "idempotency_key": "order:demo:1",
+        "total_amount": 510.0,
+        "order_payload": {
+            "orderNumber": "PO20260101001",
+            "totalAmount": 510.0,
+            "status": 0,
+            "idempotencyKey": "order:demo:1",
+            "orderDetail": [
+                {"partId": 1, "quantity": 20, "unitPrice": 25.5},
+            ],
+        },
     }
 
 
@@ -45,13 +43,11 @@ class DingTalkHitlTests(unittest.TestCase):
         self.assertIsNone(map_dingtalk_user("nobody"))
 
     def test_render_card_interactive(self):
-        frozen = freeze_shortage_suggestion(_calc())
-        card = render_approval_card(thread_id="t-1", frozen_suggestion=frozen)
+        card = render_approval_card(thread_id="t-1", frozen_suggestion=_frozen())
         self.assertEqual(card.thread_id, "t-1")
-        self.assertEqual(card.calc_run_id, "run-ding")
+        self.assertEqual(card.suggestion_id, "sug-demo")
         self.assertTrue(card.order_payload.get("idempotencyKey"))
         self.assertTrue(card.interactive_card.get("contents"))
-        self.assertTrue(any("calc_run_id" in line for line in card.summary_lines))
 
     def test_callback_to_hitl_approve(self):
         out = parse_approval_callback(
@@ -87,8 +83,7 @@ class DingTalkHitlTests(unittest.TestCase):
         self.assertFalse(out["ok"])
 
     def test_publisher_dry_run(self):
-        frozen = freeze_shortage_suggestion(_calc())
-        out = publish_shortage_approval(thread_id="t-dry", frozen_suggestion=frozen)
+        out = publish_approval(thread_id="t-dry", frozen_suggestion=_frozen())
         self.assertTrue(out["push"]["ok"])
         self.assertEqual(out["push"]["channel"], "dry_run")
 

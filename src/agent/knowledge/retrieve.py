@@ -1,4 +1,7 @@
-"""混合检索：精确标识 + 关键词加权 + 轻量向量，RRF 融合。"""
+"""混合检索：精确标识 + 关键词加权 + 轻量向量，RRF 融合。
+
+RRF 共用 ``memory.scoring.rrf_merge``；向量编码走本包 ``knowledge.embeddings``。
+"""
 
 from __future__ import annotations
 
@@ -7,28 +10,8 @@ import re
 from collections import Counter
 from typing import Any, Optional
 
+from ..memory.scoring import rrf_merge
 from .store import KnowledgeDoc, KnowledgeStore, tokenize
-
-
-def rrf_merge(result_sets: list[list[dict]], k: int = 60, top_n: int = 8) -> list[dict]:
-    scores: dict[str, float] = {}
-    payloads: dict[str, dict] = {}
-    for result_set in result_sets:
-        for rank, item in enumerate(result_set, start=1):
-            item_id = str(item.get("_dedup_key") or item.get("id") or "")
-            if not item_id:
-                continue
-            scores[item_id] = scores.get(item_id, 0.0) + 1.0 / (k + rank)
-            prev = payloads.get(item_id)
-            if prev is None or float(item.get("score") or 0) > float(prev.get("score") or 0):
-                payloads[item_id] = dict(item)
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
-    out: list[dict] = []
-    for item_id, rrf in ranked:
-        row = payloads[item_id]
-        row["rrf_score"] = round(rrf, 6)
-        out.append(row)
-    return out
 
 
 def _doc_hit(doc: KnowledgeDoc, score: float, method: str) -> dict[str, Any]:

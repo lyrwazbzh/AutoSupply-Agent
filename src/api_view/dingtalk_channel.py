@@ -86,7 +86,7 @@ class DingTalkApprovalCard:
     card_id: str
     thread_id: str
     suggestion_id: str
-    calc_run_id: str
+    evidence_id: str
     title: str
     summary_lines: list[str]
     total_amount: float
@@ -103,16 +103,15 @@ def render_approval_card(
     *,
     thread_id: str,
     frozen_suggestion: dict[str, Any],
-    title: str = "缺料补货采购审批",
+    title: str = "采购订单审批",
     exposure_level: str = "medium",
 ) -> DingTalkApprovalCard:
-    """从 freeze_shortage_suggestion 结果生成钉钉可渲染的审批卡数据。"""
+    """从订单审批载荷生成钉钉可渲染的审批卡数据。"""
     payload = frozen_suggestion.get("order_payload") or {}
     details = payload.get("orderDetail") or []
-    amount = float(frozen_suggestion.get("total_amount") or 0)
+    amount = float(frozen_suggestion.get("total_amount") or payload.get("totalAmount") or 0)
     lines = [
-        f"suggestion={frozen_suggestion.get('suggestion_id')}",
-        f"calc_run_id={frozen_suggestion.get('calc_run_id')}",
+        f"suggestion={frozen_suggestion.get('suggestion_id') or ''}",
         f"明细 {len(details)} 行 / 金额 {amount}",
         f"暴露风险={exposure_level}",
     ]
@@ -155,7 +154,7 @@ def render_approval_card(
         card_id=card_id,
         thread_id=thread_id,
         suggestion_id=str(frozen_suggestion.get("suggestion_id") or ""),
-        calc_run_id=str(frozen_suggestion.get("calc_run_id") or ""),
+        evidence_id=str(frozen_suggestion.get("evidence_id") or ""),
         title=title,
         summary_lines=lines,
         total_amount=amount,
@@ -367,14 +366,14 @@ class DingTalkStreamConsumer:
         return {"ok": False, "error": f"未知事件类型: {etype}"}
 
 
-def publish_shortage_approval(
+def publish_approval(
     *,
     thread_id: str,
     frozen_suggestion: dict[str, Any],
     userid: Optional[str] = None,
     exposure_level: str = "medium",
 ) -> dict[str, Any]:
-    """一站式：渲染 + 推送。"""
+    """一站式：渲染 + 推送采购审批卡。"""
     card = render_approval_card(
         thread_id=thread_id,
         frozen_suggestion=frozen_suggestion,

@@ -15,7 +15,7 @@ _MAX_PDF_CHARS = 12000
 
 _DOMAIN_HINTS = [
     (r"准入|信用|AVL|供应商等级", "avl"),
-    (r"SOP|作业指导|补货|审批|缺料", "procurement_sop"),
+    (r"SOP|作业指导|补货|审批", "procurement_sop"),
     (r"规格|技术要求|电极|摩擦|验收", "material_spec"),
     (r"延期|异常|台账|处置", "exception"),
 ]
@@ -75,7 +75,7 @@ def structurize_text(
         t = first[:80]
 
     tags: list[str] = []
-    for kw in ("准入", "SOP", "规格", "延期", "审批", "缺料"):
+    for kw in ("准入", "SOP", "规格", "延期", "审批", "补货"):
         if kw in raw:
             tags.append(kw)
 

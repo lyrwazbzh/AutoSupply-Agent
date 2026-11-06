@@ -1,51 +1,131 @@
-"""Embedding 客户端：优先 HTTP 推理服务，失败降级本地词袋向量。"""
+"""知识检索向量：独立于 memory.embeddings，只读 KNOWLEDGE_EMBEDDING_*。"""
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
-
-import httpx
-
-from . import settings
-from .store import tokenize
+import os
+import urllib.request
+from typing import Sequence
 
 logger = logging.getLogger(__name__)
 
+_BOW_DIM = 256
 
-def is_embedding_available() -> bool:
-    url = settings.EMBEDDING_SERVER_URL
+
+def cosine(left: Sequence[float] | None, right: Sequence[float] | None) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for a, b in zip(left, right):
+        dot += a * b
+        na += a * a
+        nb += b * b
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, dot / math.sqrt(na * nb)))
+
+
+def _embeddings_endpoint(base_url: str) -> str:
+    base = (base_url or "").rstrip("/")
+    if not base:
+        return ""
+    if base.endswith("/embeddings"):
+        return base
+    if base.endswith("/v1"):
+        return base + "/embeddings"
+    return base + "/v1/embeddings"
+
+
+def _resolve_config(
+    base_url: str = "",
+    api_key: str = "",
+    model: str = "",
+) -> tuple[str, str, str]:
+    url = (base_url or "").strip() or os.getenv("KNOWLEDGE_EMBEDDING_URL", "").strip()
+    key = (
+        (api_key or "").strip()
+        or os.getenv("KNOWLEDGE_EMBEDDING_API_KEY", "").strip()
+        or os.getenv("OPENAI_API_KEY", "").strip()
+    )
+    name = (
+        (model or "").strip()
+        or os.getenv("KNOWLEDGE_EMBEDDING_MODEL", "").strip()
+        or "text-embedding-3-small"
+    )
+    return url, key, name
+
+
+class HttpEmbedder:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        *,
+        timeout_s: float = 15.0,
+    ):
+        self._url = _embeddings_endpoint(base_url)
+        self._api_key = api_key
+        self._model = model
+        self._timeout_s = timeout_s
+
+    def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
+        payload = json.dumps(
+            {"model": self._model, "input": list(texts)},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        request = urllib.request.Request(
+            self._url,
+            data=payload,
+            method="POST",
+            headers=headers,
+        )
+        with urllib.request.urlopen(request, timeout=self._timeout_s) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        data = body.get("data") or []
+        ordered = sorted(data, key=lambda row: int(row.get("index", 0)))
+        return [list(row.get("embedding") or []) for row in ordered]
+
+
+def build_http_embedder(
+    base_url: str = "",
+    api_key: str = "",
+    model: str = "",
+) -> HttpEmbedder | None:
+    url, key, name = _resolve_config(base_url, api_key, model)
     if not url:
+        return None
+    return HttpEmbedder(url, key, name)
+
+
+def is_embedding_available(
+    base_url: str = "",
+    api_key: str = "",
+    model: str = "",
+) -> bool:
+    embedder = build_http_embedder(base_url, api_key, model)
+    if embedder is None:
         return False
     try:
-        r = httpx.get(f"{url}/health", timeout=2.0)
-        return r.status_code == 200
+        vectors = embedder.embed_texts(["ping"])
+        return bool(vectors and vectors[0])
     except Exception:
         return False
 
 
-def _http_embed(texts: list[str]) -> list[list[float]]:
-    url = settings.EMBEDDING_SERVER_URL
-    if not url:
-        raise RuntimeError("未配置 KNOWLEDGE_EMBEDDING_URL")
-    r = httpx.post(
-        f"{url}/v1/embeddings",
-        json={"model": settings.EMBEDDING_MODEL, "input": texts},
-        timeout=settings.HTTP_TIMEOUT,
-    )
-    r.raise_for_status()
-    data = r.json()["data"]
-    data.sort(key=lambda x: x["index"])
-    return [d["embedding"] for d in data]
+def _bow_embed(text: str, dim_hint: int = _BOW_DIM) -> list[float]:
+    from .store import tokenize
 
-
-def _bow_embed(text: str, dim_hint: int = 256) -> list[float]:
-    """确定性本地降级向量（hash 桶），无外部服务时保证链路可跑。"""
     vec = [0.0] * dim_hint
     for tok in tokenize(text):
-        # Python's built-in hash is randomized per process and would make
-        # persisted pgvector embeddings invalid after a restart.
         digest = hashlib.sha256(tok.encode("utf-8")).digest()
         h = int.from_bytes(digest[:8], "big") % dim_hint
         vec[h] += 1.0
@@ -53,27 +133,35 @@ def _bow_embed(text: str, dim_hint: int = 256) -> list[float]:
     return [v / norm for v in vec]
 
 
-def encode_texts(texts: list[str]) -> tuple[list[list[float]], str]:
-    """返回 (向量列表, backend=http|bow)。"""
+def encode_texts(
+    texts: list[str],
+    *,
+    base_url: str = "",
+    api_key: str = "",
+    model: str = "",
+) -> tuple[list[list[float]], str]:
     if not texts:
         return [], "empty"
-    try:
-        if settings.EMBEDDING_SERVER_URL and is_embedding_available():
-            return _http_embed(texts), "http"
-    except Exception as e:
-        logger.warning("Embedding HTTP 不可用，降级 bow: %s", e)
-    return [_bow_embed(t) for t in texts], "bow"
+    embedder = build_http_embedder(base_url, api_key, model)
+    if embedder is not None:
+        try:
+            return embedder.embed_texts(texts), "http"
+        except Exception as exc:
+            logger.warning("知识 Embedding HTTP 不可用，降级 bow: %s", exc)
+    return [_bow_embed(text) for text in texts], "bow"
 
 
-def encode_text(text: str) -> tuple[list[float], str]:
-    vecs, backend = encode_texts([text])
-    return (vecs[0] if vecs else []), backend
-
-
-def cosine(a: list[float], b: list[float]) -> float:
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a)) or 1.0
-    nb = math.sqrt(sum(y * y for y in b)) or 1.0
-    return dot / (na * nb)
+def encode_text(
+    text: str,
+    *,
+    base_url: str = "",
+    api_key: str = "",
+    model: str = "",
+) -> tuple[list[float], str]:
+    vectors, backend = encode_texts(
+        [text],
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+    )
+    return (vectors[0] if vectors else []), backend

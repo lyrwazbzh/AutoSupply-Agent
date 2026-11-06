@@ -1,0 +1,65 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: java-erp
+  datasource:
+    url: jdbc:mysql://localhost:3306/motorparts_db?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&createDatabaseIfNotExist=true&allowPublicKeyRetrieval=true&useSSL=false
+    username: root
+    password: 123456
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  data:
+    redis:
+      host: localhost
+      port: 6379
+  jackson:
+    time-zone: Asia/Shanghai
+    serialization:
+      write-dates-as-timestamps: false
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
+      - org.apache.rocketmq.spring.autoconfigure.RocketMQAutoConfiguration
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+# 默认关闭 Redis/MQ，仅 MySQL CAS + local_message 表结构就绪；联调时按需打开
+motorparts:
+  init:
+    enabled: true
+    insert-sample-data: true
+  redis:
+    enabled: false
+    idem-ttl-seconds: 86400
+  mq:
+    enabled: true
+    rocketmq-enabled: false
+    pending-cancel-hours: 24
+    poll-interval-ms: 5000
+    poll-batch-size: 20
+
+# 仅当 motorparts.mq.rocketmq-enabled=true 且去掉上面 RocketMQ exclude 时需要
+rocketmq:
+  name-server: 127.0.0.1:9876
+  producer:
+    group: java-erp-producer
+
+logging:
+  level:
+    com.motorparts: INFO

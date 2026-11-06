@@ -61,11 +61,11 @@ class MemoryIntegrationTests(unittest.TestCase):
                 {'ep_A', 'ep_B'},
             )
             self.assertEqual({i.source['thread_id'] for i in episodes}, {'A', 'B'})
-            self.assertEqual(
-                {i.goal for i in episodes},
-                {'Compare suppliers', 'Search orders'},
+            self.assertTrue(
+                all('Compare suppliers' in i.summary or 'Search orders' in i.summary
+                    for i in episodes)
             )
-            self.assertEqual({i.outcome for i in episodes}, {'done'})
+            self.assertTrue(all('done' in i.summary for i in episodes))
             self.assertIn('first-memory', capture.prompts[0])
             self.assertIn('second-memory', capture.prompts[1])
             self.assertNotIn('first-memory', capture.prompts[1])
@@ -101,11 +101,12 @@ class MemoryIntegrationTests(unittest.TestCase):
         result = extract_preferences([Msg('human', '以后不要用饼图，改成柱状图')])
         self.assertEqual(result['preferred_chart_type'], 'bar')
 
-    def test_all_user_turns_are_considered_and_latest_preference_wins(self):
+    def test_incremental_extract_uses_latest_user_turn_only(self):
         from langgraph.runtime import Runtime
         store = FakeStore()
         keeper = MemoryKeeper(store, 'u1')
         keeper.merge_preferences({'preferred_chart_type': 'bar'})
+        # 本轮只看最近一条 human；更早的「以后用饼图」不应再被扫进增量。
         MemoryUpdateMiddleware(store, 'u1').after_agent(
             {'messages': [
                 Msg('human', '以后用饼图'),
@@ -113,6 +114,18 @@ class MemoryIntegrationTests(unittest.TestCase):
                 Msg('human', '后来改成折线图'),
             ]}, Runtime())
         self.assertEqual(keeper.load_preferences()['preferred_chart_type'], 'line')
+
+        store2 = FakeStore()
+        keeper2 = MemoryKeeper(store2, 'u2')
+        keeper2.merge_preferences({'preferred_chart_type': 'bar'})
+        MemoryUpdateMiddleware(store2, 'u2').after_agent(
+            {'messages': [
+                Msg('human', '以后用饼图'),
+                Msg('ai', 'ok'),
+                Msg('human', '帮我查一下库存'),
+            ]}, Runtime())
+        # 最新一轮无图表偏好，不应被历史「饼图」覆盖成 pie
+        self.assertEqual(keeper2.load_preferences()['preferred_chart_type'], 'bar')
 
     def test_env_defaults_are_loaded(self):
         from src.agent.memory import config

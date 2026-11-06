@@ -2,7 +2,7 @@
 
 面向汽车与摩托车零部件采购场景的全栈 Agent 系统。项目以 DeepAgents 与 LangGraph
 为执行底座，通过 Planning、Executing、Review、Result 四阶段 Harness 编排采购分析、
-缺料计算、供应商查询、库存操作和采购订单处理，并以 MCP 隔离 Agent 与 ERP 接口。
+供应商查询、库存操作和采购订单处理，并以 MCP 隔离 Agent 与 ERP 接口。
 
 系统同时提供规则优先、LLM 兜底的质量评审，写操作前人工审批，写后持久化审计与对账，
 以及用户级 Docker 沙箱、三层记忆、SSE 前端和容器化部署能力。
@@ -18,7 +18,7 @@
 - **主 Agent 与两个子 Agent**：主 Agent 通过 DeepAgents 的 `task` 工具按需选择采购分析或
   订单操作子 Agent；服务端从可信 `configurable` 自动注入用户身份、偏好和 WARM 记忆，
   不要求主 Agent 在委派文本中重复传递上下文。
-- **MCP 采购网关**：FastMCP 封装供应商、零部件、订单、库存和缺料五组工具，通过 HTTP
+- **MCP 采购网关**：FastMCP 封装供应商、零部件、订单、库存四组工具，通过 HTTP
   对接外部 ERP；仓库自带行为一致的 Mock ERP，可脱离未开源业务系统运行。
 - **审批、评审与审计分层**：审批在 ERP 写入前阻断执行，Rubric 在执行后检查结果质量，
   写审计则持久化操作事实。三者职责独立，但主 Agent 直调和子 Agent 调用共享同一审批策略中心。
@@ -125,18 +125,18 @@ autosupply-agent/
 │  │  ├─ subagents/                采购分析 / 订单操作 YAML 配置
 │  │  ├─ memory/                   Semantic / Episodic / Procedural 三类记忆
 │  │  ├─ knowledge/                采购知识检索、RRF、证据与有界补搜
-│  │  ├─ shortage/                 缺料计算、建议固化与结果审计
 │  │  └─ tools/                    图表、文档、知识、记忆、下载与 HITL 工具
 │  ├─ api_view/                    FastAPI、SSE、认证、历史、审计与评测 API
-│  ├─ mcp_server/                  供应商、零部件、订单、库存、缺料 MCP 工具
+│  ├─ mcp_server/                  供应商、零部件、订单、库存 MCP 工具
 │  ├─ skills/                      Agent Skills
 │  ├─ test/evaluation/             Golden 回归与 JSON 指标报告
 │  ├─ artifacts.py                 用户隔离临时文件与 TTL 清理
 │  └─ database.py                  PostgreSQL 连接池及应用 Schema 初始化
 ├─ frontend/                       Next.js 16 Web 前端
+├─ java_erp/                       Java 采购 ERP（本地联调默认 :8080）
 ├─ deploy/
 │  ├─ postgres/                    pgvector + zhparser PostgreSQL 镜像
-│  ├─ mock-erp/                    可独立运行的采购 ERP 替身
+│  ├─ mock-erp/                    可独立运行的采购 ERP 替身（Compose 默认）
 │  ├─ sandbox/                     预装分析依赖的沙箱镜像
 │  ├─ nginx/                       统一入口、认证与 TLS
 │  ├─ prometheus/ / grafana/       指标采集、告警与 Dashboard
@@ -268,8 +268,11 @@ docker build -f deploy/sandbox/Dockerfile \
 分别启动四个进程：
 
 ```bash
-# 终端 1：Mock ERP
-python deploy/mock-erp/erp_mock_server.py
+# 终端 1：Java ERP（需本机 MySQL；见 java_erp/README.md）
+cd java_erp && mvn spring-boot:run
+
+# 或临时用 Mock ERP：python deploy/mock-erp/erp_mock_server.py
+# 并设置 ERP_BASE_URL=http://localhost:8081
 
 # 终端 2：MCP
 python -m src.mcp_server.server_main
@@ -281,8 +284,8 @@ python -m src.api_view.web_main
 cd frontend && npm run dev
 ```
 
-本地模式访问 <http://localhost:3000/>。`MCP_SERVER_URL`、`ERP_BASE_URL`、
-`DATABASE_URL` 和 `SANDBOX_IMAGE` 以根目录 `.env` 为准。
+本地模式访问 <http://localhost:3000/>。`MCP_SERVER_URL`、`ERP_BASE_URL`（默认
+`http://localhost:8080` 指向 `java_erp`）、`DATABASE_URL` 和 `SANDBOX_IMAGE` 以根目录 `.env` 为准。
 
 ## 记忆与知识检索
 
@@ -313,7 +316,7 @@ COLD 检索采用：
 当前评测链提供确定性 Golden 回归、JSON 报告和指标 API：
 
 ```bash
-python -m unittest src.test.evaluation.test_shortage_golden_evaluation -v
+python -m unittest src.test.test_result_audit src.test.test_hybrid_review -v
 curl http://localhost:8000/api/evaluation/metrics
 ```
 

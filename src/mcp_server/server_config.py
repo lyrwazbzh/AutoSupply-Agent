@@ -9,8 +9,8 @@ from dotenv import load_dotenv
 # 加载项目根目录 .env # 加载项目根目录 .env（MCP Server 独立运行，需要自己加载）
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '..', '.env'))
 
-# Java ERP 后端地址
-ERP_BASE_URL = os.getenv("ERP_BASE_URL", "http://localhost:8081")
+# Java ERP 后端地址（本地默认 java_erp:8080）
+ERP_BASE_URL = os.getenv("ERP_BASE_URL", "http://localhost:8080")
 
 # MCP Server 监听配置
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")

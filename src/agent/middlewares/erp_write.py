@@ -16,18 +16,7 @@ from ..audit.payloads import classify_tool_result, payload_hash
 from ..audit.registry import WRITE_TOOL_SPECS
 from ..audit.repository import WriteAuditRepository
 from ..log_utils import middleware_logger
-from ..audit.result import ResultAuditor
-from ..shortage.actions import (
-    record_procurement_result,
-    validate_action_retry,
-    validate_frozen_suggestion,
-)
-from ..shortage.records import load_calc_result
-from ..shortage.suggestion import (
-    assert_payload_matches_calc,
-    parse_order_data_arg,
-    validate_order_create_payload,
-)
+from ..order_payload import parse_order_data_arg, validate_order_create_payload
 
 AUDIT_FAILURE_TOTAL = Counter(
     "erp_write_audit_failure_total",
@@ -232,23 +221,8 @@ class ERPWriteMiddleware(AgentMiddleware):
         except (ValueError, json.JSONDecodeError, TypeError) as exc:
             return [f"order_data 解析失败: {exc}"]
 
-        errors.extend(validate_order_create_payload(data))
-        calc_run_id = data.get("calc_run_id")
-        if data.get("suggestion_id") and not calc_run_id:
-            errors.append("带有 suggestion_id 的建单必须携带 calc_run_id")
-
-        if calc_run_id:
-            snapshots = dict(state.get("calc_snapshots") or {})
-            snapshots.update(
-                ResultAuditor(store=self.store, user_id=self.user_id).collect_snapshots(state)
-            )
-            calc = snapshots.get(str(calc_run_id)) or load_calc_result(
-                self.store, self.user_id, str(calc_run_id)
-            )
-            errors.extend(assert_payload_matches_calc(data, calc))
-            errors.extend(validate_frozen_suggestion(self.store, self.user_id, data))
-            errors.extend(validate_action_retry(self.store, self.user_id, data))
-
+        if tool_name == "order_create":
+            errors.extend(validate_order_create_payload(data))
         if tool_name == "order_update" and args.get("id") is None and data.get("id") is None:
             errors.append("order_update 须提供订单 id")
         return errors
@@ -300,16 +274,6 @@ class ERPWriteMiddleware(AgentMiddleware):
             self.repository.mark_dispatching(operation_id)
         return request
 
-    def _record_order_result(self, request: ToolCallRequest, result: Any) -> None:
-        if str(request.tool_call.get("name") or "").lower() != "order_create":
-            return
-        try:
-            args = dict(request.tool_call.get("args") or {})
-            data = parse_order_data_arg(args.get("order_data", args))
-            record_procurement_result(self.store, self.user_id, data, result)
-        except Exception as exc:
-            middleware_logger.error("Failed to persist procurement action: %s", exc)
-
     def _prepare(
         self, request: ToolCallRequest
     ) -> tuple[ToolCallRequest, dict[str, Any], str] | ToolMessage:
@@ -335,7 +299,11 @@ class ERPWriteMiddleware(AgentMiddleware):
             payload=audit_payload,
         )
         status = operation["status"]
-        if status in {"SUCCEEDED", "RECONCILED_SUCCEEDED"}:
+        if status in {
+            "SUCCEEDED",
+            "RECONCILED_SUCCEEDED",
+            "MANUAL_RESOLVED_SUCCEEDED",
+        }:
             return self._replay_message(request, operation)
         if status == "REJECTED":
             return self._rejected_message(request, operation_id)
@@ -345,7 +313,12 @@ class ERPWriteMiddleware(AgentMiddleware):
                 operation_id,
                 "该写操作已派发或结果待对账，禁止自动重试",
             )
-        if status in {"FAILED", "NOT_APPLIED"}:
+        if status in {
+            "FAILED",
+            "NOT_APPLIED",
+            "MANUAL_RESOLVED_NOT_APPLIED",
+            "MANUAL_RESOLVED_ABANDONED",
+        }:
             return ToolMessage(
                 content=json.dumps(
                     {
@@ -471,7 +444,6 @@ class ERPWriteMiddleware(AgentMiddleware):
                 operation_id,
                 "ERP 写请求发生传输异常，执行结果未知；禁止自动重试，系统将执行对账",
             )
-        await asyncio.to_thread(self._record_order_result, audited_request, result)
         try:
             return await asyncio.to_thread(self._finish, audited_request, operation_id, result)
         except Exception as exc:
@@ -565,7 +537,6 @@ class ERPWriteMiddleware(AgentMiddleware):
                 operation_id,
                 "ERP 写请求发生传输异常，执行结果未知；禁止自动重试，系统将执行对账",
             )
-        self._record_order_result(audited_request, result)
         try:
             return self._finish(audited_request, operation_id, result)
         except Exception as exc:

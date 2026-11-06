@@ -239,13 +239,20 @@ def get_default_store() -> KnowledgeStore:
     return _DEFAULT
 
 
+_PUNCT_RE = re.compile(r"^[\W_]+$", re.UNICODE)
+
+
 def tokenize(text: str) -> list[str]:
-    text = (text or "").lower()
-    # 中英混切：连续汉字 / 字母数字
-    parts = re.findall(r"[\u4e00-\u9fff]{1,}|[a-z0-9][\w\-]*", text)
+    """BM25 分词：与记忆侧一致，jieba 精确模式中英混切。"""
+    raw = (text or "").strip().lower()
+    if not raw:
+        return []
+    import jieba
+
     tokens: list[str] = []
-    for p in parts:
-        if re.fullmatch(r"[\u4e00-\u9fff]+", p) and len(p) > 2:
-            tokens.extend(p[i : i + 2] for i in range(len(p) - 1))
-        tokens.append(p)
+    for piece in jieba.lcut(raw, cut_all=False):
+        tok = (piece or "").strip()
+        if not tok or _PUNCT_RE.match(tok):
+            continue
+        tokens.append(tok)
     return tokens

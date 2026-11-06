@@ -1,4 +1,8 @@
-"""记忆检索的时间、频次评分，以及非 PostgreSQL Store 的 BM25 回退。"""
+"""COLD 层检索融合打分。
+
+召回在 ``postgres_search.recall_ranked_lanes``（有效性 → BM25 Top-k / 向量 Top-k）；
+本模块：两路 RRF → max 归一化 → combined_score（时间/频次/置信度）。
+"""
 from __future__ import annotations
 
 import math
@@ -6,29 +10,24 @@ import re
 from datetime import datetime
 from typing import List, Optional, Sequence
 
-_CJK_RANGE = "\u4e00-\u9fff"
-_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[" + _CJK_RANGE + r"]+")
+from .embeddings import cosine
 
-
-def _is_cjk(ch: str) -> bool:
-    return bool(ch) and "\u4e00" <= ch <= "\u9fff"
+_PUNCT_RE = re.compile(r"^[\W_]+$", re.UNICODE)
 
 
 def tokenize(text: str) -> List[str]:
-    """中英混合分词：英文按词，中文按字 + 二元组（兼顾召回与噪声）。"""
+    """BM25 分词：jieba 中英混切，小写，丢掉纯标点空白。"""
+    raw = (text or "").strip().lower()
+    if not raw:
+        return []
+    import jieba
+
     tokens: List[str] = []
-    for match in _TOKEN_RE.finditer((text or "").lower()):
-        piece = match.group(0)
-        if not piece:
+    for piece in jieba.lcut(raw, cut_all=False):
+        tok = (piece or "").strip()
+        if not tok or _PUNCT_RE.match(tok):
             continue
-        if _is_cjk(piece[0]):
-            if len(piece) == 1:
-                tokens.append(piece)
-                continue
-            tokens.extend(piece)
-            tokens.extend(piece[i:i + 2] for i in range(len(piece) - 1))
-        else:
-            tokens.append(piece)
+        tokens.append(tok)
     return tokens
 
 
@@ -108,30 +107,92 @@ def combined_score(
     )
 
 
-def rank(query: str, candidates: Sequence, config=None, now: Optional[datetime] = None):
-    """给候选记忆打分并按分数降序返回 ``(item, score)`` 列表。"""
-    if not candidates:
-        return []
+def rrf_merge(
+    result_sets: list[list[dict]],
+    k: int = 60,
+    top_n: int = 8,
+    *,
+    id_keys: tuple[str, ...] = ("_dedup_key", "id"),
+) -> list[dict]:
+    """多路有序列表的 Reciprocal Rank Fusion；知识检索与记忆 COLD 共用。"""
+    scores: dict[str, float] = {}
+    payloads: dict[str, dict] = {}
+
+    def _item_id(item: dict) -> str:
+        for key in id_keys:
+            value = item.get(key)
+            if value:
+                return str(value)
+        return ""
+
+    for result_set in result_sets:
+        for rank_idx, item in enumerate(result_set, start=1):
+            item_id = _item_id(item)
+            if not item_id:
+                continue
+            scores[item_id] = scores.get(item_id, 0.0) + 1.0 / (k + rank_idx)
+            prev = payloads.get(item_id)
+            if prev is None or float(item.get("score") or 0) > float(prev.get("score") or 0):
+                payloads[item_id] = dict(item)
+    ranked = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)[:top_n]
+    out: list[dict] = []
+    for item_id, rrf in ranked:
+        row = payloads[item_id]
+        row["rrf_score"] = round(rrf, 6)
+        out.append(row)
+    return out
+
+
+def rank_from_lanes(
+    keyword_lane: Sequence,
+    vector_lane: Sequence,
+    config=None,
+    now: Optional[datetime] = None,
+    *,
+    rrf_k: int = 60,
+    top_n: Optional[int] = None,
+):
+    """对已排好序的关键词路 / 向量路做 RRF → 归一化 → combined_score。"""
     from .config import DEFAULT_MEMORY_CONFIG
 
     cfg = config or DEFAULT_MEMORY_CONFIG
-    query_tokens = tokenize(query)
-    if not query_tokens:
+    kw = list(keyword_lane or [])
+    vec = list(vector_lane or [])
+    if not kw and not vec:
         return []
 
-    docs = [tokenize(item.searchable_text()) for item in candidates]
-    raw = bm25(query_tokens, docs)
-    norm = normalize(raw)
+    by_id = {}
+    for item in kw + vec:
+        by_id[str(item.id)] = item
+
+    lanes = []
+    if kw:
+        lanes.append(
+            [
+                {"id": item.id, "score": float(len(kw) - idx)}
+                for idx, item in enumerate(kw)
+            ]
+        )
+    if vec:
+        lanes.append(
+            [
+                {"id": item.id, "score": float(len(vec) - idx)}
+                for idx, item in enumerate(vec)
+            ]
+        )
+
+    merge_n = top_n if top_n is not None else len(by_id)
+    merged = rrf_merge(lanes, k=rrf_k, top_n=max(1, merge_n))
+    channels = normalize([float(row.get("rrf_score") or 0.0) for row in merged])
 
     now_dt = now or datetime.now()
     scored = []
-    for item, text_score, raw_score in zip(candidates, norm, raw):
-        # 一个查询词都没命中的直接排除：否则时间衰减/置信度这些"先验分"
-        # 会把完全不相关的记忆托过阈值，检索就失去意义了。
-        if raw_score <= 0:
+    for row, channel in zip(merged, channels):
+        item = by_id.get(str(row.get("id") or ""))
+        if item is None:
             continue
         score = combined_score(
-            text_score,
+            channel,
             item.age_days(now_dt),
             item.access_count,
             item.confidence,
@@ -145,3 +206,59 @@ def rank(query: str, candidates: Sequence, config=None, now: Optional[datetime] 
 
     scored.sort(key=lambda pair: pair[1], reverse=True)
     return scored
+
+
+def rank(
+    query: str,
+    candidates: Sequence,
+    config=None,
+    now: Optional[datetime] = None,
+    *,
+    query_embedding: Optional[Sequence[float]] = None,
+    rrf_k: int = 60,
+):
+    """兼容入口：在候选集上本地拆 BM25 / 余弦两路后再 ``rank_from_lanes``。
+
+    主检索路径请用 ``recall_ranked_lanes`` + ``rank_from_lanes``，避免 PG 召回后再整池重算。
+    """
+    if not candidates:
+        return []
+    from .config import DEFAULT_MEMORY_CONFIG
+
+    cfg = config or DEFAULT_MEMORY_CONFIG
+    query_tokens = tokenize(query)
+    has_query_tokens = bool(query_tokens)
+    has_query_vec = bool(query_embedding)
+    if not has_query_tokens and not has_query_vec:
+        return []
+
+    docs = [tokenize(item.searchable_text()) for item in candidates]
+    raw = bm25(query_tokens, docs) if has_query_tokens else [0.0] * len(candidates)
+    min_cosine = float(getattr(cfg, "min_cosine", 0.32))
+
+    keyword_ranked = [
+        item
+        for item, score in sorted(
+            ((item, float(score)) for item, score in zip(candidates, raw) if score > 0),
+            key=lambda row: row[1],
+            reverse=True,
+        )
+    ]
+    vector_ranked: list = []
+    if has_query_vec:
+        scored_vec = []
+        for item in candidates:
+            semantic_score = cosine(query_embedding, getattr(item, "embedding", None))
+            if semantic_score >= min_cosine:
+                scored_vec.append((item, float(semantic_score)))
+        scored_vec.sort(key=lambda row: row[1], reverse=True)
+        vector_ranked = [item for item, _ in scored_vec]
+
+    return rank_from_lanes(
+        keyword_ranked,
+        vector_ranked,
+        cfg,
+        now,
+        rrf_k=rrf_k,
+        top_n=len(candidates),
+    )

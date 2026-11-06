@@ -1,4 +1,4 @@
-现有 [`test_shortage_golden_evaluation.py`](<D:/Autumn recruitment/Agent-Harness-main/src/test/evaluation/test_shortage_golden_evaluation.py:1>) 主要验证确定性模块和缺料金标，没有完整运行真实 Agent，不能直接支撑“采购查询任务完成率约 91%”。需要增加独立的全链路评测集和外部评测器。
+现有单元与 Golden 回归主要验证确定性模块与写安全门禁，没有完整运行真实 Agent，不能直接支撑“采购查询任务完成率约 91%”。需要增加独立的全链路评测集和外部评测器。
 
 # 一、先明确两个指标
 
@@ -73,7 +73,7 @@
 | 库存查询 | 30 | 库存量、安全库存、预警、可用量 |
 | 订单只读查询 | 30 | 订单状态、明细、分页、统计 |
 | 跨领域分析 | 40 | 供应商+零件、订单+库存、多工具汇总 |
-| 缺料/多轮/异常查询 | 40 | 缺槽位澄清、无结果、上下文追问、歧义表达 |
+| 多轮/异常查询 | 40 | 缺槽位澄清、无结果、上下文追问、歧义表达 |
 
 总计 200 条。
 
@@ -266,7 +266,7 @@ fixtures/
 ├── expected_parts_v1.json
 ├── expected_inventory_v1.json
 ├── expected_orders_v1.json
-└── expected_shortage_v1.json
+└── expected_query_v1.json
 ```
 
 每条评测前恢复相同快照，固定：
@@ -276,12 +276,12 @@ fixtures/
 - 订单状态
 - 库存数量
 - 供应商状态
-- 缺料计算口径
+- 查询口径
 - 数据版本
 
 ## 2. 金标程序化生成
 
-列表、统计、库存和订单金标直接从冻结的 mock ERP 快照程序化计算，缺料金标继续复用现有 `shortage_seed.py` 和确定性计算口径，避免人工抄写错误。金标生成器只接收 fixture 版本和用例过滤条件。
+列表、统计、库存和订单金标直接从冻结的 mock ERP 快照程序化计算，避免人工抄写错误。金标生成器只接收 fixture 版本和用例过滤条件。
 
 ## 3. 用例隔离
 

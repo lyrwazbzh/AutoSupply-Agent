@@ -221,7 +221,7 @@ namespace=lambda _: (user_context.user_id,)
 ```text
 tenant_id / user_id / memory_type
 tenant_id / user_id / persisted-skills
-tenant_id / user_id / shortage-records
+tenant_id / user_id / write-audit
 ```
 
 ## 3.2 子 Agent可信上下文

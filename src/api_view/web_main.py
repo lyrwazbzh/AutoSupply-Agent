@@ -90,7 +90,6 @@ async def lifespan(app: FastAPI):
         reconciliation_task = asyncio.create_task(
             WriteReconciler(
                 repository=agent_loader.write_audit_repository,
-                store=agent_loader.store,
             ).run(stop_event),
             name="write-reconciliation",
         )

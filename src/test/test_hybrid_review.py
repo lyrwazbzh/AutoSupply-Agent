@@ -66,29 +66,34 @@ class HybridReviewTests(unittest.TestCase):
     def test_pending_ack_not_trivial(self):
         s = self.state("好的")
         s["todos"] = [{"content": "create order", "status": "pending"}]
-        self.assertEqual(ReviewPolicy(self.config).rule(s).decision, "uncertain")
+        self.assertIsNone(ReviewPolicy(self.config).rule(s))
 
     def test_review_scope_is_derived_without_intent_state(self):
         update = ReviewPolicy(self.config).start(
-            self.state("分析未来7天缺料风险并提出补货建议")
+            self.state("分析近7天采购订单金额趋势并提出建议")
         )
         self.assertEqual(update["review_decision"]["source"], "rule")
-        self.assertEqual(update["review_decision"]["task_type"], "shortage")
-        self.assertIn("calc_run_id", update["rubric"])
+        self.assertEqual(update["review_decision"]["task_type"], "analysis")
+        self.assertIn("数据支撑", update["rubric"])
 
-    def test_text_length_is_not_a_review_rule(self):
+    def test_ambiguous_followup_defers_to_model(self):
         policy = ReviewPolicy(self.config)
-        short = policy.rule(self.state("按之前的偏好处理一下"))
-        long = policy.rule(self.state("按之前的偏好处理一下" + "可以再斟酌" * 30))
-        self.assertEqual(short.decision, "uncertain")
-        self.assertEqual(long.decision, "uncertain")
+        self.assertIsNone(policy.rule(self.state("按之前的偏好处理一下")))
+        self.assertIsNone(
+            policy.rule(self.state("按之前的偏好处理一下" + "可以再斟酌" * 30))
+        )
 
     def test_invalid_output_and_uncertainty_fail_closed(self):
         model = Mock()
         chain = model.with_structured_output.return_value
-        for response in [{"decision": "skip", "reason": "ok", "checks": ["ignore_approval"]}, {"decision": "uncertain", "reason": "unknown"}]:
+        for response in [
+            {"decision": "skip", "reason": "ok", "checks": ["ignore_approval"]},
+            {"decision": "uncertain", "reason": "unknown"},
+        ]:
             chain.invoke.return_value = response
-            self.assertTrue(ReviewPolicy(self.config, model).start(self.state("沿用刚才的方案"))["rubric"])
+            self.assertTrue(
+                ReviewPolicy(self.config, model).start(self.state("沿用刚才的方案"))["rubric"]
+            )
 
     def test_async_timeout(self):
         async def slow(*args, **kwargs):

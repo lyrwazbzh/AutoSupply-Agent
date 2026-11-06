@@ -4,7 +4,7 @@ Harness 编排模块（真 Harness 架构核心）
 职责：
 1. HarnessPhaseState — 扩展 LangGraph 状态（phase / plan / review_result）
 2. load_harness_config — 加载声明式 DSL 配置（harness_config.yaml）
-3. build_rubric / detect_review_scope — 按评审范围生成固定标准
+3. build_rubric / detect_task_type / should_use_grader — 任务类型与是否评审规则
 4. HarnessPhaseMiddleware — 阶段状态机 + rubric 注入
 
 设计说明：
@@ -52,17 +52,6 @@ class HarnessPhaseState(AgentState):
     """记录 rubric 是否由本中间件自动注入，用于跨 checkpoint 清理旧 rubric。"""
 
     review_decision: NotRequired[dict]
-    calc_snapshots: NotRequired[dict]
-    """calc_run_id → CalcResult dict，供 ResultAuditor 数值溯源"""
-
-    business_facts: NotRequired[list[dict]]
-    """服务端或模型提供的结构化业务事实五元组，供字段级核验。"""
-
-    audit_result: NotRequired[dict]
-    """ResultAuditor 门禁结果"""
-
-    snapshot_persistence_error: NotRequired[str]
-
     _review_start: NotRequired[Annotated[int, PrivateStateAttr]]
     _review_write_attempted: NotRequired[Annotated[bool, PrivateStateAttr]]
     _review_signals: NotRequired[Annotated[list[str], PrivateStateAttr]]
@@ -99,8 +88,8 @@ def load_harness_config(config_path: Path | None = None) -> dict[str, Any]:
         return _DEFAULT_CONFIG
 
 
-def detect_review_scope(messages: list[Any], config: dict[str, Any]) -> str:
-    """根据用户消息确定评审范围，用于选择对应的固定评审标准。
+def detect_task_type(messages: list[Any], config: dict[str, Any]) -> str:
+    """根据用户消息识别任务类型，用于选择对应的评审标准。
 
     规则：取最近一条 HumanMessage 的文本，按 task_types 的关键词命中判定。
     多个类型命中时取关键词命中数量最多者；无命中返回 "default"。
@@ -109,7 +98,6 @@ def detect_review_scope(messages: list[Any], config: dict[str, Any]) -> str:
     if not task_types:
         return "default"
 
-    # 收集用户消息文本（取最近的人类消息）
     user_text = ""
     for msg in reversed(messages or []):
         if getattr(msg, "type", "") == "human":
@@ -129,6 +117,28 @@ def detect_review_scope(messages: list[Any], config: dict[str, Any]) -> str:
     return best_type
 
 
+# 兼容旧名：评审范围 = 任务类型（只选 Rubric，不分流工具/子 Agent）
+detect_review_scope = detect_task_type
+
+
+_DEFAULT_REVIEW_TRIGGER_KEYWORDS = (
+    "查询", "搜索", "获取", "列出", "统计", "分析", "对比", "比较", "评估",
+    "报表", "报告", "图表", "下单", "采购", "订单", "审批", "创建", "修改", "删除",
+    "库存", "入库", "出库", "盘点", "预警", "供应商", "供货", "价格", "报价",
+    "生成", "导出", "下载", "上传", "安装", "配置", "执行", "调用", "脚本", "代码",
+    "文件", "批量", "验证", "检查", "审查", "复核", "评审", "验收", "完整", "详细", "请帮我做",
+)
+
+_DEFAULT_TRIVIAL_PATTERNS = (
+    re.compile(
+        r"^(?:你好|您好|嗨|哈喽|hello|hi|hey|早上好|晚上好|晚安|谢谢|感谢|多谢|"
+        r"在吗|你是谁|再见|拜拜|好的|好哒|收到|明白|了解|ok|okay|行|嗯|嗯嗯)"
+        r"[!！。,.，、\s~～]*$",
+        re.IGNORECASE,
+    ),
+)
+
+
 def latest_human_text(messages: list[Any] | None) -> str:
     """提取当前请求最近一条人类消息的纯文本内容。"""
     for msg in reversed(messages or []):
@@ -136,7 +146,6 @@ def latest_human_text(messages: list[Any] | None) -> str:
             continue
         content = getattr(msg, "content", "") or ""
         if isinstance(content, list):
-            # 多模态消息只取文本块；图片本身不应让简单请求触发 grader。
             content = " ".join(
                 str(block.get("text", ""))
                 for block in content
@@ -144,6 +153,38 @@ def latest_human_text(messages: list[Any] | None) -> str:
             )
         return re.sub(r"\s+", " ", str(content)).strip()
     return ""
+
+
+def should_use_grader(messages: list[Any] | None, config: dict[str, Any]) -> bool:
+    """判断本次请求是否需要调用 grader（供 strategy=rules 与兼容路径使用）。"""
+    review_config = config.get("review", {}) if isinstance(config, dict) else {}
+    review_config = review_config if isinstance(review_config, dict) else {}
+    mode = str(review_config.get("mode", "auto")).strip().lower()
+    text = latest_human_text(messages)
+
+    if mode == "never":
+        return False
+    if mode == "always":
+        return bool(text)
+    if not text:
+        return False
+
+    for pattern in _DEFAULT_TRIVIAL_PATTERNS:
+        if pattern.fullmatch(text):
+            return False
+
+    if re.fullmatch(r"(?:什么是[\w]{1,12}|[\w]{1,12}是什么)[？?。\s]*", text):
+        return False
+
+    configured_keywords = review_config.get("trigger_keywords")
+    if isinstance(configured_keywords, list):
+        trigger_keywords = tuple(str(item) for item in configured_keywords if item)
+    else:
+        trigger_keywords = _DEFAULT_REVIEW_TRIGGER_KEYWORDS
+
+    if detect_task_type(messages or [], config) != "default":
+        return True
+    return any(keyword in text for keyword in trigger_keywords)
 
 
 def build_rubric(task_type: str, config: dict[str, Any]) -> str:
@@ -188,7 +229,7 @@ class HarnessPhaseMiddleware(AgentMiddleware):
     """Harness 阶段状态机中间件。
 
     职责：
-    - before_agent: 统一评审路由 → 仅对需要审查的任务注入 rubric → 置 phase=planning
+    - before_agent: 按需识别请求 → 仅对业务/多步任务注入 rubric → 置 phase=planning
     - after_agent:  置 phase=result（终态）
 
     阶段字段写入 state，供 chat.py 从 values 流读取并向前端发射结构化 SSE 事件，
@@ -197,19 +238,10 @@ class HarnessPhaseMiddleware(AgentMiddleware):
 
     state_schema = HarnessPhaseState
 
-    def __init__(
-        self,
-        config_path: Path | None = None,
-        router_model=None,
-        *,
-        store=None,
-        user_id: str = "default_user",
-    ):
+    def __init__(self, config_path: Path | None = None, router_model=None):
         self._config = load_harness_config(config_path)
         from .review_policy import ReviewPolicy
         self._review_policy = ReviewPolicy(self._config, router_model)
-        self._store = store
-        self._user_id = user_id
         self.tools = []
 
     @property
@@ -217,35 +249,23 @@ class HarnessPhaseMiddleware(AgentMiddleware):
         return "HarnessPhaseMiddleware"
 
     def before_agent(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
-        """执行前：统一评审路由 → rubric → phase=planning。"""
-        review_updates = self._review_policy.start(state)
-        return {
-            "phase": Phase.planning.value,
-            "snapshot_persistence_error": "",
-            **review_updates,
-        }
+        """执行前：按需注入 rubric + 置初始阶段为 planning。"""
+        return {"phase": Phase.planning.value, **self._review_policy.start(state)}
 
     async def abefore_agent(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
-        review_updates = await self._review_policy.astart(state)
         return {
             "phase": Phase.planning.value,
-            "snapshot_persistence_error": "",
-            **review_updates,
+            **await self._review_policy.astart(state),
         }
 
     def after_model(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
-        """模型返回后：跟踪阶段 + 同步结构化 plan。
-
-        - 模型产出工具调用 → 置 phase=executing（结构性写入，非正则猜测）
-        - 将 TodoListMiddleware 的 todos 同步为结构化 Plan 写入 plan 字段
-        """
+        """模型返回后：跟踪阶段 + 同步结构化 plan。"""
         updates: dict[str, Any] = {}
 
         messages = state.get("messages", [])
         if messages and getattr(messages[-1], "tool_calls", None):
             updates["phase"] = Phase.executing.value
 
-        # 同步 todos → plan（让 plan 字段真正生效）
         todos = state.get("todos")
         if todos:
             plan = _build_plan_from_todos(todos)
@@ -255,70 +275,24 @@ class HarnessPhaseMiddleware(AgentMiddleware):
         return updates or None
 
     def after_agent(self, state: Any, runtime: Runtime) -> dict[str, Any] | None:
-        """执行后：ResultAuditor 门禁 + 评审结果 + 阶段终态。
+        """执行后：根据评审状态置终态阶段 + 构建结构化评审结果。
 
         说明：after_agent 钩子按逆序执行，RubricMiddleware（注册在本中间件之后）
         会先完成 grading 并更新 _rubric_status，故此处可读取其私有状态。
         """
-        from .audit import ResultAuditor
-
         updates: dict[str, Any] = {}
-        auditor = ResultAuditor(store=self._store, user_id=self._user_id)
-        snapshots = auditor.collect_snapshots(state)
-        persistence_error = ""
-        if snapshots:
-            updates["calc_snapshots"] = snapshots
-            try:
-                auditor.persist_snapshots(snapshots)
-            except Exception as exc:
-                agent_logger.error(f"Failed to persist immutable calc record: {exc}")
-                persistence_error = str(exc)
-                updates["snapshot_persistence_error"] = persistence_error
-        merged_state = {
-            **state,
-            "calc_snapshots": snapshots or state.get("calc_snapshots"),
-            "snapshot_persistence_error": persistence_error
-            or state.get("snapshot_persistence_error"),
-        }
-        audit = auditor.audit(merged_state)
-        updates["audit_result"] = audit.to_dict()
 
-        # 从 RubricMiddleware 的私有状态构建结构化评审结果（持久化到 checkpoint）
-        # 只在本次 state 仍有 rubric 时读取 status。简单请求会清空自动 rubric，
-        # 不能把上一个复杂请求的终态 review_result 误带到本次响应。
         status = state.get("_rubric_status") if state.get("rubric") else None
-        # Auditor reject：有 rubric → needs_revision 打回；无 rubric → failed 终态
-        if audit.action == "reject" and status not in (
-            "max_iterations_reached",
-            "failed",
-        ):
-            status = "needs_revision" if state.get("rubric") else "failed"
-            if state.get("rubric"):
-                updates["_rubric_status"] = "needs_revision"
-
         if status:
             evaluations = state.get("_rubric_evaluations") or []
             last = evaluations[-1] if evaluations else {}
-            explanation = last.get("explanation", "")
-            if audit.action == "reject":
-                audit_msg = "; ".join(
-                    f.message for f in audit.findings if f.severity == "high"
-                ) or "; ".join(f.message for f in audit.findings)
-                explanation = (explanation + " | " if explanation else "") + audit_msg
             review_result = ReviewResult(
                 verdict=status,
-                explanation=explanation,
+                explanation=last.get("explanation", ""),
                 criteria=[dict(c) for c in last.get("criteria", [])],
                 iteration=last.get("iteration", 0),
             )
             updates["review_result"] = review_result.model_dump()
-        elif audit.action == "reject":
-            updates["review_result"] = ReviewResult(
-                verdict="failed",
-                explanation="; ".join(f.message for f in audit.findings),
-                criteria=[],
-                iteration=0,
-            ).model_dump()
 
         todos = state.get("todos")
         if todos:
