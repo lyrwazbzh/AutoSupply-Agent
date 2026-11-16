@@ -90,3 +90,12 @@ class AppRepository:
                 """,
                 (thread_id, Jsonb(trace)),
             )
+
+    def get_harness_trace(self, thread_id: str) -> list[dict]:
+        with self.pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT trace FROM app.harness_traces WHERE thread_id = %s",
+                (thread_id,),
+            )
+            row = cur.fetchone()
+            return list(row["trace"]) if row else []

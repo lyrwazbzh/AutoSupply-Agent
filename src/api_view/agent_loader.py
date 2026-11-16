@@ -267,6 +267,13 @@ class AgentLoader:
             self._app_repository.save_harness_trace, thread_id, trace
         )
 
+    async def get_harness_trace(self, thread_id: str) -> list:
+        """读取已持久化的 Harness 阶段与评审 Trace。"""
+        await self._ensure_resources()
+        return await asyncio.to_thread(
+            self._app_repository.get_harness_trace, thread_id
+        )
+
 
 # 全局单例
 agent_loader = AgentLoader()
