@@ -2,7 +2,7 @@
 子Agent配置加载器
 核心职责：
 1. 读取 configs/*.yaml 并校验必填字段
-2. 将 tools 字符串通过子串匹配映射为实际工具对象
+2. 将 tools 字符串按完整工具名映射为实际工具对象
 3. 将 context_protocol 注入到主Agent系统提示词
 """
 from pathlib import Path  # 导入路径库，用于处理文件路径
@@ -147,12 +147,10 @@ def resolve_subagent_tools(
     middleware_by_agent: dict[str, list] | None = None,
     approval_policy: ApprovalPolicyRegistry | None = None,
 ) -> list:
-    """将 tools 字符串通过子串匹配映射为实际工具对象
-    
-    匹配规则：pattern in tool.name（子串包含匹配）
-    例如："supplier" 会匹配 "supplier_query", "supplier_page", "supplier_get"
-    
-    这种设计允许用户在配置文件中只写 "supplier"，就能自动匹配所有相关工具
+    """将配置中的完整工具名映射为实际工具对象。
+
+    授权面必须可审计，所以禁止前缀/子串兜底。若要授权多个工具，应在 YAML 中
+    逐个声明；拼写错误会记录告警并得到空匹配，而不会扩大权限。
     
     Args:
         configs: 子Agent配置列表（来自 load_subagent_configs）
@@ -165,34 +163,21 @@ def resolve_subagent_tools(
     
     # 遍历每个子Agent配置
     for config in configs:
-        # 获取配置中的工具模式列表（字符串列表）
-        tool_patterns = config.get("tools", [])
+        tool_names = config.get("tools", [])
         
         # 存储匹配到的实际工具对象
         matched_tools = []
 
-        # 遍历每个工具模式字符串
-        for pattern in tool_patterns:
-            pattern_name = str(pattern or "").strip()
-            if not pattern_name:
+        for configured_name in tool_names:
+            exact_name = str(configured_name or "").strip()
+            if not exact_name:
                 continue
 
-            # 匹配优先级：精确 > 分组前缀（order -> order_create）> 子串（旧行为兜底）
-            # 直接用子串会让 "order" 命中 "reorder_item" 这类意外包含该片段的工具，
-            # 导致子Agent 拿到不该有的写权限，因此收敛为按 _ 边界的前缀匹配。
-            hits = [t for t in all_tools if getattr(t, "name", "") == pattern_name]
-            if not hits:
-                hits = [
-                    t for t in all_tools
-                    if str(getattr(t, "name", "")).startswith(pattern_name + "_")
-                ]
-            if not hits:
-                hits = [t for t in all_tools if pattern_name in str(getattr(t, "name", ""))]
+            hits = [t for t in all_tools if getattr(t, "name", "") == exact_name]
 
             if not hits:
                 agent_logger.warning(
-                    f"Subagent '{config.get('name')}' tool pattern '{pattern_name}' "
-                    f"matched no tool"
+                    f"Subagent '{config.get('name')}' exact tool '{exact_name}' is unavailable"
                 )
 
             for tool in hits:

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Optional
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
+from ..agent_loader import agent_loader
+from ..auth import AuthenticatedPrincipal, require_permission
 from ..dingtalk_channel import (
     DingTalkStreamConsumer,
     parse_approval_callback,
@@ -16,6 +19,28 @@ from ..dingtalk_channel import (
 
 router = APIRouter(prefix="/api/dingtalk", tags=["dingtalk"])
 _stream = DingTalkStreamConsumer()
+
+
+async def _persist_approval(result: dict[str, Any]) -> dict[str, Any]:
+    identity = result["identity"]
+    decision = result["approval_decision"]
+    await agent_loader.initialize()
+    try:
+        approval = await asyncio.to_thread(
+            agent_loader.write_audit_repository.decide_approval,
+            decision["operation_id"],
+            decision=decision["decision"],
+            actor_id=identity["agent_user_id"],
+            note=decision.get("note", ""),
+            expected_payload_hash=decision.get("payload_hash", ""),
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="审批任务不存在") from None
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    return {"ok": True, "approval": approval, "card_id": result.get("card_id")}
 
 
 class FreezePushBody(BaseModel):
@@ -31,7 +56,10 @@ async def dingtalk_health():
 
 
 @router.post("/approvals/push")
-async def push_approval(body: FreezePushBody):
+async def push_approval(
+    body: FreezePushBody,
+    _: AuthenticatedPrincipal = Depends(require_permission("erp:order:approve")),
+):
     """渲染并推送采购审批卡（webhook/robot/dry_run）。"""
     return publish_approval(
         thread_id=body.thread_id,
@@ -47,8 +75,8 @@ async def approval_callback(
     timestamp: Optional[str] = Header(default=None, alias="timestamp"),
     sign: Optional[str] = Header(default=None, alias="sign"),
 ):
-    """钉钉审批/互动卡片回调 → HITL resume 载荷。"""
-    if timestamp and sign and not verify_dingtalk_sign(timestamp, sign):
+    """钉钉审批/互动卡片回调 → 按 operation_id 持久化独立决定。"""
+    if not verify_dingtalk_sign(timestamp or "", sign or ""):
         raise HTTPException(status_code=403, detail="invalid dingtalk signature")
     # 开放平台 URL 校验挑战
     if body.get("encrypt") and not body.get("decision") and not body.get("value"):
@@ -56,10 +84,16 @@ async def approval_callback(
     result = parse_approval_callback(body)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "callback failed")
-    return result
+    return await _persist_approval(result)
 
 
 @router.post("/stream/event")
-async def stream_event(event: dict[str, Any]):
+async def stream_event(
+    event: dict[str, Any],
+    _: AuthenticatedPrincipal = Depends(require_permission("erp:order:approve")),
+):
     """外部 Stream 长连接进程把事件推入；本服务做幂等分发。"""
-    return _stream.handle_event(event)
+    result = _stream.handle_event(event)
+    if not result.get("ok") or result.get("dedup") or result.get("type") == "chat":
+        return result
+    return await _persist_approval(result)

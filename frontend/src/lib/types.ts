@@ -53,11 +53,6 @@ export interface SSETodoUpdateEvent {
   type: "todo_update";
   phase?: string;
   todos?: { id: string; content: string; status: string }[];
-  status_change?: string;
-  // legacy fields
-  tool?: string;
-  args?: string;
-  result?: string;
 }
 
 export interface SSEPhaseEvent {

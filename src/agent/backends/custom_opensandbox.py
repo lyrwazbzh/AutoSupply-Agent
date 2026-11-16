@@ -11,8 +11,6 @@ from enum import Enum
 from typing import Optional
 
 import docker
-from requests.exceptions import ConnectionError as RequestsConnectionError
-from requests.exceptions import Timeout as RequestsTimeout
 from deepagents.backends import DEFAULT_EXECUTE_TIMEOUT
 from deepagents.backends.sandbox import (
     BaseSandbox,
@@ -20,6 +18,8 @@ from deepagents.backends.sandbox import (
     FileDownloadResponse,
     FileUploadResponse,
 )
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import Timeout as RequestsTimeout
 
 from ..config import DOCKER_TIMEOUT_SECONDS, SANDBOX_WORK_DIR
 from ..log_utils import sandbox_logger

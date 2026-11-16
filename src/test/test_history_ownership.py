@@ -21,10 +21,9 @@ from unittest.mock import AsyncMock, patch
 from fastapi import HTTPException
 
 from src.api_view.api import history
-from src.api_view.auth import derive_user_id
 
-ALICE = derive_user_id("alice")
-BOB = derive_user_id("bob")
+ALICE = "usr_alice"
+BOB = "usr_bob"
 
 
 class _FakeAgentLoader:

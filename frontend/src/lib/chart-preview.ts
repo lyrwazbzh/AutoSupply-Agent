@@ -19,7 +19,9 @@ export function extractChartPreviews(
 
     let url = link;
     try {
-      const parsed = new URL(link);
+      // 提供一个仅用于解析的基准地址，让相对下载链接与绝对链接走同一套
+      // pathname 编码和同源化逻辑（尤其是包含中文文件名时）。
+      const parsed = new URL(link, "http://frontend.invalid");
       // 下载接口与前端同源代理，转成相对地址后也能适配局域网和生产域名。
       if (parsed.pathname.startsWith("/api/download/")) {
         url = `${parsed.pathname}${parsed.search}`;

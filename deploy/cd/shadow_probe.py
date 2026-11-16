@@ -9,8 +9,8 @@
 它验什么（方案 5.5）：
   1. /health 200                       进程能起、PostgreSQL 连得上
   2. mcp:9000 可连                      依赖链在
-  3. /api/history 带身份头 + 正确内部令牌 → 200
-  4. 同一个请求去掉内部令牌 → 401       证明共享密钥校验**是开着的**
+  3. 用发布冒烟账号向 Java ERP 登录并取得 JWT
+  4. /api/history 带 Bearer → 200，去掉 Bearer → 401
   5. 镜像内 src/skills 可读
   6. 一次真实的 LLM 调用                Key / 模型名 / LLM_BASE_URL 三者都真的可用
 
@@ -35,8 +35,9 @@ import urllib.error
 import urllib.request
 
 BASE = os.environ.get("CD_SHADOW_BASE", "http://127.0.0.1:8000")
-TOKEN = os.environ.get("INTERNAL_AUTH_TOKEN", "")
-PROBE_USER = "shadow-probe"
+ERP_BASE = os.environ.get("ERP_BASE_URL", "http://java-erp:8080").rstrip("/")
+SMOKE_USER = os.environ.get("SMOKE_ERP_USER", "")
+SMOKE_PASSWORD = os.environ.get("SMOKE_ERP_PASSWORD", "")
 RUN_LLM = os.environ.get("CD_SHADOW_LLM", "1") == "1"
 
 failures = []
@@ -51,14 +52,23 @@ def bad(name, detail=""):
     failures.append(name)
 
 
-def http_get(path, headers=None, timeout=10):
+def http_request(path, headers=None, timeout=10, *, method="GET", data=None, base=BASE):
     """返回 (status, body)。HTTP 错误也当结果返回，不抛。"""
-    req = urllib.request.Request(BASE + path, headers=headers or {})
+    req = urllib.request.Request(
+        base + path,
+        headers=headers or {},
+        method=method,
+        data=data,
+    )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, r.read(4096).decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read(1024).decode("utf-8", "replace")
+
+
+def http_get(path, headers=None, timeout=10):
+    return http_request(path, headers, timeout)
 
 
 # ---------------------------------------------------------------- 1. /health
@@ -78,30 +88,54 @@ try:
 except Exception as e:  # noqa: BLE001
     bad("mcp:9000", f"{type(e).__name__}: {e}")
 
-# ---------------------------------------------------------------- 3/4. 共享密钥
-if not TOKEN:
-    bad("内部令牌", "容器里 INTERNAL_AUTH_TOKEN 为空 —— 前置检查本该拦住这个")
+# ---------------------------------------------------------------- 3/4. 统一 JWT 身份
+if not SMOKE_USER or not SMOKE_PASSWORD:
+    bad("ERP 冒烟账号", "未提供 SMOKE_ERP_USER / SMOKE_ERP_PASSWORD")
 else:
-    hdr = {"X-Authenticated-User": PROBE_USER, "X-Internal-Auth": TOKEN}
     try:
-        code, body = http_get("/api/history", hdr, timeout=15)
-        if code == 200:
-            ok("/api/history 带正确令牌 200", body[:80])
+        payload = json.dumps({"username": SMOKE_USER, "password": SMOKE_PASSWORD}).encode()
+        code, body = http_request(
+            "/api/auth/login",
+            {"Content-Type": "application/json"},
+            timeout=15,
+            method="POST",
+            data=payload,
+            base=ERP_BASE,
+        )
+        parsed = json.loads(body) if body else {}
+        token = str(((parsed.get("data") or {}).get("accessToken") or ""))
+        if code == 200 and token:
+            ok("Java ERP 登录签发 JWT")
         else:
-            bad("/api/history（正确令牌）", f"期望 200，实际 {code}：{body[:160]}")
+            bad("Java ERP 登录", f"期望 200 + accessToken，实际 {code}：{body[:160]}")
+            token = ""
     except Exception as e:  # noqa: BLE001
-        bad("/api/history（正确令牌）", f"{type(e).__name__}: {e}")
+        bad("Java ERP 登录", f"{type(e).__name__}: {e}")
+        token = ""
 
-    # 负向：这一条才是真正钉住"共享密钥校验生效"的断言。如果去掉令牌仍然 200，
-    # 说明 backend 根本没在校验 —— 那正是线上曾经出现过的失效形态。
+    if token:
+        try:
+            code, body = http_get(
+                "/api/history",
+                {"Authorization": f"Bearer {token}"},
+                timeout=15,
+            )
+            if code == 200:
+                ok("/api/history 带 JWT 200", body[:80])
+            else:
+                bad("/api/history（JWT）", f"期望 200，实际 {code}：{body[:160]}")
+        except Exception as e:  # noqa: BLE001
+            bad("/api/history（JWT）", f"{type(e).__name__}: {e}")
+
+    # 负向：去掉 JWT 后必须拒绝，证明影子 backend 没有回退到信任身份头。
     try:
-        code, _ = http_get("/api/history", {"X-Authenticated-User": PROBE_USER}, timeout=15)
+        code, _ = http_get("/api/history", timeout=15)
         if code == 401:
-            ok("去掉内部令牌 → 401（校验确实生效）")
+            ok("去掉 JWT → 401（统一认证生效）")
         else:
-            bad("/api/history（缺令牌）", f"期望 401，实际 {code} —— 共享密钥校验没生效")
+            bad("/api/history（无 JWT）", f"期望 401，实际 {code}")
     except Exception as e:  # noqa: BLE001
-        bad("/api/history（缺令牌）", f"{type(e).__name__}: {e}")
+        bad("/api/history（无 JWT）", f"{type(e).__name__}: {e}")
 
 # ---------------------------------------------------------------- 5. src/skills
 try:

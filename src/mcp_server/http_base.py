@@ -6,6 +6,7 @@ import json
 from typing import Optional
 
 import httpx
+from fastmcp.server.dependencies import get_access_token
 
 from .server_config import ERP_BASE_URL, HTTP_MAX_CONNECTIONS, HTTP_TIMEOUT
 
@@ -46,7 +47,7 @@ class ERPHttpClient:
         # 过滤掉 None 值的参数
         if params:
             params = {k: v for k, v in params.items() if v is not None}
-        response = await self.client.get(path, params=params, headers=headers)
+        response = await self.client.get(path, params=params, headers=self._forward_headers(headers))
         return self._handle_response(response)
 
     async def post(
@@ -60,7 +61,7 @@ class ERPHttpClient:
         if params:
             params = {k: v for k, v in params.items() if v is not None}
         response = await self.client.post(
-            path, json=json_data, params=params, headers=headers
+            path, json=json_data, params=params, headers=self._forward_headers(headers)
         )
         return self._handle_response(response)
 
@@ -75,7 +76,7 @@ class ERPHttpClient:
         if params:
             params = {k: v for k, v in params.items() if v is not None}
         response = await self.client.put(
-            path, json=json_data, params=params, headers=headers
+            path, json=json_data, params=params, headers=self._forward_headers(headers)
         )
         return self._handle_response(response)
 
@@ -85,12 +86,12 @@ class ERPHttpClient:
         """PATCH 请求"""
         if params:
             params = {k: v for k, v in params.items() if v is not None}
-        response = await self.client.patch(path, params=params, headers=headers)
+        response = await self.client.patch(path, params=params, headers=self._forward_headers(headers))
         return self._handle_response(response)
 
     async def delete(self, path: str, headers: Optional[dict] = None) -> dict:
         """DELETE 请求"""
-        response = await self.client.delete(path, headers=headers)
+        response = await self.client.delete(path, headers=self._forward_headers(headers))
         return self._handle_response(response)
 
     def _handle_response(self, response: httpx.Response) -> dict:
@@ -111,6 +112,15 @@ class ERPHttpClient:
                 "message": f"Response not JSON: {response.text[:500]}",
                 "data": None,
             }
+
+    @staticmethod
+    def _forward_headers(headers: Optional[dict] = None) -> dict:
+        forwarded = dict(headers or {})
+        token = get_access_token()
+        if token is not None:
+            forwarded["Authorization"] = f"Bearer {token.token}"
+            forwarded["X-Operation-Source"] = "ASSISTANT"
+        return forwarded
 
     async def close(self):
         """关闭客户端"""

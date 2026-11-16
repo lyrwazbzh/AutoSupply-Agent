@@ -27,8 +27,10 @@ from typing import Dict, Optional
 from urllib.parse import urlparse
 
 from ...database import get_pg_pool, setup_database
+from ...runtime_state import LeaseHandle, RuntimeStateRepository, new_instance_id
 from ..config import (
     SANDBOX_IDLE_TIMEOUT_MINUTES,
+    SANDBOX_MAINTENANCE_INTERVAL_SECONDS,
     SANDBOX_MCP_HOST_IP,
     SANDBOX_MCP_URL,
     SANDBOX_WARM_POOL_SIZE,
@@ -184,6 +186,8 @@ class SandboxManager:
         self._entries: Dict[str, SandboxEntry] = {}   # container_name → entry
         self._user_map: Dict[str, str] = {}           # user_id → container_name
         self._warm_creating = 0                        # 避免并发补池超量创建
+        self._instance_id = new_instance_id("sandbox")
+        self._runtime_state_repository: RuntimeStateRepository | None = None
 
         # --- 配置 ---
         self._warm_pool_size = (
@@ -208,6 +212,7 @@ class SandboxManager:
 
     def ensure_warm_pool(self):
         """确保预热池中有足够的空闲容器"""
+        self._renew_warm_pool_assignments()
         with self._lock:
             warm_count = sum(
                 1 for e in self._entries.values()
@@ -223,8 +228,10 @@ class SandboxManager:
 
         # 在锁外创建容器（避免长时间持有锁）
         for i in range(needed):
+            entry = None
             try:
                 entry = self._create_warm_container()
+                self._register_warm_container(entry.container_name)
                 with self._lock:
                     self._entries[entry.container_name] = entry
                 sandbox_logger.info(
@@ -232,6 +239,11 @@ class SandboxManager:
                 )
             except Exception as e:
                 sandbox_logger.error(f"Failed to create warm pool container: {e}")
+                if entry is not None:
+                    try:
+                        entry.sandbox.destroy_container()
+                    except Exception:
+                        pass
             finally:
                 with self._lock:
                     self._warm_creating = max(0, self._warm_creating - 1)
@@ -251,6 +263,45 @@ class SandboxManager:
         )
 
         return SandboxEntry(sandbox=sandbox, state=SandboxState.WARM)
+
+    def _register_warm_container(self, container_name: str) -> None:
+        """Externalize warm-pool ownership so another replica cannot prune it."""
+        ttl = max(180, int(SANDBOX_MAINTENANCE_INTERVAL_SECONDS) * 3)
+        setup_database()
+        with get_pg_pool().connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO app.sandbox_warm_pool(
+                    container_name, owner_id, lease_expires_at
+                ) VALUES (%s, %s, now() + (%s * interval '1 second'))
+                ON CONFLICT (container_name) DO UPDATE SET
+                    owner_id = EXCLUDED.owner_id,
+                    lease_expires_at = EXCLUDED.lease_expires_at,
+                    updated_at = now()
+                """,
+                (container_name, self._instance_id, ttl),
+            )
+
+    def _renew_warm_pool_assignments(self) -> None:
+        with self._lock:
+            names = [
+                entry.container_name
+                for entry in self._entries.values()
+                if entry.state == SandboxState.WARM
+            ]
+        for name in names:
+            self._register_warm_container(name)
+
+    def _remove_warm_registration(self, container_name: str) -> None:
+        setup_database()
+        with get_pg_pool().connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM app.sandbox_warm_pool
+                WHERE container_name = %s AND owner_id = %s
+                """,
+                (container_name, self._instance_id),
+            )
 
     # ============================================================
     # 认领机制（用户请求沙箱）
@@ -298,6 +349,7 @@ class SandboxManager:
 
     def _claim_from_warm_pool(self, user_id: str) -> Optional[CustomOpenSandbox]:
         """从预热池中认领一个空闲容器"""
+        selected: SandboxEntry | None = None
         with self._lock:
             for entry in self._entries.values():
                 if entry.state == SandboxState.WARM and entry.is_healthy():
@@ -307,22 +359,36 @@ class SandboxManager:
                     entry.claimed_at = datetime.now()
                     entry.touch()
                     self._user_map[user_id] = entry.container_name
+                    selected = entry
+                    break
 
-                    sandbox_logger.info(
-                        f"Claimed warm sandbox {entry.container_name} for {user_id}"
-                    )
+        if selected is None:
+            return None
+        try:
+            authoritative = self._persist_to_postgres(selected)
+        except Exception:
+            with self._lock:
+                self._user_map.pop(user_id, None)
+                selected.user_id = ""
+                selected.state = SandboxState.WARM
+                selected.claimed_at = None
+            raise
+        if authoritative["container_name"] != selected.container_name:
+            # Another replica won the database assignment. Keep this warm
+            # container available locally and attach the authoritative one.
+            with self._lock:
+                self._user_map.pop(user_id, None)
+                selected.user_id = ""
+                selected.state = SandboxState.WARM
+                selected.claimed_at = None
+            return self._restore_from_postgres(user_id)
 
-                    self._persist_to_postgres(entry)
-
-                    # 补充预热池
-                    threading.Thread(
-                        target=self.ensure_warm_pool,
-                        daemon=True,
-                    ).start()
-
-                    return entry.sandbox
-
-        return None
+        self._remove_warm_registration(selected.container_name)
+        sandbox_logger.info(
+            f"Claimed warm sandbox {selected.container_name} for {user_id}"
+        )
+        threading.Thread(target=self.ensure_warm_pool, daemon=True).start()
+        return selected.sandbox
 
     def _create_for_user(self, user_id: str) -> CustomOpenSandbox:
         """为用户创建新容器"""
@@ -371,7 +437,36 @@ class SandboxManager:
                 pass
             return raced_entry.sandbox
 
-        self._persist_to_postgres(entry)
+        try:
+            authoritative = self._persist_to_postgres(entry)
+        except Exception:
+            with self._lock:
+                self._entries.pop(entry.container_name, None)
+                self._user_map.pop(user_id, None)
+            try:
+                sandbox.destroy_container()
+            except Exception:
+                pass
+            raise
+        if authoritative["container_name"] != entry.container_name:
+            restored = self._restore_from_postgres(user_id)
+            if restored is not None:
+                with self._lock:
+                    self._entries.pop(entry.container_name, None)
+                try:
+                    sandbox.destroy_container()
+                except Exception:
+                    pass
+                return restored
+            # The authoritative mapping pointed at an unavailable container and
+            # was conditionally removed by _restore_from_postgres. Reserve the
+            # container we already created instead of leaking it and failing.
+            with self._lock:
+                self._entries[entry.container_name] = entry
+                self._user_map[user_id] = entry.container_name
+            retried = self._persist_to_postgres(entry)
+            if retried["container_name"] != entry.container_name:
+                raise RuntimeError("sandbox assignment changed during recovery")
         sandbox_logger.info(f"New sandbox created for {user_id}: {name}")
         return sandbox
 
@@ -379,27 +474,40 @@ class SandboxManager:
     # PostgreSQL 缓存（持久化 user→container 映射）
     # ============================================================
 
-    def _persist_to_postgres(self, entry: SandboxEntry):
-        """将沙箱映射持久化到 PostgreSQL。"""
-        try:
-            entry.state = SandboxState.CACHED
-            setup_database()
-            with get_pg_pool().connection() as conn, conn.cursor() as cur:
+    def _persist_to_postgres(self, entry: SandboxEntry) -> dict:
+        """Atomically reserve user→container; an existing mapping always wins."""
+        entry.state = SandboxState.CACHED
+        setup_database()
+        with get_pg_pool().connection() as conn:
+            with conn.transaction(), conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"sandbox-assignment:{entry.user_id}",),
+                )
+                cur.execute(
+                    "SELECT * FROM app.sandbox_cache WHERE user_id = %s FOR UPDATE",
+                    (entry.user_id,),
+                )
+                existing = cur.fetchone()
+                if existing and existing["container_name"] != entry.container_name:
+                    return dict(existing)
                 cur.execute(
                     """
                     INSERT INTO app.sandbox_cache(
                         user_id, container_name, container_id, state, created_at,
-                        claimed_at, last_active_at, active_runs, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
+                        claimed_at, last_active_at, active_runs,
+                        assignment_owner_id, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
                     ON CONFLICT (user_id) DO UPDATE SET
-                        container_name = EXCLUDED.container_name,
                         container_id = EXCLUDED.container_id,
                         state = EXCLUDED.state,
-                        created_at = EXCLUDED.created_at,
                         claimed_at = EXCLUDED.claimed_at,
                         last_active_at = EXCLUDED.last_active_at,
                         active_runs = EXCLUDED.active_runs,
+                        assignment_owner_id = EXCLUDED.assignment_owner_id,
+                        assignment_version = app.sandbox_cache.assignment_version + 1,
                         updated_at = now()
+                    RETURNING *
                     """,
                     (
                         entry.user_id,
@@ -410,22 +518,35 @@ class SandboxManager:
                         entry.claimed_at,
                         entry.last_active_at,
                         entry.active_runs,
+                        self._instance_id,
                     ),
                 )
-            sandbox_logger.debug(f"Persisted sandbox cache for {entry.user_id}")
-        except Exception as e:
-            sandbox_logger.warning(f"Failed to persist sandbox cache: {e}")
+                row = dict(cur.fetchone())
+        sandbox_logger.debug(f"Persisted sandbox assignment for {entry.user_id}")
+        return row
 
     def _restore_from_postgres(self, user_id: str) -> Optional[CustomOpenSandbox]:
         """从 PostgreSQL 恢复沙箱映射。"""
         try:
             setup_database()
-            with get_pg_pool().connection() as conn, conn.cursor() as cur:
-                cur.execute(
-                    "SELECT * FROM app.sandbox_cache WHERE user_id = %s",
-                    (user_id,),
-                )
-                doc = cur.fetchone()
+            with get_pg_pool().connection() as conn:
+                with conn.transaction(), conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT * FROM app.sandbox_cache WHERE user_id = %s FOR UPDATE",
+                        (user_id,),
+                    )
+                    doc = cur.fetchone()
+                    if doc:
+                        cur.execute(
+                            """
+                            UPDATE app.sandbox_cache
+                            SET assignment_owner_id = %s,
+                                assignment_version = assignment_version + 1,
+                                last_active_at = now(), updated_at = now()
+                            WHERE user_id = %s
+                            """,
+                            (self._instance_id, user_id),
+                        )
 
             if not doc:
                 return None
@@ -444,7 +565,7 @@ class SandboxManager:
                 sandbox_logger.info(
                     f"Cached container unavailable ({e}), cleaning cache"
                 )
-                self._cleanup_postgres_cache(user_id)
+                self._cleanup_postgres_cache(user_id, container_name)
                 return None
 
             entry = SandboxEntry(
@@ -464,18 +585,23 @@ class SandboxManager:
             return sandbox
 
         except Exception as e:
-            sandbox_logger.warning(f"Failed to restore from PostgreSQL cache: {e}")
+            sandbox_logger.error(f"Failed to restore sandbox assignment: {e}")
+            raise
 
         return None
 
-    def _cleanup_postgres_cache(self, user_id: str):
-        """清理 PostgreSQL 中的无效缓存。"""
+    def _cleanup_postgres_cache(self, user_id: str, container_name: str | None = None):
+        """Delete only the mapping this process actually observed."""
         try:
             setup_database()
             with get_pg_pool().connection() as conn, conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM app.sandbox_cache WHERE user_id = %s", (user_id,)
-                )
+                if container_name:
+                    cur.execute(
+                        "DELETE FROM app.sandbox_cache WHERE user_id = %s AND container_name = %s",
+                        (user_id, container_name),
+                    )
+                else:
+                    cur.execute("DELETE FROM app.sandbox_cache WHERE user_id = %s", (user_id,))
         except Exception as e:
             sandbox_logger.warning(f"Failed to cleanup PostgreSQL cache: {e}")
 
@@ -486,12 +612,17 @@ class SandboxManager:
     def rebuild(self, user_id: str = "default_user") -> CustomOpenSandbox:
         """重建用户沙箱（故障恢复）"""
         active_runs = 0
+        old_container_name = None
         with self._lock:
             container_name = self._user_map.get(user_id)
             if container_name and container_name in self._entries:
                 entry = self._entries[container_name]
                 active_runs = entry.active_runs
+                old_container_name = entry.container_name
                 self._remove_entry(entry)
+
+        if old_container_name:
+            self._cleanup_postgres_cache(user_id, old_container_name)
 
         sandbox = self._create_for_user(user_id)
         if active_runs:
@@ -508,7 +639,7 @@ class SandboxManager:
             if container_name and container_name in self._entries:
                 entry = self._entries[container_name]
                 self._remove_entry(entry)
-                self._cleanup_postgres_cache(user_id)
+                self._cleanup_postgres_cache(user_id, container_name)
                 sandbox_logger.info(f"Sandbox destroyed for user: {user_id}")
 
     def destroy_all(self):
@@ -538,7 +669,14 @@ class SandboxManager:
         try:
             setup_database()
             with get_pg_pool().connection() as conn, conn.cursor() as cur:
-                cur.execute("SELECT container_name FROM app.sandbox_cache")
+                cur.execute(
+                    """
+                    SELECT container_name FROM app.sandbox_cache
+                    UNION
+                    SELECT container_name FROM app.sandbox_warm_pool
+                    WHERE lease_expires_at > now()
+                    """
+                )
                 names = {row["container_name"] for row in cur.fetchall()}
         except Exception as e:
             sandbox_logger.warning(f"Failed to read sandbox_cache: {e}")
@@ -588,10 +726,10 @@ class SandboxManager:
                 continue
             if container.name in self._entries:
                 continue
-            if not container.name.startswith(WARM_CONTAINER_PREFIX):
-                # 用户容器：只有确认它不在持久化映射里才删。读不到映射时保留。
-                if persisted is None or container.name in persisted:
-                    continue
+            # Both user assignments and warm-pool ownership are externalized.
+            # If PostgreSQL is unavailable, fail closed and preserve everything.
+            if persisted is None or container.name in persisted:
+                continue
             try:
                 container.stop(timeout=3)
                 # v=True：孤儿容器的依赖目录 volume 跟着一起清（见 sandbox_setup）
@@ -614,6 +752,10 @@ class SandboxManager:
                 if entry.state in (SandboxState.CLAIMED, SandboxState.CACHED):
                     if entry.active_runs > 0:
                         continue
+                    if entry.user_id and self._runtime_state().has_active_lease(
+                        "sandbox_run", entry.user_id
+                    ):
+                        continue
                     idle_time = now - entry.last_active_at
                     if idle_time > self._idle_timeout:
                         sandbox_logger.info(
@@ -624,7 +766,7 @@ class SandboxManager:
                         self._remove_entry(entry)
                         if user_id:
                             self._user_map.pop(user_id, None)
-                            self._cleanup_postgres_cache(user_id)
+                            self._cleanup_postgres_cache(user_id, entry.container_name)
 
     # ============================================================
     # 健康检查
@@ -648,25 +790,60 @@ class SandboxManager:
             if entry is not None:
                 entry.touch()
 
-    def acquire_lease(self, user_id: str) -> bool:
-        """标记正在运行的 Agent 流，防止超时回收误删工作中的容器。"""
+    def _runtime_state(self) -> RuntimeStateRepository:
+        if self._runtime_state_repository is None:
+            self._runtime_state_repository = RuntimeStateRepository()
+        return self._runtime_state_repository
+
+    def acquire_lease(
+        self,
+        user_id: str,
+        *,
+        owner_id: str,
+        ttl_seconds: int,
+    ) -> LeaseHandle | None:
+        """Persist the sandbox run lease and mirror it in the local cache."""
         with self._lock:
             container_name = self._user_map.get(user_id)
             entry = self._entries.get(container_name) if container_name else None
             if entry is None:
-                return False
+                return None
+        handle = self._runtime_state().acquire_sandbox_run(
+            user_id,
+            owner_id=owner_id,
+            ttl_seconds=ttl_seconds,
+        )
+        if handle is None:
+            return None
+        with self._lock:
             entry.active_runs += 1
             entry.touch()
-            return True
+        try:
+            self._persist_to_postgres(entry)
+        except Exception:
+            with self._lock:
+                entry.active_runs = max(0, entry.active_runs - 1)
+            self._runtime_state().release(handle)
+            raise
+        return handle
 
-    def release_lease(self, user_id: str) -> None:
-        """释放运行租约；异常清理路径也不会让计数变为负数。"""
+    def renew_lease(self, handle: LeaseHandle, *, ttl_seconds: int) -> LeaseHandle | None:
+        return self._runtime_state().renew(handle, ttl_seconds=ttl_seconds)
+
+    def release_lease(self, handle: LeaseHandle) -> None:
+        """Release by opaque token so a stale replica cannot release a new lease."""
+        user_id = handle.resource_key
         with self._lock:
             container_name = self._user_map.get(user_id)
             entry = self._entries.get(container_name) if container_name else None
             if entry is not None:
                 entry.active_runs = max(0, entry.active_runs - 1)
                 entry.touch()
+        try:
+            if entry is not None:
+                self._persist_to_postgres(entry)
+        finally:
+            self._runtime_state().release(handle)
 
     def health_check_all(self):
         """检查所有沙箱健康状态"""
@@ -678,6 +855,12 @@ class SandboxManager:
 
         # 在锁外重建故障容器
         for entry in unhealthy:
+            if entry.user_id and self._runtime_state().has_active_lease(
+                "sandbox_run", entry.user_id
+            ):
+                # The owning request performs its own hot-swap recovery. A
+                # maintenance loop in another replica must not destroy it.
+                continue
             sandbox_logger.warning(
                 f"Unhealthy sandbox detected: {entry.container_name} "
                 f"(user={entry.user_id})"

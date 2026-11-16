@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PostgreSQL custom-format backup with structural verification and retention.
+# PostgreSQL custom-format and MySQL logical backup with verification and retention.
 set -euo pipefail
 
 DR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,7 +22,7 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
-dr_prune_pg_backups() {
+dr_prune_backups() {
     local keep="${CD_BACKUP_KEEP:-7}" item count=0
     [ -d "$CD_BACKUP_DIR" ] || return 0
     while IFS= read -r item; do
@@ -35,8 +35,9 @@ dr_prune_pg_backups() {
         -name '20*T*Z-*' -print | sort -r)
 }
 
-dr_verify_pg_backup() {
-    local dir="$1" dump="$dir/database.dump" expected actual
+dr_verify_backup() {
+    local dir="$1" dump="$dir/database.dump" mysql_dump="$dir/mysql.sql"
+    local expected actual mysql_expected mysql_actual
     [ -f "$dir/manifest.txt" ] || { warn "缺少 manifest.txt: $dir"; return 1; }
     expected="$(sed -n 's/^DATABASE_SHA256=//p' "$dir/manifest.txt")"
     actual="$(sha256sum "$dump" | awk '{print $1}')"
@@ -45,6 +46,13 @@ dr_verify_pg_backup() {
         return 1
     }
     dr_verify_dump "$dump"
+    mysql_expected="$(sed -n 's/^MYSQL_SHA256=//p' "$dir/manifest.txt")"
+    mysql_actual="$(sha256sum "$mysql_dump" | awk '{print $1}')"
+    [ -n "$mysql_expected" ] && [ "$mysql_expected" = "$mysql_actual" ] || {
+        warn "mysql.sql 校验和不一致"
+        return 1
+    }
+    dr_verify_mysql_dump "$mysql_dump"
 }
 
 case "$MODE" in
@@ -53,18 +61,20 @@ case "$MODE" in
         exit 0
         ;;
     prune)
-        dr_prune_pg_backups
+        dr_prune_backups
         exit 0
         ;;
     verify)
         [ -n "$VERIFY_DIR" ] || { warn "--verify 需要备份目录"; exit 1; }
         dr_assert_postgres_up
-        dr_verify_pg_backup "$VERIFY_DIR"
+        dr_assert_mysql_up
+        dr_verify_backup "$VERIFY_DIR"
         exit 0
         ;;
 esac
 
 dr_assert_postgres_up
+dr_assert_mysql_up
 mkdir -p "$CD_BACKUP_DIR"
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -84,17 +94,23 @@ dr_pg_dump > "$work_dir/database.dump"
 dr_verify_dump "$work_dir/database.dump"
 checksum="$(sha256sum "$work_dir/database.dump" | awk '{print $1}')"
 
+info "导出 MySQL: $work_dir/mysql.sql"
+dr_mysql_dump > "$work_dir/mysql.sql"
+dr_verify_mysql_dump "$work_dir/mysql.sql"
+mysql_checksum="$(sha256sum "$work_dir/mysql.sql" | awk '{print $1}')"
+
 {
-    printf 'FORMAT=postgres-custom\n'
+    printf 'FORMAT=postgres-custom+mysql-sql\n'
     printf 'CREATED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'VERSION=%s\n' "$version"
     printf 'GIT_SHA=%s\n' "${CD_BACKUP_GIT_SHA:-}"
     printf 'DATABASE_SHA256=%s\n' "$checksum"
+    printf 'MYSQL_SHA256=%s\n' "$mysql_checksum"
 } > "$work_dir/manifest.txt"
 
 mv "$work_dir" "$final_dir"
 work_dir=""
-dr_verify_pg_backup "$final_dir"
+dr_verify_backup "$final_dir"
 
 if [ "$NO_OFFSITE" = 0 ] && [ -x "$DR_DIR/offsite.sh" ]; then
     bash "$DR_DIR/offsite.sh" "$final_dir"
@@ -102,14 +118,16 @@ else
     dr_offsite_mark "$final_dir" skipped "--no-offsite"
 fi
 
-dr_prune_pg_backups
+dr_prune_backups
 
 if [ -n "${BACKUP_RESULT_FILE:-}" ]; then
     {
         printf 'DB_DUMP=%s\n' "$final_dir/database.dump"
         printf 'DB_DUMP_SHA256=%s\n' "$checksum"
+        printf 'MYSQL_DUMP=%s\n' "$final_dir/mysql.sql"
+        printf 'MYSQL_DUMP_SHA256=%s\n' "$mysql_checksum"
     } > "$BACKUP_RESULT_FILE"
 fi
 
 trap - EXIT
-info "PostgreSQL 备份完成并通过 pg_restore 清单校验: $final_dir"
+info "PostgreSQL + MySQL 备份完成并通过结构校验: $final_dir"

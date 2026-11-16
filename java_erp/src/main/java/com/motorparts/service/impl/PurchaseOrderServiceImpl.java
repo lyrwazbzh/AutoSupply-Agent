@@ -21,7 +21,7 @@ import com.motorparts.mapper.OrderIdempotencyMapper;
 import com.motorparts.mapper.PartMapper;
 import com.motorparts.mapper.PurchaseOrderMapper;
 import com.motorparts.mapper.SupplierMapper;
-import com.motorparts.mq.LocalMessageService;
+import com.motorparts.procurement.expiry.OrderExpiryTaskService;
 import com.motorparts.service.ErpOperationService;
 import com.motorparts.service.PurchaseOrderService;
 import lombok.RequiredArgsConstructor;
@@ -54,19 +54,20 @@ public class PurchaseOrderServiceImpl extends ServiceImpl<PurchaseOrderMapper, P
     private final SupplierMapper supplierMapper;
     private final OrderIdempotencyMapper orderIdempotencyMapper;
     private final ErpOperationService erpOperationService;
-    private final LocalMessageService localMessageService;
+    private final OrderExpiryTaskService orderExpiryTaskService;
 
-    @Value("${motorparts.mq.enabled:true}")
-    private boolean mqEnabled;
+    @Value("${motorparts.order-expiry.enabled:true}")
+    private boolean orderExpiryEnabled;
 
-    @Value("${motorparts.mq.pending-cancel-hours:24}")
+    @Value("${motorparts.order-expiry.pending-cancel-hours:24}")
     private long pendingCancelHours;
 
     private static final Set<Integer> TERMINAL_STATUS = Set.of(4, 5);
     private static final Map<Integer, Set<Integer>> STATUS_TRANSITIONS = Map.of(
             1, Set.of(2, 5),
             2, Set.of(3, 5),
-            3, Set.of(4, 5)
+            // 3 -> 4 is reserved for OrderReceivingService so stock and ledger cannot be bypassed.
+            3, Set.of(5)
     );
 
     @Override
@@ -114,9 +115,8 @@ public class PurchaseOrderServiceImpl extends ServiceImpl<PurchaseOrderMapper, P
             order.setOrderTime(LocalDateTime.now());
         }
 
-        if (order.getStatus() == null || order.getStatus() == 0) {
-            order.setStatus(1); // 待审核（Harness/MCP 0 与缺省归一）
-        }
+        // 新建采购单只能从“待审核”开始，调用方不能跳过审批状态机。
+        order.setStatus(1);
 
         // 计算总金额
         BigDecimal totalAmount = BigDecimal.ZERO;
@@ -194,9 +194,8 @@ public class PurchaseOrderServiceImpl extends ServiceImpl<PurchaseOrderMapper, P
             }
         }
 
-        if (order.getStatus() == null || order.getStatus() == 0) {
-            order.setStatus(1);
-        }
+        // 统一创建契约：1=待审核，不再接受历史 status=0。
+        order.setStatus(1);
         if (!StringUtils.hasText(order.getOrderNumber())) {
             order.setOrderNumber("PO" + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss")));
         }
@@ -278,8 +277,8 @@ public class PurchaseOrderServiceImpl extends ServiceImpl<PurchaseOrderMapper, P
         created.setIdempotencyKey(idem);
         created.setPayloadHash(payloadHash);
         created.setOperationStatus("CONFIRMED");
-        if (mqEnabled && created.getStatus() != null && created.getStatus() == 1) {
-            localMessageService.enqueueOrderPendingCancel(
+        if (orderExpiryEnabled && created.getStatus() != null && created.getStatus() == 1) {
+            orderExpiryTaskService.schedulePendingOrderCancellation(
                     created.getId(),
                     LocalDateTime.now().plusHours(Math.max(1, pendingCancelHours))
             );
@@ -323,6 +322,7 @@ public class PurchaseOrderServiceImpl extends ServiceImpl<PurchaseOrderMapper, P
         PurchaseOrderWithDetails view = new PurchaseOrderWithDetails();
         view.setId(order.getId());
         view.setOrderNumber(order.getOrderNumber());
+        view.setSupplierId(order.getSupplierId());
         view.setTotalAmount(order.getTotalAmount());
         view.setStatus(order.getStatus());
         view.setOrderTime(order.getOrderTime());
@@ -365,6 +365,15 @@ public class PurchaseOrderServiceImpl extends ServiceImpl<PurchaseOrderMapper, P
         if (order == null || order.getId() == null) {
             return false;
         }
+        PurchaseOrder existing = baseMapper.selectById(order.getId());
+        if (existing == null || existing.getStatus() == null) {
+            return false;
+        }
+        // 通用编辑接口不能改变状态；状态迁移必须经过 updateOrderStatus/receive。
+        if (order.getStatus() != null && !order.getStatus().equals(existing.getStatus())) {
+            return false;
+        }
+        order.setStatus(existing.getStatus());
 
         Long orderId = order.getId();
 
@@ -374,10 +383,6 @@ public class PurchaseOrderServiceImpl extends ServiceImpl<PurchaseOrderMapper, P
         // 2. 设置默认值
         if (order.getOrderTime() == null) {
             order.setOrderTime(LocalDateTime.now());
-        }
-
-        if (order.getStatus() == null || order.getStatus() == 0) {
-            order.setStatus(1); // 待审核（Harness/MCP 0 与缺省归一）
         }
 
         // 3. 计算总金额
@@ -454,9 +459,6 @@ public class PurchaseOrderServiceImpl extends ServiceImpl<PurchaseOrderMapper, P
         wrapper.set(PurchaseOrder::getStatus, status)
                .eq(PurchaseOrder::getId, id)
                .eq(PurchaseOrder::getStatus, from);
-        if (status == 4) {
-            wrapper.set(PurchaseOrder::getActualDeliveryDate, LocalDate.now());
-        }
         return update(wrapper);
     }
 

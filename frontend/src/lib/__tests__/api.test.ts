@@ -103,9 +103,7 @@ describe("streamChat", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/api/chat/stream");
     expect(init.method).toBe("POST");
-    // 请求体必须原样发出去：`username` 是后端唯一认得的展示名来源，掉了就变成
-    // 匿名会话（而 AUTH_MODE=proxy 下 user_id 由 nginx 决定，掉了不影响归属 ——
-    // 所以这个字段丢了不会报错，只会静默显示错名字，更需要钉住）。
+    // 请求体必须原样发出去：`username` 是展示名来源；JWT subject 只负责归属。
     expect(JSON.parse(init.body)).toEqual(request);
     // 分块边界不能丢字符：拼起来必须与原始流逐字相同。
     expect(chunks.join("")).toBe('event: token\ndata: {"content":"你好"}\n\n');

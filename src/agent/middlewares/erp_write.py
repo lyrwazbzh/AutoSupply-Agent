@@ -47,12 +47,14 @@ class ERPWriteMiddleware(AgentMiddleware):
         user_id: str,
         agent_name: str = "main",
         store=None,
+        permissions: frozenset[str] | None = None,
     ) -> None:
         self.tools = []
         self.repository = repository
         self.user_id = user_id
         self.agent_name = agent_name
         self.store = store
+        self.permissions = permissions
 
     @property
     def name(self) -> str:
@@ -270,6 +272,22 @@ class ERPWriteMiddleware(AgentMiddleware):
             return self._guard_rejected_message(request, operation_id, errors)
 
         spec = WRITE_TOOL_SPECS[tool_name]
+        if self.permissions is not None and (
+            "assistant:erp-write" not in self.permissions
+            or spec.required_permission not in self.permissions
+        ):
+            reason = f"当前用户缺少助手写入权限或业务权限 {spec.required_permission}"
+            self.repository.mark_blocked(operation_id, reason)
+            return ToolMessage(
+                content=json.dumps(
+                    {"code": 403, "message": "权限不足，未调用 ERP", "data": {"operation_id": operation_id}},
+                    ensure_ascii=False,
+                ),
+                tool_call_id=request.tool_call.get("id", ""),
+                name=tool_name,
+                status="error",
+                additional_kwargs={"write_operation_id": operation_id, "permission_denied": True},
+            )
         if not spec.requires_approval or operation.get("status") == "APPROVED":
             self.repository.mark_dispatching(operation_id)
         return request

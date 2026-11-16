@@ -10,7 +10,7 @@ import re
 from collections import Counter
 from typing import Any, Optional
 
-from ..memory.scoring import rrf_merge
+from ..memory.scoring import rrf_merge as rrf_merge
 from .store import KnowledgeDoc, KnowledgeStore, tokenize
 
 

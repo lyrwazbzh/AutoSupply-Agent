@@ -32,7 +32,6 @@ from src.agent.harness import (
 from src.agent.middlewares.sandbox_health import SandboxHealthMiddleware
 from src.agent.middlewares.skills_sync import SkillsSyncMiddleware
 from src.agent.middlewares.user_skills_restore import UserSkillsRestoreMiddleware
-from src.api_view.mongodb_store import MongoDBStore
 
 
 class FakeSandbox(BaseSandbox):
@@ -140,6 +139,7 @@ class SandboxProxyTests(unittest.TestCase):
 
         second = FakeSandbox("second")
         proxy.replace_backend(second)
+        self.assertTrue(proxy.probe_workspace(publish_ready=True))
 
         self.assertEqual(proxy.generation, 1)
         self.assertEqual(proxy.id, "second")
@@ -196,6 +196,7 @@ class SkillsLifecycleTests(unittest.TestCase):
 
             replacement = FakeSandbox("replacement")
             proxy.replace_backend(replacement)
+            self.assertTrue(proxy.probe_workspace(publish_ready=True))
             middleware.sync_now()
             self.assertIn("/skills/demo/SKILL.md", replacement.files)
 
@@ -228,6 +229,7 @@ class SkillsLifecycleTests(unittest.TestCase):
 
         replacement = FakeSandbox("replacement")
         proxy.replace_backend(replacement)
+        self.assertTrue(proxy.probe_workspace(publish_ready=True))
         middleware.restore_now()
         self.assertEqual(
             replacement.files["/skills/custom/demo/run.py"], b"print('hello')"
@@ -277,14 +279,6 @@ class IsolationTests(unittest.TestCase):
         finally:
             set_sandbox(None, DEFAULT_USER_ID)
             self.assertIsNone(get_sandbox(DEFAULT_USER_ID))
-
-
-class MongoNamespaceTests(unittest.TestCase):
-    def test_namespace_prefix_query_matches_array_segments(self):
-        self.assertEqual(
-            MongoDBStore._namespace_prefix_query(("persisted-skills", "alice")),
-            {"namespace.0": "persisted-skills", "namespace.1": "alice"},
-        )
 
 
 class HarnessReviewSelectionTests(unittest.TestCase):

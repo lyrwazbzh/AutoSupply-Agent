@@ -22,7 +22,6 @@ def register_order_tools(mcp: FastMCP):
                 {
                     "orderNumber": "PO20260101001",  // 必填，订单编号
                     "totalAmount": 1000.0,           // 总金额
-                    "status": 0,                     // 状态：0=待审核,1=已审核,2=已发货,3=已收货,4=已完成
                     "remark": "备注",
                     "orderDetail": [                 // 订单明细列表
                         {
@@ -89,7 +88,7 @@ def register_order_tools(mcp: FastMCP):
 
         Args:
             id: 订单ID
-            order_data: 更新的订单数据JSON字符串，格式同 order_create
+            order_data: 更新的订单数据JSON字符串，格式同 order_create；不能修改状态
 
         Returns:
             更新结果JSON
@@ -122,7 +121,7 @@ def register_order_tools(mcp: FastMCP):
             current: 当前页码，默认1
             size: 每页大小，默认10
             order_number: 订单编号（可选，模糊匹配）
-            status: 订单状态（可选）：0=待审核,1=已审核,2=已发货,3=已收货,4=已完成
+            status: 订单状态（可选）：1=待审核,2=已审核,3=采购中,4=已入库,5=已取消
             start_date: 开始日期（可选），格式 yyyy-MM-dd
             end_date: 结束日期（可选），格式 yyyy-MM-dd
 
@@ -206,7 +205,7 @@ def register_order_tools(mcp: FastMCP):
 
         Args:
             id: 订单ID
-            status: 新状态：0=待审核,1=已审核,2=已发货,3=已收货,4=已完成
+            status: 新状态：2=已审核,3=采购中,5=已取消。3→4 必须使用 order_receive
 
         Returns:
             操作结果JSON

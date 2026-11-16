@@ -15,7 +15,7 @@ import io
 import re
 import tarfile
 import zipfile
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 
 import httpx
 import yaml
@@ -23,11 +23,13 @@ from langchain_core.tools import tool
 
 from ..config import skills_store_namespace
 from ..log_utils import agent_logger
-from ..runtime_context import get_current_store, get_current_user_id
+from ..runtime_context import (
+    get_current_store,
+    get_current_user_id,
+    has_runtime_permission,
+)
 
-# Skills 目录：项目根/src/skills
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-SKILLS_DIR = PROJECT_ROOT / "src" / "skills"
+SKILL_INSTALL_PERMISSION = "assistant:skill:install"
 
 
 def _strip_html(html: str) -> str:
@@ -91,7 +93,7 @@ def web_fetch(url: str, max_chars: int = 8000) -> str:
 
 # ============================================================
 # Skill 安装（沙箱安全隔离）
-# 流程图：下载 → 沙箱验证 → 通过 → 安装到正式环境
+# 流程图：下载 → 沙箱验证 → 通过 → 安装到当前用户沙箱与 Store
 #         ↓ 失败
 #       清理沙箱临时文件 + 返回错误
 # ============================================================
@@ -289,34 +291,6 @@ def _validate_skill_in_sandbox(sandbox, skill_name: str, sandbox_skill_dir: str)
     return True, "", files
 
 
-def _install_from_sandbox_to_host(sandbox, sandbox_skill_dir: str, host_skill_dir: Path, files: list[str]) -> list[str]:
-    """
-    从沙箱读取验证通过的文件，写入宿主机 skills 目录。
-    返回已安装的文件列表。
-    """
-    # 初始化已安装文件列表
-    installed = []
-    # 遍历所有需要从沙箱复制的文件
-    for remote_path in files:
-        try:
-            # 从沙箱读取文件内容（字节）
-            content = sandbox.read_file_bytes(remote_path)
-            # 计算相对于沙箱技能目录的相对路径
-            rel = remote_path.replace(sandbox_skill_dir, "").lstrip("/")
-            # 构建宿主机上的目标文件路径
-            target = host_skill_dir / rel
-            # 创建目标文件所在的目录（如果不存在）
-            target.parent.mkdir(parents=True, exist_ok=True)
-            # 将内容写入宿主机文件
-            target.write_bytes(content)
-            # 记录已安装的文件名
-            installed.append(rel)
-        except Exception as e:
-            # 如果复制失败，记录警告日志但继续处理其他文件
-            agent_logger.warning(f"Failed to copy {remote_path} from sandbox: {e}")
-    return installed
-
-
 def _persist_installed_skill(
     sandbox,
     sandbox_skill_dir: str,
@@ -368,7 +342,7 @@ def install_skill(url: str, skill_name: str = "") -> str:
     1. 下载到内存
     2. 上传到沙箱 /tmp/ 验证
     3. 在沙箱中解压并校验 SKILL.md 完整性
-    4. 校验通过 → 从沙箱复制到宿主机 src/skills/
+    4. 校验通过 → 写入当前用户 /skills/custom/ 与用户 Store namespace
     5. 校验失败 → 清理沙箱临时文件
 
     支持四种来源：
@@ -390,6 +364,9 @@ def install_skill(url: str, skill_name: str = "") -> str:
     Returns:
         安装结果说明（含安装路径和文件列表）
     """
+    if not has_runtime_permission(SKILL_INSTALL_PERMISSION):
+        return "权限不足：安装 Skill 需要 assistant:skill:install"
+
     # 验证 URL 协议是否合法（只支持 HTTP 和 HTTPS）
     if not url.startswith(("http://", "https://")):
         return "错误: URL 必须以 http:// 或 https:// 开头"
@@ -473,19 +450,18 @@ def install_skill(url: str, skill_name: str = "") -> str:
             sandbox.execute(f"rm -rf {sandbox_tmp}")
             return f"沙箱验证失败: {err_msg}（已清理沙箱临时文件，未影响宿主机）"
 
-        # Step 5: 验证通过 → 从沙箱复制到宿主机 + 沙箱正式目录
+        # Step 5: 验证通过 → 只复制到当前用户沙箱正式目录。
+        # 宿主机 src/skills 是所有用户共享的核心技能目录，绝不能由运行时工具写入。
         sandbox_verify_dir = f"{sandbox_tmp}/skill"
-        host_skills_dir = Path(SKILLS_DIR)
-        host_skills_dir.mkdir(parents=True, exist_ok=True)
-        host_target = host_skills_dir / skill_name
-
-        installed = _install_from_sandbox_to_host(sandbox, sandbox_verify_dir, host_target, sandbox_files)
-
-        # 同步写入当前用户的正式目录；恢复器也使用同一 /skills/custom/<name>/ 协议。
-        for rel in installed:
+        installed: list[str] = []
+        for remote_path in sandbox_files:
+            rel = remote_path.replace(sandbox_verify_dir, "").lstrip("/")
+            if not rel:
+                continue
             remote_target = f"/skills/custom/{skill_name}/{rel}"
             try:
                 sandbox.write_file(remote_target, sandbox.read_file_bytes(f"{sandbox_verify_dir}/{rel}"))
+                installed.append(rel)
             except Exception as e:
                 agent_logger.warning(f"Failed to write to sandbox skills dir: {e}")
 
@@ -499,7 +475,7 @@ def install_skill(url: str, skill_name: str = "") -> str:
         )
 
         # 安装依赖（在沙箱内执行 pip install -r requirements.txt）
-        _install_dependencies(host_target)
+        _install_dependencies(sandbox, f"/skills/custom/{skill_name}", skill_name)
 
         # 清理沙箱临时文件（释放临时空间）
         sandbox.execute(f"rm -rf {sandbox_tmp}")
@@ -521,12 +497,12 @@ def install_skill(url: str, skill_name: str = "") -> str:
         return (
             f"✅ Skill 安装成功！（沙箱安全验证通过）\n"
             f"名称: {skill_name}\n"
-            f"路径: {host_target}\n"
+            f"路径: /skills/custom/{skill_name}/\n"
             f"文件数: {len(installed)}\n"
             f"{persisted_hint}"
             f"文件列表:\n{file_listing}{truncated_hint}\n"
             f"来源: {url}\n\n"
-            "该 Skill 已通过沙箱安全验证，现已安装到正式环境。"
+            "该 Skill 已通过沙箱安全验证，仅对当前用户生效。"
         )
 
     except httpx.TimeoutException:
@@ -607,45 +583,25 @@ def _is_archive(url: str, content_type: str) -> bool:
     return False
 
 
-def _install_dependencies(skill_dir: Path):
-    """安装 Skill 的 Python 依赖（优先在沙箱内安装，不回退到宿主机）"""
-    # 检查 requirements.txt 是否存在
-    req_file = skill_dir / "requirements.txt"
-    if not req_file.exists():
-        return
-
-    # 尝试在沙箱内安装依赖
+def _install_dependencies(sandbox, sandbox_skill_dir: str, skill_name: str) -> None:
+    """仅在当前用户沙箱安装 Skill 依赖，永不读取或修改宿主机目录。"""
+    req_file = f"{sandbox_skill_dir}/requirements.txt"
     try:
-        from ..backends.sandbox_holder import get_sandbox
-        sandbox = get_sandbox()
-        if sandbox is not None:
-            # 读取 requirements.txt 内容
-            req_content = req_file.read_text(encoding="utf-8")
-            # 将内容写入沙箱临时文件
-            sandbox_req = f"/workspace/requirements_{skill_dir.name}.txt"
-            sandbox.write_file(sandbox_req, req_content)
-            # 安全容器的根目录为只读，依赖统一落到可写工作区。
-            result = sandbox.execute(
-                "mkdir -p /workspace/python-packages && "
-                "python3 -m pip install --no-cache-dir "
-                "--target /workspace/python-packages "
-                f"-r '{sandbox_req}' -q",
-                # 用户 Skill 的依赖可能包含编译型包，120s 常常不够
-                timeout=300,
-            )
-            # 清理沙箱临时文件
-            sandbox.execute(f"rm -f {sandbox_req}")
-            if result.exit_code == 0:
-                agent_logger.info(f"Skill dependencies installed in sandbox from {req_file}")
-            else:
-                agent_logger.warning(f"Sandbox dependency install failed: {result.output[:200]}")
+        exists = sandbox.execute(f"test -f '{req_file}'")
+        if exists.exit_code != 0:
             return
+        result = sandbox.execute(
+            "mkdir -p /workspace/python-packages && "
+            "python3 -m pip install --no-cache-dir "
+            "--target /workspace/python-packages "
+            f"-r '{req_file}' -q",
+            timeout=300,
+        )
+        if result.exit_code == 0:
+            agent_logger.info(
+                f"Skill dependencies installed in user sandbox: {skill_name}"
+            )
+        else:
+            agent_logger.warning(f"Sandbox dependency install failed: {result.output[:200]}")
     except Exception as e:
         agent_logger.warning(f"Sandbox dependency install error: {e}")
-
-    # 如果沙箱不可用，仅记录警告，不在宿主机安装依赖
-    # 这样做是为了保持宿主机环境清洁，依赖会在沙箱准备好时安装
-    agent_logger.warning(
-        f"Sandbox unavailable, skipping dependency installation for {req_file}. "
-        "Dependencies will be installed when sandbox is ready."
-    )

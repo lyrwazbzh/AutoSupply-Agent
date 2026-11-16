@@ -8,10 +8,7 @@
 
 # Maven
 target/
-.mvn/
-mvnw
-mvnw.cmd
-.mvn/wrapper/
+.mvn/wrapper/dists/
 
 # IDE
 .idea/

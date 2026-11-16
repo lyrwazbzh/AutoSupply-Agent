@@ -209,12 +209,12 @@ def seed() -> None:
         })
     store._seq["inventory"] = len(store.parts)
 
-    # 订单：过去 180 天，31 张单，状态覆盖 0-4
+    # 订单：过去 180 天，31 张单，状态覆盖 1-5
     for n in range(1, 32):
         days_ago = 180 - n * 5 + rng.randint(-2, 2)
         days_ago = max(0, days_ago)
         order_time = NOW - timedelta(days=days_ago, hours=rng.randint(0, 10))
-        status = rng.choices([0, 1, 2, 3, 4], weights=[1, 2, 3, 3, 4])[0]
+        status = rng.choices([1, 2, 3, 4, 5], weights=[1, 2, 3, 4, 1])[0]
         order = {
             "id": n,
             "orderNumber": f"PO{order_time.strftime('%Y%m%d')}{n:03d}",
@@ -543,7 +543,13 @@ def _business_payload_hash(payload: dict) -> str:
     """幂等键绑定业务内容；同 key 改内容必须冲突而不是复用旧单。"""
 
     canonical = dict(payload)
-    canonical.pop("payloadHash", None)
+    for key in (
+        "operationId", "operation_id", "idempotencyKey", "idempotency_key",
+        "payloadHash", "payload_hash", "idempotentReplay", "operationStatus",
+        "dispatchPayloadHash",
+    ):
+        canonical.pop(key, None)
+    canonical["status"] = 1
     raw = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -605,7 +611,8 @@ async def orders_create(payload: dict = Body(...)):
             "id": order_id,
             "orderNumber": payload.get("orderNumber") or f"PO{NOW.strftime('%Y%m%d')}{order_id:03d}",
             "totalAmount": float(payload.get("totalAmount") or computed),
-            "status": int(payload.get("status", 0)),
+            # 与 Java ERP 一致：新采购单只能从待审核开始。
+            "status": 1,
             "orderTime": order_time,
             "remark": payload.get("remark", ""),
             "evidence_id": payload.get("evidence_id"),
@@ -688,9 +695,12 @@ async def orders_update(oid: int, payload: dict = Body(...)):
         computed = round(sum(int(d["quantity"]) * float(d["unitPrice"]) for d in details), 2)
         order["totalAmount"] = float(payload.get("totalAmount") or computed)
 
-    for field in ("orderNumber", "status", "remark"):
+    if payload.get("status") is not None and int(payload["status"]) != int(order["status"]):
+        return fail("通用订单编辑不能修改状态，请使用状态迁移或收货接口")
+
+    for field in ("orderNumber", "remark"):
         if payload.get(field) is not None:
-            order[field] = int(payload[field]) if field == "status" else payload[field]
+            order[field] = payload[field]
     if payload.get("totalAmount") is not None and not details:
         order["totalAmount"] = float(payload["totalAmount"])
 
@@ -772,7 +782,7 @@ async def orders_statistics(startDate: Optional[str] = None, endDate: Optional[s
     if startDate or endDate:
         rows = [o for o in rows if in_range(o["orderTime"], startDate, endDate)]
 
-    status_names = {0: "待审核", 1: "已审核", 2: "已发货", 3: "已收货", 4: "已完成"}
+    status_names = {1: "待审核", 2: "已审核", 3: "采购中", 4: "已入库", 5: "已取消"}
     by_status = [
         {
             "status": st,
@@ -812,8 +822,12 @@ async def orders_update_status(
     order = next((o for o in store.orders if o["id"] == oid), None)
     if not order:
         return fail(f"订单不存在: {oid}", 404)
-    if status not in (0, 1, 2, 3, 4):
-        return fail("status 取值必须为 0-4")
+    allowed_transitions = {1: {2, 5}, 2: {3, 5}, 3: {5}}
+    current = int(order["status"])
+    if status == current:
+        return complete_operation(operationId, ok(order, "状态未变化"))
+    if status not in allowed_transitions.get(current, set()):
+        return fail(f"不允许从状态 {current} 变更为 {status}")
     order["status"] = status
     return complete_operation(operationId, ok(order, "状态更新成功"))
 

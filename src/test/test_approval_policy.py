@@ -6,7 +6,12 @@ from src.agent.subagents.loader import load_subagent_configs, resolve_subagent_t
 def test_central_policy_covers_all_approval_writes_without_edit():
     policy = approval_policy_registry.main_interrupt_on()
 
-    assert set(policy) == {"order_create", "order_update", "order_update_status"}
+    assert set(policy) == {
+        "order_create", "order_update", "order_update_status", "order_receive",
+        "replenishment_create", "replenishment_inspect", "replenishment_create_order",
+        "replenishment_complete", "replenishment_cancel",
+        "purchase_return_create", "purchase_return_confirm",
+    }
     assert all(config["allowed_decisions"] == ["approve", "reject"] for config in policy.values())
     assert all(WRITE_TOOL_SPECS[name].requires_approval for name in policy)
 

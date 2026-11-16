@@ -5,7 +5,12 @@
 from fastapi import APIRouter, Depends, Query
 
 from ..agent_loader import agent_loader
-from ..auth import assert_thread_owner, current_user_id, resolve_user_id
+from ..auth import (
+    assert_permission,
+    assert_thread_owner,
+    current_user_id,
+    resolve_user_id,
+)
 
 router = APIRouter(prefix="/api/history", tags=["history"])
 
@@ -16,6 +21,7 @@ async def list_conversations(
     authenticated: str | None = Depends(current_user_id),
 ):
     """获取会话列表"""
+    assert_permission("assistant:use")
     conversations = await agent_loader.get_conversations(
         resolve_user_id(authenticated, user_id)
     )
@@ -28,6 +34,7 @@ async def get_messages(
     authenticated: str | None = Depends(current_user_id),
 ):
     """获取指定会话的消息列表"""
+    assert_permission("assistant:use")
     owner = await agent_loader.get_conversation_user_id(thread_id)
     assert_thread_owner(thread_id, owner, authenticated)
     messages = await agent_loader.get_display_messages(thread_id)
@@ -40,6 +47,7 @@ async def delete_conversation(
     authenticated: str | None = Depends(current_user_id),
 ):
     """删除会话"""
+    assert_permission("assistant:use")
     owner = await agent_loader.get_conversation_user_id(thread_id)
     assert_thread_owner(thread_id, owner, authenticated)
     await agent_loader.delete_conversation(thread_id)

@@ -1,85 +1,144 @@
 """
 身份解析
 
-容器部署走 nginx 的 HTTP Basic：nginx 认人后把 ``$remote_user`` 注入
-``X-Authenticated-User``，backend 只信这个头。
+容器部署使用 Java ERP 签发的 RS256 JWT。backend 本地验签后，再向 Java ERP
+确认账号状态和 ``authz_version``，使停用和改权立即生效。
 
-关键点：在 ``AUTH_MODE=proxy`` 下，请求体 / 查询串里的 ``user_id`` 一律被
-**丢弃**。改造前 ``user_id`` 完全由客户端提供且前端硬编码成 ``user-001``，
-意味着所有浏览器共享同一份会话历史、同一个沙箱；而 ``/api/chat/{id}/history``
-和 ``DELETE /api/history/{id}`` 连归属校验都没有，知道 thread_id 就能读写
-别人的会话。身份必须来自认证层，不能来自请求体。
-
-``AUTH_MODE=none``（本机开发默认）不校验，行为与改造前完全一致。
+生产只接受 JWT 身份；``AUTH_MODE=none`` 仅用于本机离线开发。
 """
-import hashlib
-import re
-import secrets
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
-from fastapi import Header, HTTPException
+import httpx
+import jwt
+from fastapi import Depends, Header, HTTPException
 
 from ..agent.config import (
     AUTH_MODE,
-    AUTH_USER_HEADER,
-    INTERNAL_AUTH_HEADER,
-    INTERNAL_AUTH_TOKEN,
+    ERP_BASE_URL,
+    JWT_ACTIVE_CHECK_ENABLED,
+    JWT_AUDIENCE,
+    JWT_ISSUER,
+    JWT_PUBLIC_KEY_PATH,
 )
 from ..agent.log_utils import web_logger
-
-# Basic Auth 的用户名允许出现空格、冒号、非 ASCII 等字符，而 user_id 会进入
-# PostgreSQL 查询、Store 命名空间和沙箱容器名（容器名有字符集限制），
-# 所以不能原样透传。
-_UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9_-]")
 
 DEFAULT_USER_ID = "default_user"
 
 
-def derive_user_id(username: str) -> str:
-    """把 Basic Auth 用户名映射成稳定的 user_id。
+@dataclass(frozen=True)
+class AuthenticatedPrincipal:
+    subject: str
+    username: str
+    display_name: str
+    roles: frozenset[str] = field(default_factory=frozenset)
+    permissions: frozenset[str] = field(default_factory=frozenset)
+    authz_version: int = 1
+    access_token: str = field(default="", repr=False)
 
-    保留可读前缀便于排障（日志里能看出是谁），后缀哈希保证不同用户名的映射
-    不撞车 —— 只做字符替换的话 ``a.b`` 和 ``a-b`` 会合并成同一个人。
-    """
-    digest = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
-    safe = _UNSAFE_CHARS.sub("", username)[:24]
-    return f"{safe}_{digest}" if safe else f"user_{digest}"
+
+_current_principal: ContextVar[AuthenticatedPrincipal | None] = ContextVar(
+    "erp_authenticated_principal", default=None
+)
+
+
+def get_request_principal() -> AuthenticatedPrincipal | None:
+    return _current_principal.get()
+
+
+@lru_cache(maxsize=4)
+def _public_key(path: str) -> str:
+    if not path:
+        raise HTTPException(status_code=503, detail="JWT 公钥未配置")
+    try:
+        return Path(path).read_text(encoding="ascii")
+    except OSError as exc:
+        web_logger.error("Cannot read JWT public key %s: %s", path, exc)
+        raise HTTPException(status_code=503, detail="JWT 验证配置不可用") from exc
+
+
+async def _decode_bearer(authorization: str | None) -> AuthenticatedPrincipal:
+    if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="缺少 Bearer Token")
+    raw = authorization[7:].strip()
+    try:
+        claims = jwt.decode(
+            raw,
+            _public_key(JWT_PUBLIC_KEY_PATH),
+            algorithms=["RS256"],
+            audience=JWT_AUDIENCE,
+            issuer=JWT_ISSUER,
+            options={"require": ["sub", "exp", "iat", "iss", "aud"]},
+        )
+    except jwt.PyJWTError as exc:
+        web_logger.info("Rejected invalid JWT: %s", type(exc).__name__)
+        raise HTTPException(status_code=401, detail="登录已过期或 Token 无效") from exc
+    subject = str(claims.get("sub") or "").strip()
+    if not subject:
+        raise HTTPException(status_code=401, detail="Token 缺少用户主体")
+    principal = AuthenticatedPrincipal(
+        subject=subject,
+        username=str(claims.get("username") or subject),
+        display_name=str(claims.get("display_name") or claims.get("username") or subject),
+        roles=frozenset(str(v) for v in claims.get("roles") or ()),
+        permissions=frozenset(str(v) for v in claims.get("permissions") or ()),
+        authz_version=int(claims.get("authz_version") or 1),
+        access_token=raw,
+    )
+    # Java ERP 持有账号状态与 authz_version 的唯一真值。只做离线验签会让已经
+    # 停用或改权的令牌在 15 分钟内仍能访问助手，因此每个入口请求向签发方确认一次。
+    if JWT_ACTIVE_CHECK_ENABLED:
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                response = await client.get(
+                    f"{ERP_BASE_URL}/api/auth/me",
+                    headers={"Authorization": f"Bearer {raw}"},
+                )
+        except httpx.HTTPError as exc:
+            web_logger.warning("JWT active check unavailable: %s", exc)
+            raise HTTPException(status_code=503, detail="身份服务暂时不可用") from exc
+        if response.status_code != 200:
+            raise HTTPException(status_code=401, detail="登录状态或权限已经变更")
+    return principal
 
 
 async def current_user_id(
-    authenticated_user: Optional[str] = Header(default=None, alias=AUTH_USER_HEADER),
-    internal_auth: Optional[str] = Header(default=None, alias=INTERNAL_AUTH_HEADER),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ) -> Optional[str]:
-    """FastAPI 依赖：返回认证身份。
-
-    - ``AUTH_MODE=proxy`` 且头存在 → 返回派生的 user_id
-    - ``AUTH_MODE=proxy`` 但头缺失 → 401（说明请求绕过了 nginx）
-    - ``AUTH_MODE=none``          → 返回 None，调用方回退到请求里的 user_id
-
-    配了 ``INTERNAL_AUTH_TOKEN`` 时，还要求 ``X-Internal-Auth`` 匹配。这道校验
-    挡的是"沙箱代码直连 backend 伪造身份头"（见 config.py 里该变量的注释）。
-    """
-    if AUTH_MODE != "proxy":
+    """Return the JWT subject, or ``None`` in explicit local dev mode."""
+    if AUTH_MODE == "jwt":
+        principal = await _decode_bearer(authorization)
+        _current_principal.set(principal)
+        return principal.subject
+    if AUTH_MODE == "none":
+        _current_principal.set(None)
         return None
-    if not authenticated_user or not authenticated_user.strip():
-        web_logger.warning(
-            f"Rejected unauthenticated request: missing {AUTH_USER_HEADER} header "
-            f"(AUTH_MODE=proxy). The request did not come through nginx."
-        )
-        raise HTTPException(status_code=401, detail="未认证")
-    if INTERNAL_AUTH_TOKEN and not _token_matches(internal_auth):
-        web_logger.warning(
-            f"Rejected request with a valid {AUTH_USER_HEADER} but a bad/missing "
-            f"{INTERNAL_AUTH_HEADER}: it did not come from nginx."
-        )
-        raise HTTPException(status_code=401, detail="未认证")
-    return derive_user_id(authenticated_user.strip())
+    raise HTTPException(status_code=503, detail="AUTH_MODE 配置无效，只允许 jwt 或 none")
 
 
-def _token_matches(provided: Optional[str]) -> bool:
-    """定长比较，避免按字符提前返回泄露密钥前缀。"""
-    return secrets.compare_digest((provided or "").encode("utf-8"),
-                                  INTERNAL_AUTH_TOKEN.encode("utf-8"))
+def require_permission(permission: str):
+    async def dependency(_: str | None = Depends(current_user_id)) -> AuthenticatedPrincipal:
+        principal = get_request_principal()
+        if principal is None:
+            raise HTTPException(status_code=401, detail="未认证")
+        if permission not in principal.permissions:
+            raise HTTPException(status_code=403, detail="权限不足")
+        return principal
+    return dependency
+
+
+def assert_permission(*permissions: str) -> None:
+    """Enforce JWT permissions while preserving explicit local dev mode."""
+    if AUTH_MODE != "jwt":
+        return
+    principal = get_request_principal()
+    if principal is None:
+        raise HTTPException(status_code=401, detail="未认证")
+    if not any(permission in principal.permissions for permission in permissions):
+        raise HTTPException(status_code=403, detail="权限不足")
 
 
 def resolve_user_id(authenticated: Optional[str], requested: Optional[str]) -> str:

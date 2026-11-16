@@ -85,11 +85,8 @@ describe("跨块边界（chunk 由 TCP 分帧决定，切在哪都合法）", ()
 });
 
 describe("容错", () => {
-  it("data 不是 JSON 时，token 降级成纯文本事件", () => {
-    // 老版本后端发过不带 JSON 的裸 token；保留这条兼容路径。
-    expect(new SSEParser().parse("event: token\ndata: 裸文本\n\n")).toEqual([
-      { type: "token", content: "裸文本", source: "main" },
-    ]);
+  it("data 不是 JSON 时丢弃，不猜测载荷格式", () => {
+    expect(new SSEParser().parse("event: token\ndata: 裸文本\n\n")).toEqual([]);
   });
 
   it("data 不是 JSON 且事件名不是 token 时丢弃，且不污染下一个事件", () => {
@@ -126,11 +123,8 @@ describe("容错", () => {
 });
 
 describe("载荷形状", () => {
-  it("JSON 里的 type 会覆盖 event: 行（展开顺序所致）", () => {
-    // `{ type: currentEvent, ...parsed }` —— 后端现在不发 type 字段，所以
-    // 这是潜伏的：哪天有人给 data 里加个 type，事件类型会静默变成 data 里的
-    // 那个值，路由到错误的处理分支。钉住它，改顺序时这里会红。
+  it("event: 行是事件类型的唯一来源", () => {
     const events = new SSEParser().parse('event: token\ndata: {"type":"done"}\n\n');
-    expect(events).toEqual([{ type: "done" }]);
+    expect(events).toEqual([{ type: "token" }]);
   });
 });

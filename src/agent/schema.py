@@ -9,7 +9,6 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-
 PROCUREMENT_CONTEXT_CONFIG_KEY = "procurement_context"
 
 
@@ -28,6 +27,9 @@ class ProcurementContext(BaseModel):
     """采购上下文 - 每次请求注入到 Agent state"""
     user_id: str = Field(default="default_user", description="用户ID")
     username: str = Field(default="用户", description="用户名")
+    roles: List[str] = Field(default_factory=list, description="当前登录角色")
+    permissions: List[str] = Field(default_factory=list, description="当前登录权限")
+    authz_version: int = Field(default=1, description="权限版本")
     preferences: dict = Field(default_factory=dict, description="用户偏好字典")
     warm_memory: str = Field(default="", description="WARM 层记忆摘要（语义记忆 + 近期情节），注入系统提示词")
     session_start: str = Field(default_factory=lambda: datetime.now().isoformat())

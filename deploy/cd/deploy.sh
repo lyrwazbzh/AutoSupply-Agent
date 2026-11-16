@@ -29,8 +29,8 @@ usage() {
   bash deploy/cd/deploy.sh rollback <env> [--check]     回滚 / --check 只校验回滚能力不执行
 
 可选环境变量：
-  SMOKE_BASIC_USER / SMOKE_BASIC_PASSWORD
-      带认证的深链路冒烟（/ 与 /api/history）需要它们。不传则只探 /healthz 与
+  SMOKE_ERP_USER / SMOKE_ERP_PASSWORD
+      带认证的深链路冒烟（登录、Python API、Java ERP RBAC）需要它们。不传则只探 /healthz 与
       /health 两个免认证端点，前端与 /api 链路不被验证。CI 里从 Secrets 注入。
   DEPLOYED_BY          写进状态文件的发布者，CI 里传 github-actions
   CD_ALLOW_INFRA_CHANGE=1
@@ -218,9 +218,8 @@ cd_apply_and_verify() {
     # 老安装升级到含 :443 的 nginx.conf 时，宿主 tls 目录是空的（bootstrap 只在
     # 装机器时生成过证书），不补占位证书 nginx 会在下面这一步启动即崩。幂等。
     cd_ensure_nginx_tls_cert
-    # 老实例的 htpasswd 权限（600→644）与 nginx.env 缺 TLS_ENABLED 行同样只在
-    # up 前补最省事；本函数被正常发布与回滚两路复用，一次调用两边都覆盖。
-    cd_ensure_nginx_auth_and_switch
+    # 老实例若 nginx.env 缺 TLS_ENABLED 行，在 up 前补齐；认证由应用层 JWT 完成。
+    cd_ensure_nginx_runtime
 
     log "重建容器（--no-build：跑的就是本机那组镜像，不在目标机上编译）"
 
@@ -430,7 +429,7 @@ cd_rollback_check() {
         # 确认「prev 记的那个 digest」和「本机这个 tag 现在指向的」是同一个 ——
         # 不一致说明有人动过 tag，这时回滚会滚到一个未知的东西上。
         local ref id key
-        for key in APP_IMAGE:APP_IMAGE_ID FRONTEND_IMAGE:FRONTEND_IMAGE_ID MOCK_ERP_IMAGE:MOCK_ERP_IMAGE_ID; do
+        for key in APP_IMAGE:APP_IMAGE_ID FRONTEND_IMAGE:FRONTEND_IMAGE_ID JAVA_ERP_IMAGE:JAVA_ERP_IMAGE_ID; do
             ref="$(cd_state_get "$CD_PREV_FILE" "${key%%:*}" || true)"
             id="$(cd_state_get "$CD_PREV_FILE" "${key##*:}" || true)"
             if [ -z "$ref" ]; then

@@ -1,0 +1,14 @@
+spring:
+  config:
+    activate:
+      on-profile: test
+
+motorparts:
+  security:
+    enabled: false
+  seed:
+    enabled: false
+  order-expiry:
+    enabled: false
+  replenishment:
+    enabled: false

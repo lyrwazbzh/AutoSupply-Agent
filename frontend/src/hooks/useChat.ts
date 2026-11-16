@@ -129,7 +129,6 @@ export function useChat() {
           break;
 
         case "todo_update": {
-          // 新格式：后端直接发送 todos 数组
           if (event.todos && Array.isArray(event.todos)) {
             const items: TodoItem[] = event.todos.map((t) => ({
               id: t.id || `todo-${Math.random().toString(36).slice(2)}`,
@@ -138,29 +137,6 @@ export function useChat() {
             }));
             setTodoItems(items);
             setTodoVisible(true);
-          } else if (event.status_change === "executing") {
-            // 执行阶段：将所有 pending 改为 in_progress
-            setTodoItems((prev) =>
-              prev.map((item) =>
-                item.status === "pending" ? { ...item, status: "in_progress" as const } : item
-              )
-            );
-          } else if (event.args) {
-            // 兼容旧格式
-            try {
-              const args = JSON.parse(event.args);
-              if (args.todos && Array.isArray(args.todos)) {
-                const items: TodoItem[] = args.todos.map((t: Record<string, unknown>, i: number) => ({
-                  id: (t.id as string) || `todo-${i}`,
-                  content: (t.content as string) || "",
-                  status: (t.status as TodoItem["status"]) || "pending",
-                }));
-                setTodoItems(items);
-                setTodoVisible(true);
-              }
-            } catch {
-              // 解析失败静默处理
-            }
           }
           break;
         }

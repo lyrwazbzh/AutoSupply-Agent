@@ -5,14 +5,14 @@
 供应商查询、库存操作和采购订单处理，并以 MCP 隔离 Agent 与 ERP 接口。
 
 系统同时提供规则优先、LLM 兜底的质量评审，写操作前人工审批，写后持久化审计与对账，
-以及用户级 Docker 沙箱、三层记忆、SSE 前端和容器化部署能力。本地联调默认对接仓库内
-`java_erp`（Spring Boot 采购 ERP）；Compose 全栈仍可使用行为一致的 Mock ERP。
+以及用户级 Docker 沙箱、三层记忆、SSE 前端和容器化部署能力。本地联调和生产 Compose
+均对接仓库内 `java_erp`（Spring Boot 采购 ERP）；Mock ERP 仅用于 CI 契约测试。
 
 ## 核心能力
 
 - **Harness 编排与评审**：使用图状态维护 Planning、Executing、Review、Result 四阶段；
   `ReviewPolicy` 先执行确定性规则，无法判断时调用 Router LLM，超时或 Schema 无效时保守评审；
-  采购查询任务完成率约 91%。
+  完整 Agent 质量由版本化离线数据集和 Java ERP 事实金标独立评测。
 - **固定 Rubric 与安全返工**：LLM 只决定是否评审及检查维度，具体标准从 YAML 预设中选择；
   多工具、写操作、委派和失败信号会升级审查。只读任务最多返工 3 轮，写入及委派任务只评审一次，
   不自动重放副作用链路。
@@ -23,7 +23,9 @@
   契约为 `{code,message,data}`，业务错误保持 HTTP 200 + `body.code`。
 - **Java ERP 写契约**：`java_erp` 提供订单幂等键、同键不同 payload → `409`、
   `GET /api/operations/{id}` 回查、`by-idempotency` 回查，以及订单/供应商状态与库存 CAS；
-  可选 Redis Lua 出库热路径与 `local_message` / RocketMQ 旁路（开关见 `java_erp/README.md`）。
+  Redis 只承担零件/供应商查询缓存、登录限流和最近/常用访问，库存正确性始终由 MySQL 保证。
+- **采购目录 M1**：Java ERP 已支持一个零件对应多个供应商报价，并提供摩托车车型档案、
+  零件适配关系和按车型反查零件；保留 `part.supplier_id` 作为默认供应商兼容字段。
 - **审批、评审与审计分层**：审批在 ERP 写入前阻断执行，Rubric 在执行后检查结果质量，
   写审计则持久化操作事实。三者职责独立，但主 Agent 直调和子 Agent 调用共享同一审批策略中心。
 - **通用写治理与结果审计**：订单、库存、供应商和零部件写入统一生成操作记录与追加式审计事件；
@@ -42,8 +44,9 @@
 
 ```mermaid
 flowchart LR
-    UI[Next.js Web] -->|HTTP / SSE| NGINX[Nginx + Basic Auth]
-    NGINX --> API[FastAPI]
+    UI[Next.js ERP + Assistant] -->|HTTP / SSE + Bearer JWT| NGINX[Nginx Edge]
+    NGINX --> API[FastAPI Resource Server]
+    NGINX --> ERP[java_erp Identity + ERP]
     API --> LOADER[AgentLoader]
     LOADER --> MAIN[Procurement Main Agent]
 
@@ -57,7 +60,7 @@ flowchart LR
     MAIN --> MCP[FastMCP Gateway]
     ANALYST --> MCP
     ORDER --> MCP
-    MCP --> ERP[java_erp / Mock ERP]
+    MCP --> ERP
 
     MAIN --> PROXY[Sandbox Proxy]
     PROXY --> DIND[Docker-in-Docker]
@@ -106,7 +109,7 @@ ERP 写工具
 |---|---|
 | Agent | DeepAgents 0.7、LangGraph 1.2、LangChain、OpenAI-compatible LLM |
 | API / 工具 | FastAPI、SSE、FastMCP、HTTPX |
-| ERP | `java_erp`：Spring Boot 3.1、JDK 17、MyBatis-Plus、MySQL；Compose 可选 Mock ERP |
+| ERP | `java_erp`：Spring Boot 3.1、JDK 17、MyBatis-Plus、Flyway、MySQL；Mock ERP 仅供契约测试 |
 | 数据 | PostgreSQL 16、pgvector、zhparser、LangGraph PostgresSaver / Store |
 | 沙箱 | Docker SDK、Docker-in-Docker、seccomp、用户级资源隔离 |
 | 前端 | Next.js 16、React 19、TypeScript、Tailwind CSS 4 |
@@ -134,25 +137,27 @@ AutoSupply-Agent/
 │  ├─ api_view/                    FastAPI、SSE、认证、历史、审计与评测 API
 │  ├─ mcp_server/                  供应商、零部件、订单、库存 MCP 工具
 │  ├─ skills/                      Agent Skills
-│  ├─ test/evaluation/             Golden 回归与 JSON 指标报告
+│  ├─ evaluation/                  完整 Agent Runner、声明抽取、Oracle 与报告聚合
+│  ├─ test/evaluation/             评测 Schema 示例与最新 JSON 报告
 │  ├─ artifacts.py                 用户隔离临时文件与 TTL 清理
 │  └─ database.py                  PostgreSQL 连接池及应用 Schema 初始化
 ├─ frontend/                       Next.js 16 Web 前端
 ├─ java_erp/                       Spring Boot 采购 ERP（本地默认 :8080；Harness 写契约）
 ├─ deploy/
 │  ├─ postgres/                    pgvector + zhparser PostgreSQL 镜像
-│  ├─ mock-erp/                    可独立运行的采购 ERP 替身（Compose 默认）
+│  ├─ mock-erp/                    仅供 CI 契约测试的采购 ERP 替身
 │  ├─ sandbox/                     预装分析依赖的沙箱镜像
 │  ├─ nginx/                       统一入口、认证与 TLS
 │  ├─ prometheus/ / grafana/       指标采集、告警与 Dashboard
 │  ├─ ci/                          集成栈、备份恢复和迁移门禁
 │  ├─ cd/                          构建、发布、观察窗与回滚
-│  ├─ dr/                          PostgreSQL 备份、恢复与演练
+│  ├─ dr/                          PostgreSQL + MySQL 备份、恢复与演练
+│  ├─ mysql/                       宿主 MySQL 无损迁移工具与手册
 │  └─ cloud/                       新云主机初始化脚本
 ├─ .github/workflows/              CI、构建、发布与 Release Please
 ├─ docker-compose.yml              全栈服务编排
 ├─ Dockerfile                      Backend / MCP 共用镜像
-└─ eval.md                         采购查询与错误拦截评测方案
+└─ eval.md                         Agent 四维评测方案
 ```
 
 ## 环境要求
@@ -165,8 +170,8 @@ AutoSupply-Agent/
 
 ## 快速启动
 
-Docker Compose 是最完整的运行方式，会启动 PostgreSQL、Mock ERP、MCP、Backend、
-Frontend、Docker 沙箱、Prometheus、Grafana 和 Nginx。
+Docker Compose 是最完整的运行方式，会启动 PostgreSQL、MySQL、Java ERP、MCP、
+Backend、Frontend、Docker 沙箱、Prometheus、Grafana 和 Nginx。
 
 ### 1. 准备配置
 
@@ -186,18 +191,15 @@ PUBLIC_BASE_URL=http://localhost
 POSTGRES_PASSWORD=请替换为强密码
 ```
 
-生成 Nginx 与 Backend 共用的内部认证 Token：
+生成 ERP 的 RS256 密钥与一次性管理员：
 
 ```bash
-sh deploy/set_internal_token.sh
+bash deploy/init-security.sh
 ```
 
-### 2. 创建登录凭据和 TLS 占位证书
+### 2. 创建 TLS 占位证书
 
 ```bash
-docker run --rm httpd:2.4-alpine \
-  htpasswd -nbB admin '请替换为登录密码' > deploy/nginx/htpasswd
-
 mkdir -p deploy/nginx/tls
 openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
   -keyout deploy/nginx/tls/key.pem \
@@ -217,7 +219,7 @@ docker compose ps
 curl http://localhost/healthz
 ```
 
-访问 <http://localhost/> 并使用刚创建的 Basic Auth 账号登录。Grafana 默认位于
+访问 <http://localhost/> 并使用 `init-security.sh` 创建的 ERP 管理员登录。Grafana 默认位于
 <http://localhost:13000/>。
 
 首次启动时应用会幂等创建业务 Schema，LangGraph 会创建 checkpoint 与 store 表，
@@ -258,9 +260,10 @@ cd ..
 
 ```bash
 docker build -t agent-harness-postgres deploy/postgres
+POSTGRES_PASSWORD="$(openssl rand -hex 24)"
 docker run -d --name agent-harness-postgres \
   -e POSTGRES_USER=erp_agent \
-  -e POSTGRES_PASSWORD=erp_agent \
+  -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   -e POSTGRES_DB=erp_agent \
   -p 5432:5432 agent-harness-postgres
 
@@ -274,12 +277,11 @@ docker build -f deploy/sandbox/Dockerfile \
 
 ```bash
 # 终端 1：Java ERP（需本机 MySQL；完整说明见 java_erp/README.md）
-cd java_erp && mvn spring-boot:run
-# 可选冒烟：powershell -File java_erp/scripts/smoke_harness.ps1
+cd java_erp && ./mvnw spring-boot:run
+# 可选冒烟：python java_erp/scripts/smoke_harness.py
 #           再执行 java_erp/docs/verify_invariants.sql
 
-# 备选：Mock ERP（将 .env 中 ERP_BASE_URL 改为 http://localhost:8081）
-# python deploy/mock-erp/erp_mock_server.py
+# Mock ERP 仅由 deploy/ci/compose.mock-erp.yml 启动，用于契约回归，不作为联调或生产实现
 
 # 终端 2：MCP
 python -m src.mcp_server.server_main
@@ -299,10 +301,11 @@ cd frontend && npm run dev
 | 模式 | 地址 | 适用 |
 |---|---|---|
 | `java_erp`（本地默认） | `ERP_BASE_URL=http://localhost:8080` | 幂等、operations 回查、状态/库存 CAS、可选 Redis/MQ |
-| Mock ERP（Compose 默认） | Compose 内 `mock-erp:8081`；本机进程可用 `:8081` | 无 MySQL 时快速起全栈 |
+| Java ERP（Compose/生产默认） | Compose 内 `java-erp:8080` | Flyway、MySQL、幂等写与 operation 回查 |
+| Mock ERP（仅测试） | `deploy/ci/compose.mock-erp.yml` 内 `mock-erp:8081` | 契约回归，不进入生产发布物 |
 
 供应商状态以 Java 枚举为准：`1=合作中, 2=已终止, 3=审核中`（历史 `0` 写库前归一为 `2`）。
-订单 `status=0` 或缺省写库前归一为 `1`（待审核）。接口细节见 [java_erp/README.md](java_erp/README.md)
+新采购单统一以 `status=1`（待审核）创建，后续状态只能通过受控迁移接口变更。接口细节见 [java_erp/README.md](java_erp/README.md)
 与 [java_erp/docs/API_DOCUMENTATION.md](java_erp/docs/API_DOCUMENTATION.md)。
 
 ## 记忆与知识检索
@@ -331,27 +334,28 @@ COLD 检索采用：
 
 ## 评测
 
-当前评测链提供确定性 Golden 回归、JSON 报告和指标 API：
+当前评测链通过真实对话 SSE、工具 Trace 和 Java ERP 金标生成 JSON 报告。无网络环境
+可先校验数据契约：
 
 ```bash
-python -m unittest src.test.test_result_audit src.test.test_hybrid_review -v
+python -m src.evaluation --dataset src/test/evaluation/datasets/schema_examples.jsonl --validate-only
+pytest -q src/test/test_evaluation_oracle.py src/test/test_evaluation_runner.py src/test/test_evaluation_dimensions.py
 curl http://localhost:8000/api/evaluation/metrics
 ```
 
 核心指标口径：
 
 ```text
-采购查询任务完成率
-= 通过任务目标、关键事实、工具证据和输出约束检查的查询数
-  / 采购查询总数
-
-错误拦截率
-= 被审批、参数校验、写治理或结果审计正确阻断的错误写入数
-  / 错误写入用例总数
+轨迹：轨迹通过率、工具调用准确率
+业务质量：任务完成率、关键事实准确率、采购建议可行率、补货数量偏差
+安全：风险操作拦截率、合法写入误拦截率
+稳定性：pass^3、故障恢复率
 ```
 
-评测服务只输出 JSON，Dashboard 由外部业务前端展示。完整的数据格式、冻结 ERP 快照、
-金标生成和用例隔离方案见 [eval.md](eval.md)。
+每条用例归入 `FULLY_RESOLVED`、`PARTIALLY_RESOLVED`、
+`CORRECT_CLARIFICATION`、`INCORRECT`、`UNSAFE` 或 `INFRA_ERROR`。不计算加权
+总分、85 分阈值、延迟、成本、记忆或 Redis 指标。完整口径见
+[eval.md](eval.md)。
 
 ## 测试与质量门禁
 
@@ -375,16 +379,18 @@ GitHub Actions 使用同一份可复用门禁，覆盖：
 - Gitleaks 全历史密钥扫描和敏感路径检查
 - Python lint、编译、离线回归与覆盖率
 - 前端类型、lint、测试与镜像构建
-- PostgreSQL 备份恢复、迁移幂等与负向用例
+- PostgreSQL + MySQL 备份恢复、迁移幂等与负向用例
 - Nginx 认证链路、完整 Compose 拓扑和真实沙箱冒烟
-- 后端、前端、PostgreSQL 与 Mock ERP 镜像构建验证
+- 后端、前端、PostgreSQL 与 Java ERP 镜像构建验证
 
 ## 关键接口
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | `POST` | `/api/chat/stream` | 创建或继续 thread，以 SSE 返回阶段、Token、工具和中断事件 |
-| `POST` | `/api/chat/{thread_id}/resume` | 提交审批或补充信息并恢复 LangGraph |
+| `POST` | `/api/chat/{thread_id}/resume` | 申请人消费已落库审批结果，或提交补充信息并恢复 LangGraph |
+| `GET` | `/api/write-audit/approval-queue` | 管理员查看独立审批队列（不读取申请人会话） |
+| `POST` | `/api/write-audit/approvals/{operation_id}/decision` | 管理员按 operation_id 批准或拒绝 |
 | `GET` | `/api/chat/{thread_id}/state` | 查询中断及待处理状态 |
 | `GET` | `/api/chat/{thread_id}/history` | 获取会话展示消息 |
 | `GET` | `/api/history` | 获取当前用户的会话列表 |
@@ -403,7 +409,7 @@ GitHub Actions 使用同一份可复用门禁，覆盖：
 
 ## 数据与安全约束
 
-- PostgreSQL 是唯一权威持久化路径；项目不依赖 MongoDB 或独立向量数据库。
+- PostgreSQL 是 Agent 会话、审计与知识的权威持久化路径；MySQL 是 Java ERP 业务数据的权威路径。项目不依赖 MongoDB 或独立向量数据库。
 - 当前是用户级隔离，不包含租户与角色权限模型。认证身份由 Nginx 注入，Backend 使用内部
   Token 验证请求确实来自 Nginx。
 - Backend 不应直接暴露公网端口；容器部署必须通过 Nginx 访问。
@@ -411,9 +417,12 @@ GitHub Actions 使用同一份可复用门禁，覆盖：
 - `audit.write_audit_events` 为 append-only，数据库触发器拒绝更新和删除。
 - 沙箱使用独立 DinD daemon，避免直接挂载宿主机 Docker socket；但 DinD 服务本身需要
   `privileged`，因此它是受控环境内的工程隔离，不等同于强安全边界。
-- 当前 Backend 只能运行单副本：AgentLoader、SandboxManager 和部分中间件状态仍是进程内对象，
-  不要为 Uvicorn 增加 workers，也不要横向扩容 Backend。
-- `.env`、数据库卷、运行日志、TLS 私钥、htpasswd、构建产物和本地依赖均已加入 `.gitignore`。
+- Agent 对象和 Docker 连接是实例内缓存；AgentSession 所有权、用户运行租约、
+  `user → container` 分配以及暖池所有权以 PostgreSQL 为准。副本切换时从 checkpoint
+  和外置分配重建本地对象，同一用户不会被两个副本并发执行。
+- 生成文件目前仍位于 Backend 本地临时目录；横向扩容时下载路由需要粘性会话或共享
+  artifact 存储。DinD 仍是共享沙箱基础设施的单点。
+- `.env`、数据库卷、运行日志、TLS/JWT 私钥、构建产物和本地依赖均已加入 `.gitignore`。
   提交前建议运行 `bash deploy/cd/leak-check.sh --tree`。
 
 ## 运维文档
@@ -421,10 +430,11 @@ GitHub Actions 使用同一份可复用门禁，覆盖：
 - [容器拓扑、认证与故障排查](deploy/README.md)
 - [云主机初始化](deploy/cloud/README.md)
 - [构建、发布与回滚](deploy/cd/README.md)
-- [PostgreSQL 备份、恢复与演练](deploy/dr/README.md)
+- [PostgreSQL + MySQL 备份、恢复与演练](deploy/dr/README.md)
+- [宿主 MySQL 迁入 Compose](deploy/mysql/README.md)
 - [CI 集成栈与数据库门禁](deploy/ci/README.md)
 - [Java ERP 联调、写契约与冒烟](java_erp/README.md)
-- [采购查询与错误拦截评测方案](eval.md)
+- [Agent 四维评测方案](eval.md)
 
 ## 来源与致谢
 
@@ -432,5 +442,3 @@ GitHub Actions 使用同一份可复用门禁，覆盖：
 - Agent 框架：[DeepAgents](https://github.com/langchain-ai/deepagents) 与
   [LangGraph](https://github.com/langchain-ai/langgraph)
 - 工具协议：[Model Context Protocol](https://modelcontextprotocol.io/)
-
-

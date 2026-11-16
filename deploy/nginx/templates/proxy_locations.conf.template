@@ -1,0 +1,80 @@
+# Shared by HTTP and HTTPS servers. Keep the streaming route before /api/.
+location = /healthz {
+    access_log off;
+    default_type text/plain;
+    return 200 "ok\n";
+}
+
+location = /health {
+    access_log off;
+    set $backend http://backend:8000;
+    proxy_pass $backend;
+    proxy_set_header Host $host;
+    proxy_read_timeout 10s;
+}
+
+location /api/auth/ {
+    set $erp http://java-erp:8080;
+    proxy_pass $erp;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Authorization $http_authorization;
+}
+
+location /api/erp/ {
+    set $erp http://java-erp:8080;
+    rewrite ^/api/erp/(.*)$ /api/$1 break;
+    proxy_pass $erp;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header X-Operation-Source UI;
+    proxy_read_timeout 300s;
+}
+
+location /api/chat/ {
+    set $backend http://backend:8000;
+    proxy_pass $backend;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Authorization $http_authorization;
+    proxy_buffering off;
+    proxy_cache off;
+    gzip off;
+    chunked_transfer_encoding on;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+}
+
+location /api/ {
+    set $backend http://backend:8000;
+    proxy_pass $backend;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Authorization $http_authorization;
+    proxy_read_timeout 300s;
+}
+
+location / {
+    set $frontend http://frontend:3000;
+    proxy_pass $frontend;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 120s;
+}

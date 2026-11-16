@@ -7,11 +7,9 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.motorparts.dto.InventoryWithPart;
 import com.motorparts.entity.Inventory;
 import com.motorparts.entity.Part;
-import com.motorparts.inventory.RedisInventoryGate;
 import com.motorparts.mapper.InventoryMapper;
 import com.motorparts.mapper.PartMapper;
 import com.motorparts.service.InventoryService;
-import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -21,7 +19,6 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.stream.Collectors;
 
 /**
@@ -32,9 +29,6 @@ public class InventoryServiceImpl extends ServiceImpl<InventoryMapper, Inventory
 
     @Autowired
     private PartMapper partMapper;
-
-    @Autowired
-    private ObjectProvider<RedisInventoryGate> redisInventoryGate;
 
     @Override
     public Page<Inventory> pageInventories(Page<Inventory> page, String partName, String warehouseLocation) {
@@ -80,27 +74,16 @@ public class InventoryServiceImpl extends ServiceImpl<InventoryMapper, Inventory
             newInventory.setDeleted(0);
             newInventory.setCreateTime(LocalDateTime.now());
             newInventory.setUpdateTime(LocalDateTime.now());
-            boolean ok = save(newInventory);
-            if (ok) {
-                syncRedisStock(partId, quantity);
-            }
-            return ok;
+            return save(newInventory);
         } else {
             LambdaUpdateWrapper<Inventory> updateWrapper = new LambdaUpdateWrapper<>();
-            updateWrapper.setSql("current_quantity = current_quantity + {0}", quantity)
+            updateWrapper.setSql("current_quantity = current_quantity + " + quantity)
                          .set(Inventory::getLastInboundTime, LocalDateTime.now())
                          .eq(Inventory::getId, inventory.getId());
             if (StringUtils.hasText(warehouseLocation)) {
                 updateWrapper.set(Inventory::getWarehouseLocation, warehouseLocation);
             }
-            boolean ok = update(updateWrapper);
-            if (ok) {
-                Inventory latest = baseMapper.selectById(inventory.getId());
-                if (latest != null) {
-                    syncRedisStock(partId, latest.getCurrentQuantity());
-                }
-            }
-            return ok;
+            return update(updateWrapper);
         }
     }
 
@@ -118,48 +101,12 @@ public class InventoryServiceImpl extends ServiceImpl<InventoryMapper, Inventory
             return false;
         }
 
-        RedisInventoryGate gate = redisInventoryGate.getIfAvailable();
-        String requestId = null;
-        if (gate != null) {
-            // 先同步一次 DB 库存到 Redis，再 Lua 扣减
-            gate.syncStock(partId, inventory.getCurrentQuantity());
-            RedisInventoryGate.GateResult gateResult = gate.tryOutbound(partId, quantity, UUID.randomUUID().toString());
-            requestId = gateResult.requestId();
-            if (gateResult.code() == RedisInventoryGate.INSUFFICIENT) {
-                return false;
-            }
-            if (gateResult.code() == RedisInventoryGate.IDEMPOTENT_HIT) {
-                return true;
-            }
-            if (gateResult.code() != RedisInventoryGate.OK) {
-                // Lua 异常：回退纯 DB CAS
-                requestId = null;
-            }
-        }
-
         LambdaUpdateWrapper<Inventory> updateWrapper = new LambdaUpdateWrapper<>();
-        updateWrapper.setSql("current_quantity = current_quantity - {0}", quantity)
+        updateWrapper.setSql("current_quantity = current_quantity - " + quantity)
                      .set(Inventory::getLastOutboundTime, LocalDateTime.now())
                      .eq(Inventory::getId, inventory.getId())
                      .ge(Inventory::getCurrentQuantity, quantity);
-        boolean ok = update(updateWrapper);
-        if (!ok && gate != null && requestId != null) {
-            gate.rollbackOutbound(partId, quantity, requestId);
-        }
-        if (ok) {
-            Inventory latest = baseMapper.selectById(inventory.getId());
-            if (latest != null) {
-                syncRedisStock(partId, latest.getCurrentQuantity());
-            }
-        }
-        return ok;
-    }
-
-    private void syncRedisStock(Long partId, Integer qty) {
-        RedisInventoryGate gate = redisInventoryGate.getIfAvailable();
-        if (gate != null && qty != null) {
-            gate.syncStock(partId, qty);
-        }
+        return update(updateWrapper);
     }
 
     @Override

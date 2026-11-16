@@ -12,6 +12,14 @@ import java.util.List;
  */
 public interface PartService extends IService<Part> {
 
+    Part getPart(Long id);
+
+    boolean createPart(Part part);
+
+    boolean updatePart(Part part);
+
+    boolean deletePart(Long id);
+
     /**
      * 分页查询零部件
      *
@@ -21,7 +29,7 @@ public interface PartService extends IService<Part> {
      * @param supplierId 供应商ID（可选）
      * @return 分页结果
      */
-    Page<Part> pageParts(Page<Part> page, String name, String category, Long supplierId);
+    Page<Part> pageParts(Long current, Long size, String name, String category, Long supplierId);
 
     /**
      * 根据名称搜索零部件
@@ -29,7 +37,7 @@ public interface PartService extends IService<Part> {
      * @param name 零件名称关键字
      * @return 零件列表
      */
-    List<Part> searchByName(String name);
+    List<Part> searchParts(String name);
 
     /**
      * 更新采购单价
@@ -46,7 +54,9 @@ public interface PartService extends IService<Part> {
      * @param supplierId 供应商ID
      * @return 零件列表
      */
-    List<Part> getPartsBySupplierId(Long supplierId);
+    List<Part> getPartsBySupplier(Long supplierId);
+
+    List<Part> getPartsByIdsOrdered(List<Long> ids);
 
     /**
      * 检查零件编码是否存在

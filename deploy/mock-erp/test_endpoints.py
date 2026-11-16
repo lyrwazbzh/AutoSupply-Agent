@@ -45,7 +45,7 @@ with httpx.Client(base_url=BASE, timeout=15.0) as c:
         "supplierCode": "SUP9001", "name": "测试供应商", "contactPerson": "测试",
         "creditRating": "B", "status": 1}), probe=lambda d: f"id={d['id']}")
     check("supplier_update_status", c.patch("/api/suppliers/update-status/1",
-          params={"status": 0}), probe=lambda d: f"status={d['status']}")
+          params={"status": 1}), probe=lambda d: f"status={d['status']}")
 
     # ---------- 零部件 5 ----------
     check("part_search", c.get("/api/parts/search", params={"name": "火花塞"}),
@@ -65,7 +65,7 @@ with httpx.Client(base_url=BASE, timeout=15.0) as c:
 
     # ---------- 订单 7 ----------
     check("order_create", c.post("/api/orders/create", json={
-        "orderNumber": "PO-TEST-001", "status": 0, "remark": "冒烟测试",
+        "orderNumber": "PO-TEST-001", "status": 1, "remark": "冒烟测试",
         "orderDetail": [{"partId": 1, "quantity": 100, "unitPrice": 25.5},
                         {"partId": 7, "quantity": 50, "unitPrice": 28.0}]}),
         probe=lambda d: f"id={d['id']} totalAmount={d['totalAmount']} 明细={len(d['orderDetail'])}")

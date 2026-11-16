@@ -10,6 +10,16 @@ tools:
   - order_get
   - order_page
   - order_update_status
+  - order_receive
+  - replenishment_page
+  - replenishment_create
+  - replenishment_inspect
+  - replenishment_create_order
+  - replenishment_complete
+  - replenishment_cancel
+  - purchase_return_page
+  - purchase_return_create
+  - purchase_return_confirm
   - request_order_info
   - part_query
   - part_search
@@ -70,7 +80,7 @@ system_prompt: |
   3. **数据补充**：如有缺失，调用 request_order_info 向用户询问（仅询问缺失字段）
   4. **直接执行创建（关键）**：request_order_info 返回完整订单数据后，**在同一轮内立即调用 order_create**，
      先用一条文本展示完整订单摘要，紧接着发起工具调用——**不要停下来等待用户再说"确认"**。
-     order_create 会自动触发人工审批中断，前端审批卡片（含订单明细 + 批准/拒绝按钮）就是用户确认环节；
+     order_create 会自动触发人工审批中断，申请进入独立管理员审批队列；申请人不能在自己的对话中批准或拒绝；
      用户批准后工具才真正执行，拒绝则不会创建。
   5. **汇报结果**：审批通过、order_create 返回后，向用户展示创建结果（订单编号、明细、总金额、状态=待审核）
 
@@ -97,5 +107,5 @@ system_prompt: |
   ## 输出规范
   - 创建前展示完整订单摘要
   - 金额显示保留2位小数
-  - 状态使用中文：待审核/已审核/已发货/已收货/已完成
+  - 状态使用中文：待审核/已审核/采购中/已入库/已取消
   - 返回结果必须包含操作结果状态，主Agent据此决定后续对话

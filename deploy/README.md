@@ -8,13 +8,14 @@
 ## 架构
 
 ```
-浏览器 :80 ──Basic Auth──▶ nginx
+浏览器 :80/443 ──登录/JWT──▶ nginx
    │
- nginx ──/api/chat/──→ backend:8000   (proxy_buffering off，长超时)
-   │    ──/api/──────→ backend:8000
+ nginx ──/api/auth/、/api/erp/──→ java-erp:8080
+   │    ──/api/chat/、/api/─────→ backend:8000
    └────/───────────→ frontend:3000
                           │
- backend ──→ postgres:5432 / mcp:9000 / mock-erp:8081
+ backend ──→ postgres:5432 / mcp:9000 / java-erp:8080 ──→ mysql:3306
+                                      └───────────────→ redis:6379
     │                       ▲
     └──DOCKER_HOST──→ dind:2375 ──→ erp-sandbox-* 容器
                                     └── mcp-sandbox 网络 ──→ mcp:9000
@@ -28,76 +29,31 @@
 
 ```bash
 cp deploy/.env.example deploy/.env
-# 编辑 deploy/.env：至少填 CHATANYWHERE_API_KEY 和 PUBLIC_BASE_URL
-
-# 生成 nginx ↔ backend 的共享密钥（不生成也能起来，但那道校验是关的，见下）
+# 编辑 deploy/.env：至少填 LLM/对外地址，并替换 MySQL 与 Redis 占位口令
 cp deploy/nginx.env.example deploy/nginx.env
-sh deploy/set_internal_token.sh
-
-# 创建登录账号（不建的话 nginx 起不来，见下）
-docker run --rm httpd:2.4-alpine htpasswd -nbB 张三 '你的密码' > deploy/nginx/htpasswd
+# 生成 RS256 密钥，并配置一次性初始管理员（脚本会打印随机密码）
+bash deploy/init-security.sh
 
 docker compose up -d --build
 docker compose ps          # 等所有服务变成 healthy
 ```
 
-浏览器打开 `http://<服务器地址>/`，会弹出登录框。
+浏览器打开 `http://<服务器地址>/`，使用 ERP 初始管理员登录。登录后请修改密码，
+并清空 `deploy/.env` 中两个 `ERP_BOOTSTRAP_ADMIN_*` 值。
 
 `PUBLIC_BASE_URL` 必须是浏览器能打开的地址（如 `http://192.168.1.50`），它决定 Agent 生成的下载链接指向哪里。填 `localhost` 的话用户点链接会指向自己的机器。
 
-### 创建登录账号
+### 统一身份与权限
 
-整个服务（包括前端页面）都在 nginx 的 HTTP Basic Auth 后面。`deploy/nginx/htpasswd` 是标准 htpasswd 文件，用任意一种方式生成：
+Java ERP 是唯一身份源和令牌签发方：密码只保存自适应哈希，登录成功后签发短期
+RS256 access token，并用 HttpOnly、SameSite=Strict Cookie 轮换 refresh token。
+同一枚 access token 由 Java ERP、Python Backend 与 MCP 分别验证受众和签名；私钥
+只挂载到 `java-erp`，其余服务只读公钥。
 
-```bash
-# 方式一：借用 httpd 镜像，-B 用 bcrypt
-docker run --rm httpd:2.4-alpine htpasswd -nbB 张三 '密码' >> deploy/nginx/htpasswd
-
-# 方式二：本机有 apache2-utils / httpd-tools
-htpasswd -cB deploy/nginx/htpasswd 张三
-
-# 方式三：只有 openssl（MD5-crypt）
-printf '张三:%s\n' "$(openssl passwd -apr1 '密码')" > deploy/nginx/htpasswd
-
-chmod 644 deploy/nginx/htpasswd
-docker compose restart nginx     # 改完账号只需重启 nginx
-```
-
-加第二个用户时注意：**方式一/方式三用 `>>` 追加，不要用 `>`**，否则会覆盖掉已有账号（方式二的 `-c` 只在第一次创建时用）。
-
-`deploy/nginx/htpasswd` 已在 `.gitignore` 里，不要提交（`deploy/nginx.env` 同理，
-它装的是下面那个共享密钥；仓库里只留 `deploy/nginx.env.example` 模板）。
-
-### 认证是怎么工作的
-
-```
-浏览器 ──Basic Auth──▶ nginx ──X-Authenticated-User: $remote_user──▶ backend
-```
-
-backend 在 `AUTH_MODE=proxy` 下：
-
-- 请求头缺失 → **401**。所以 nginx 里漏配某个 location 不会静默放行，只会报错。
-- 用 nginx 给的用户名派生 `user_id`，并**丢弃**请求体/查询串里的 `user_id`。
-
-第二条是这次改造的重点。改造前 `user_id` 由前端硬编码成 `user-001`，所有浏览器共享同一份历史、同一个沙箱；`/api/chat/{id}/history`、`/api/history/{id}/messages`、`DELETE /api/history/{id}` 更是连归属校验都没有，知道 thread_id 就能读写删除别人的会话。现在这些接口一律校验归属，跨用户访问返回 403。
-
-用户名到 `user_id` 的映射是 `<清洗后的用户名>_<sha256 前 8 位>`，例如 `张三` 全是非 ASCII 字符，会变成 `user_<hash>`。日志里会打印这个映射，排查"某个沙箱是谁的"时看 `docker compose logs backend | grep Ignoring`。
-
-**注意一**：`AUTH_MODE=proxy` 的前提是 backend 不对宿主机发布端口。compose 里 backend 确实没有 `ports`；一旦你给它加上 `ports`，任何人都能伪造这个头。
-
-**注意二**：不发布端口还不够。backend 与 `dind` 同在一张 Docker 网络上（要用 `DOCKER_HOST=tcp://dind:2375`），而沙箱容器跑在 `dind` 自己的 daemon 里，出口流量经 `dind` MASQUERADE 后就落在同一张网上 —— **沙箱里模型生成的代码可以绕过 nginx 直连 `backend:8000`，自己填一个别人的用户名，读到别人的会话历史**。
-
-堵法是共享密钥：nginx 把 `INTERNAL_AUTH_TOKEN` 渲染成 `X-Internal-Auth` 注入每个 `/api` 请求，backend 校验它。这个值只存在于 nginx 与 backend 的进程环境里，沙箱代码拿不到。
-
-```sh
-cp deploy/nginx.env.example deploy/nginx.env   # 首次；该文件不入库
-sh deploy/set_internal_token.sh          # 生成密钥，一次写入 deploy/.env 与 deploy/nginx.env
-docker compose up -d backend nginx       # env_file 在容器创建时注入，restart 不重读
-```
-
-留空 = 不校验（本机开发默认），此时 backend 启动日志里会有一条 `without INTERNAL_AUTH_TOKEN` 的 WARNING。**对公网部署务必设置。**
-
-验证：`PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe ../erp-verify/v16_internal_token.py`（仓库外的验证脚本，两阶段跑：先复现漏洞，再证明开启后被 401）。
+账号停用、角色或权限变更会提高 `authz_version` 并撤销刷新会话。Java 请求逐次检查
+数据库状态，Python 入口向 Java ERP 做 active check，因此旧 token 会立即失效。
+内置角色为 `ADMIN`、`PURCHASER`、`WAREHOUSE`、`VIEWER`；接口权限均使用明确的
+permission code，不使用通配管理员权限。
 
 ## 前置条件
 
@@ -126,16 +82,16 @@ docker run --rm -v erp-agent_download-data:/d alpine ls -l /d
 ### 备份
 
 **不要手工拼装数据库备份命令。** 使用 [deploy/dr/](dr/README.md) 的 PostgreSQL
-备份、校验和恢复链路：
+与 MySQL 一致性备份、校验和恢复链路：
 
 ```bash
 bash deploy/dr/backup.sh          # pg_dump → 清单校验 → 剪枝 → 外推
 bash deploy/dr/backup.sh --list   # 看有哪些
 ```
 
-`backup.sh` 对 `DATABASE_URL` 执行 custom-format `pg_dump`，写入 SHA-256 清单并使用
-`pg_restore --list` 校验。`restore-drill.sh` 会把备份恢复到一次性 PostgreSQL，检查
-应用表和 `audit.write_operations`。
+`backup.sh` 同时执行 custom-format `pg_dump` 与 `mysqldump --single-transaction`，
+写入 SHA-256 清单。恢复演练会把两份备份恢复到一次性数据库，并检查审计表、ERP
+业务表和库存不变式。
 
 `download-data` 卷中的用户报告不在 PostgreSQL dump 内，应使用对象存储或独立卷备份；
 卷丢失后历史下载链接会失效。完整边界见 [deploy/dr/README.md](dr/README.md)。
@@ -165,24 +121,28 @@ backend 和 mcp 共用同一个镜像（`erp-agent-app:local`），要一起重�
 
 ## 已知限制
 
-### 只能单副本
+### 多副本边界
 
-`SandboxManager._entries` / `sandbox_holder._sandboxes_by_user` / `AgentLoader._sessions` 全是**进程内状态**，PostgreSQL 只持久化了 `user → container_name` 映射。
+AgentSession 所有权、执行租约、用户沙箱分配与暖池归属已经外置到 PostgreSQL；
+进程内 `_sessions` / `_entries` 只作为可重建缓存，同一用户的运行由带 TTL 的数据库
+租约串行化。Backend 可以增加 worker/副本而不会覆盖 `sandbox_cache`。
 
-`--scale backend=2` 或 uvicorn `--workers 2` 会**立刻坏**（不是性能退化）：两个副本各自从预热池认领同一个容器、互相覆盖 `sandbox_cache`、给同一 `user_id` 建不同 Agent。dind 同样是 SPOF。
+生成文件仍在 Backend 本地临时目录，因此多副本入口要为 `/api/download/` 配置粘性
+路由或共享 artifact 存储。共享 dind 仍是 SPOF，不等同于沙箱高可用。
 
 ### 认证的边界
 
-认证解决了"谁能进"和"谁的会话是谁的"，但有两处没覆盖：
-
-- **下载目录是全局共享的**。`/api/download/{filename}` 要求登录，但任何已登录用户拿到文件名就能下载别人的报告。文件名是 `<名称>_<时间戳>.md` 这类可猜格式。要严格隔离得让生成工具按 `user_id` 分目录。
-- **审批中断是每人一份，但审批本身没有权限分级**。写操作（下单/改单）的待审批项按用户隔离，但任何登录用户都能批准自己发起的单。
-
-**2026-09-26 更新**：沙箱代码够到 `backend:8000` 这条通路**本身没有被关闭**（dind 与 backend 必须同网，否则 backend 连不上 dockerd），但它的后果已经被降级：配了 `INTERNAL_AUTH_TOKEN` 后，伪造的 `X-Authenticated-User` 会因为没有 `X-Internal-Auth` 而被 401。**未配该密钥的部署，沙箱代码可以冒充任意用户读取其会话 —— 见上面「认证是怎么工作的」里的注意二。**
+- access token 默认 15 分钟，浏览器只保存在内存中；刷新依赖 HttpOnly Cookie。
+- 会话历史和下载文件均绑定 JWT `sub`，客户端传入的 `user_id` 不作为身份来源。
+- 助手写 ERP 同时需要 `assistant:erp-write` 与对应业务权限，审批入口另需
+  `erp:order:approve`。
+- 钉钉外部回调只使用开放平台 HMAC 签名，不接受浏览器 JWT；未配置密钥时默认拒绝。
 
 ### 沙箱内访问 MCP
 
-已接通，但默认只有配了 `SANDBOX_MCP_URL` + `SANDBOX_MCP_HOST_IP` 才生效（`deploy/.env.example` 里已给出可用值）。
+阶段 2 默认关闭 `SANDBOX_MCP_URL` 与 `SANDBOX_MCP_HOST_IP`。不能把用户 access token
+注入会执行模型生成代码且可出网的沙箱；Agent 主进程仍通过带 Bearer 的 MCP 客户端
+访问 ERP。若以后恢复沙箱直连，应先增加短期、降权、不可转用的 capability proxy。
 
 链路：
 
@@ -196,17 +156,13 @@ backend 和 mcp 共用同一个镜像（`erp-agent-app:local`），要一起重�
 
 Agent 侧怎么知道能用：`src/agent/memory/AGENTS.md` 里让它先跑 `os.getenv("MCP_SERVER_URL")` 自己判断，为空就不要尝试。所以没配这条通路时，Agent 不会去撞墙。
 
-**改静态 IP 要同步改三处**：`docker-compose.yml` 里 mcp 的 `ipv4_address`、`deploy/.env` 的 `SANDBOX_MCP_HOST_IP`、以及 `deploy/cd/lib.sh` 里 `MCP_SANDBOX_IP` 的默认值。
-
-三处漏掉任意一处，CI 的 `test_static_config.py` 会直接红，并在报错里指出是哪两处对不上 —— 这条以前只是文档，文档拦不住人。顺带那条断言还会检查这个 IP 落在 `mcp-sandbox` 的 `subnet` 内，以及整份 compose 里只有一处 `ipv4_address`。
-
-**沙箱镜像里没预装 MCP 客户端**，脚本需要自己 `pip install mcp`（装进 `/workspace/python-packages`）。这会让每次沙箱冷启动多一次几十秒的安装。要消掉就往 `deploy/sandbox/Dockerfile` 里加一行 `pip install mcp`，`sandbox-image-loader` 下次起栈时会重新构建。
+上图只说明历史网络拓扑，不是重新开启该能力的操作指南。
 
 ### 其它
 
 - `/workspace` 挂载带 `noexec`：Agent 生成的 `./script.sh` 和编译产物无法直接执行（`python x.py` 可以，因为被 exec 的是 `/usr/local/bin/python`）。这是既有行为。
-- mock ERP 的数据是**内存态**，重启即重置，种子数据固定（`random.Random(42)`）。
-- 容器以 root 运行。改成非 root 需要额外处理 `./src/skills` 与 `download-data` 的属主。
+- Mock ERP 仅保留在 CI 契约测试覆盖文件中，不进入默认 Compose 或发布产物。
+- Java ERP 镜像以非 root 用户运行；其余容器仍需逐项收紧运行身份。
 
 ## 故障排查
 
@@ -222,19 +178,11 @@ Agent 侧怎么知道能用：`src/agent/memory/AGENTS.md` 里让它先跑 `os.g
 
 `prune_orphans()` 已在 backend 启动时清扫。如果仍在堆积，说明 dind API 在 backend 启动时不可用（日志里会有 `Orphan prune skipped`），重启 backend 即可。
 
-**nginx 起不来，日志里 `open() "/etc/nginx/htpasswd" failed` 或 `is a directory`**
-
-`deploy/nginx/htpasswd` 不存在或是个目录。Docker 在 bind mount 的源路径不存在时会**自动建一个同名目录**，所以第一次 `up` 很可能把仓库里那个路径变成一个空目录。清掉再按「创建登录账号」生成：
-
-```bash
-rm -rf deploy/nginx/htpasswd
-printf 'admin:%s\n' "$(openssl passwd -apr1 '你的密码')" > deploy/nginx/htpasswd
-docker compose up -d nginx
-```
-
 **所有接口都返回 401，但明明登录了**
 
-backend 收到的 `X-Authenticated-User` 是空的。检查 `deploy/nginx/nginx.conf` 里三个 location 是否都还在设这个头，以及请求是不是绕过了 nginx 直连 backend（直连必 401，见「认证是怎么工作的」）。
+检查浏览器 `/api/auth/refresh` 是否携带 `erp_refresh` Cookie、Java ERP readiness、JWT
+公钥是否正确挂载到 backend/MCP，以及三者的 issuer/audience 是否与 `deploy/.env` 一致。
+账号状态或权限刚变化时旧 access token 返回 401 是预期行为，前端会回到登录页。
 
 **日志里出现 `Ignoring client-supplied user_id`**
 
@@ -242,7 +190,7 @@ backend 收到的 `X-Authenticated-User` 是空的。检查 `deploy/nginx/nginx.
 
 **nginx 502**
 
-`docker compose ps` 看 backend/frontend 是否 healthy。启动顺序是 postgres → mock-erp → mcp → dind → sandbox-image-loader → backend → frontend → nginx，backend 的 `start_period` 是 90s（要建预热池）。
+`docker compose ps` 看所有服务是否 healthy。业务主链路的启动顺序是 MySQL/Redis healthy → Java ERP/Flyway ready → MCP healthy → backend/frontend → nginx；PostgreSQL 与 dind/沙箱链路按各自依赖并行启动。backend 的 `start_period` 是 90s（要建预热池）。
 
 **沙箱里 `curl http://mcp:9000` 失败**
 
@@ -252,3 +200,7 @@ backend 收到的 `X-Authenticated-User` 是空的。检查 `deploy/nginx/nginx.
 
 `POSTGRES_USER`、`POSTGRES_PASSWORD` 和 `POSTGRES_DB` 只在数据卷**首次初始化**时生效。
 生产环境应通过受控凭据轮换修改，不能直接执行 `docker compose down -v`，后者会删除全部数据。
+
+MySQL 的 `MYSQL_*` 初始化变量也只在 `mysql-data` 卷首次初始化时生效。宿主机旧数据库的切换必须使用 [mysql/README.md](mysql/README.md) 的预检、快照、校验与回退流程，不要手工重建数据卷。
+
+Redis 只加入内部 `data` 网络，不发布 6379。它只保存零件/供应商查询缓存、登录限流和按用户隔离的最近/常用记录；不保存库存、订单、HITL 或 Agent 记忆。修改 `REDIS_PASSWORD` 后必须重建 Redis 与 Java ERP 容器，使两端同时读取新口令。

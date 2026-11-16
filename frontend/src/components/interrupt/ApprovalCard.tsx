@@ -1,15 +1,14 @@
 "use client";
 
-import { ShieldCheck, Check, X } from "lucide-react";
+import { ShieldCheck, RefreshCw } from "lucide-react";
 import { InterruptData } from "@/lib/types";
 
 interface Props {
   data: InterruptData;
-  onApprove: () => void;
-  onReject: () => void;
+  onCheckApproval: () => void;
 }
 
-export default function ApprovalCard({ data, onApprove, onReject }: Props) {
+export default function ApprovalCard({ data, onCheckApproval }: Props) {
   const orderData = data.order_data || data.tool_args || {};
 
   return (
@@ -18,12 +17,12 @@ export default function ApprovalCard({ data, onApprove, onReject }: Props) {
         <div className="flex items-center gap-2 mb-3">
           <ShieldCheck size={16} className="text-blue-600" />
           <span className="text-sm font-medium text-blue-800">
-            订单审批确认
+            等待独立审批
           </span>
         </div>
 
         <p className="text-xs text-blue-700 mb-3">
-          以下操作需要您的审批确认：
+          申请已进入管理员审批队列。申请人不能审批自己的操作：
           {data.tool_name && (
             <span className="font-medium"> {data.tool_name}</span>
           )}
@@ -51,21 +50,13 @@ export default function ApprovalCard({ data, onApprove, onReject }: Props) {
           </div>
         )}
 
-        {/* 审批按钮 */}
         <div className="flex gap-3">
           <button
-            onClick={onApprove}
-            className="flex items-center gap-1.5 px-4 py-2 bg-green-600 hover:bg-green-700 text-white text-sm font-medium rounded-lg transition-colors"
+            onClick={onCheckApproval}
+            className="flex items-center gap-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-colors"
           >
-            <Check size={14} />
-            批准执行
-          </button>
-          <button
-            onClick={onReject}
-            className="flex items-center gap-1.5 px-4 py-2 bg-red-500 hover:bg-red-600 text-white text-sm font-medium rounded-lg transition-colors"
-          >
-            <X size={14} />
-            拒绝
+            <RefreshCw size={14} />
+            检查审批结果并继续
           </button>
         </div>
       </div>

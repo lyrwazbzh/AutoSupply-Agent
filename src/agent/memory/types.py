@@ -14,6 +14,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 SEMANTIC = "semantic"      # 语义记忆：稳定事实（偏好、画像、领域知识）
@@ -25,6 +26,13 @@ MEMORY_TYPES = (SEMANTIC, EPISODIC, PROCEDURAL)
 HOT = "hot"
 WARM = "warm"
 COLD = "cold"
+
+
+class MemorySearchStatus(str, Enum):
+    SUCCESS = "success"
+    NO_RESULT = "no_result"
+    UNAVAILABLE = "memory_unavailable"
+    DEGRADED = "retrieval_degraded"
 
 
 def now_iso() -> str:
@@ -68,6 +76,7 @@ class MemoryItem:
     entities: List[str] = field(default_factory=list)
     idempotency_key: str = ""
     source: Dict[str, Any] = field(default_factory=dict)
+    structured: Dict[str, Any] = field(default_factory=dict)
     confidence: float = 0.6
     evidence: str = ""
 
@@ -109,6 +118,7 @@ class MemoryItem:
             "entities": list(self.entities),
             "idempotency_key": self.idempotency_key,
             "source": dict(self.source),
+            "structured": dict(self.structured),
             "confidence": self.confidence,
             "evidence": self.evidence,
             "valid_from": self.valid_from,
@@ -156,6 +166,11 @@ class MemoryItem:
             entities=[str(e) for e in (data.get("entities") or []) if e],
             idempotency_key=str(data.get("idempotency_key") or ""),
             source=data.get("source") if isinstance(data.get("source"), dict) else {},
+            structured=(
+                data.get("structured")
+                if isinstance(data.get("structured"), dict)
+                else {}
+            ),
             confidence=confidence,
             evidence=str(data.get("evidence") or ""),
             valid_from=str(data.get("valid_from") or ""),
@@ -233,6 +248,7 @@ class MemoryItem:
             self.content,
             " ".join(self.tags),
             " ".join(self.entities),
+            _structured_search_text(self.structured),
         ]
         return " ".join(p for p in parts if p)
 
@@ -244,3 +260,21 @@ class MemoryItem:
         self.invalidated_at = at or now_iso()
         self.supersedes = by
         self.updated_at = self.invalidated_at
+
+
+def _structured_search_text(value: Any) -> str:
+    """把结构化情节中的标量展平用于检索，不把 JSON 标点当业务词。"""
+    if isinstance(value, dict):
+        return " ".join(_structured_search_text(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_structured_search_text(item) for item in value)
+    if value is None:
+        return ""
+    return str(value)
+
+
+@dataclass
+class MemorySearchResult:
+    status: MemorySearchStatus
+    hits: List[tuple[MemoryItem, float]] = field(default_factory=list)
+    detail: str = ""

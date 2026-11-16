@@ -92,6 +92,16 @@ class WriteAuditRepository:
                     event_key="requested",
                     detail={"payload_hash": digest},
                 )
+                if spec.requires_approval:
+                    cur.execute(
+                        """
+                        INSERT INTO audit.approval_tasks(
+                            task_id, operation_id, requester_id, status
+                        ) VALUES (%s, %s, %s, 'PENDING')
+                        ON CONFLICT (operation_id) DO NOTHING
+                        """,
+                        (f"approval:{operation_id}", operation_id, user_id),
+                    )
                 cur.execute(
                     """
                     INSERT INTO audit.reconcile_jobs(operation_id, job_status, next_run_at)
@@ -119,151 +129,147 @@ class WriteAuditRepository:
             event_key="approval_pending",
         )
 
-    def mark_approval(
+    def list_pending_approvals(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Return the independent maker-checker queue without conversation data."""
+        with self.pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT t.task_id, t.operation_id, t.requester_id,
+                       t.status AS approval_status, t.created_at,
+                       o.tool_name, o.domain, o.action, o.payload_redacted,
+                       o.payload_hash, o.policy_id, o.policy_version
+                FROM audit.approval_tasks t
+                JOIN audit.write_operations o USING (operation_id)
+                WHERE t.status = 'PENDING'
+                  AND o.status = 'PENDING_APPROVAL'
+                ORDER BY t.created_at, t.task_id
+                LIMIT %s
+                """,
+                (max(1, min(int(limit), 500)),),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def decide_approval(
         self,
         operation_id: str,
         *,
-        approved: bool,
+        decision: str,
         actor_id: str,
-        detail: dict[str, Any] | None = None,
-    ) -> None:
-        status = "APPROVED" if approved else "REJECTED"
-        event_type = "approved" if approved else "rejected"
-        self._transition(
-            operation_id,
-            status=status,
-            event_type=event_type,
-            event_key=event_type,
-            actor_id=actor_id,
-            detail=detail,
-            complete_job=not approved,
-        )
-
-    def mark_thread_approval(
-        self,
-        thread_id: str,
-        *,
-        approved: bool,
-        actor_id: str,
-        operation_ids: list[str] | None = None,
-    ) -> list[str]:
-        with self.pool.connection() as conn, conn.cursor() as cur:
-            if operation_ids:
-                cur.execute(
-                    """
-                    SELECT operation_id FROM audit.write_operations
-                    WHERE thread_id = %s AND status = 'PENDING_APPROVAL'
-                      AND operation_id = ANY(%s)
-                    ORDER BY created_at
-                    """,
-                    (thread_id, operation_ids),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT operation_id FROM audit.write_operations
-                    WHERE thread_id = %s AND status = 'PENDING_APPROVAL'
-                    ORDER BY created_at
-                    """,
-                    (thread_id,),
-                )
-            selected = [str(row["operation_id"]) for row in cur.fetchall()]
-        for operation_id in selected:
-            self.mark_approval(operation_id, approved=approved, actor_id=actor_id)
-        return selected
-
-    def mark_thread_decisions(
-        self,
-        thread_id: str,
-        *,
-        decisions: list[dict[str, Any]],
-        actor_id: str,
-    ) -> list[str]:
-        """Apply approve/reject decisions to explicitly identified operations.
-
-        Decisions are intentionally not matched by list position.  A thread can
-        have multiple pending writes and the approval must be bound to the
-        operation_id shown in the interrupt payload.  ``edit`` is not part of
-        the current protocol; clients must reject and submit a new request.
-        """
-        normalized = [
-            {
-                "operation_id": str(item.get("operation_id") or ""),
-                "type": str(item.get("type") or "").lower(),
-                "payload_hash": str(item.get("payload_hash") or ""),
-            }
-            for item in decisions
-        ]
-        invalid = [item["type"] for item in normalized if item["type"] not in {"approve", "reject"}]
-        if invalid:
-            raise ValueError(f"不支持的审批决定: {invalid[0] or '<empty>'}")
-        missing_ids = [item for item in normalized if not item["operation_id"]]
-        if missing_ids:
-            raise ValueError("每条审批决定必须包含 operation_id")
-        operation_ids = [item["operation_id"] for item in normalized]
-        if len(operation_ids) != len(set(operation_ids)):
-            raise ValueError("审批决定包含重复的 operation_id")
+        note: str = "",
+        expected_payload_hash: str = "",
+    ) -> dict[str, Any]:
+        """Decide exactly one task by operation_id and enforce maker != checker."""
+        normalized = (decision or "").strip().lower()
+        if normalized not in {"approve", "reject"}:
+            raise ValueError("decision must be approve or reject")
+        actor = (actor_id or "").strip()
+        if not actor:
+            raise ValueError("actor_id is required")
 
         with self.pool.connection() as conn:
             with conn.transaction(), conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT * FROM audit.write_operations
-                    WHERE thread_id = %s AND status = 'PENDING_APPROVAL'
-                    ORDER BY created_at, operation_id
-                    FOR UPDATE
+                    SELECT t.task_id, t.operation_id, t.requester_id,
+                           t.status AS task_status, t.decision_note,
+                           o.thread_id, o.user_id, o.agent_name, o.tool_name,
+                           o.payload_hash, o.status AS operation_status
+                    FROM audit.approval_tasks t
+                    JOIN audit.write_operations o USING (operation_id)
+                    WHERE t.operation_id = %s
+                    FOR UPDATE OF t, o
                     """,
-                    (thread_id,),
+                    (operation_id,),
                 )
-                operations = [dict(row) for row in cur.fetchall()]
-                operations_by_id = {
-                    str(operation["operation_id"]): operation for operation in operations
-                }
-                unknown = [
-                    operation_id
-                    for operation_id in operation_ids
-                    if operation_id not in operations_by_id
-                ]
-                if unknown:
-                    raise ValueError(f"不存在或不属于当前会话的待审批操作: {unknown[0]}")
-                if len(normalized) != len(operations):
-                    raise ValueError(
-                        f"审批决定数量({len(normalized)})与待审批写操作数量({len(operations)})不一致"
+                row = cur.fetchone()
+                if not row:
+                    raise KeyError(f"unknown approval operation: {operation_id}")
+                operation = dict(row)
+                if actor == str(operation["requester_id"]):
+                    raise PermissionError("申请人不能审批自己的写操作")
+                if operation["task_status"] != "PENDING" or operation["operation_status"] != "PENDING_APPROVAL":
+                    raise ValueError("该审批任务已经处理或写操作不再等待审批")
+                if expected_payload_hash and expected_payload_hash != str(operation["payload_hash"]):
+                    raise ValueError("审批载荷已变化，必须重新检查后再审批")
+
+                approved = normalized == "approve"
+                target = "APPROVED" if approved else "REJECTED"
+                cur.execute(
+                    """
+                    UPDATE audit.approval_tasks
+                    SET status = %s, decided_by = %s, decision_note = %s,
+                        decided_at = now(), updated_at = now()
+                    WHERE operation_id = %s
+                    """,
+                    (target, actor, (note or "")[:2000], operation_id),
+                )
+                self._update_operation(cur, operation_id, status=target)
+                self._insert_event(
+                    cur,
+                    operation=operation,
+                    event_type="approved" if approved else "rejected",
+                    event_key="approved" if approved else "rejected",
+                    actor_id=actor,
+                    detail={"decision": normalized, "note": (note or "")[:2000]},
+                )
+                if not approved:
+                    cur.execute(
+                        """
+                        UPDATE audit.reconcile_jobs
+                        SET job_status = 'DONE', locked_by = NULL,
+                            locked_at = NULL, updated_at = now()
+                        WHERE operation_id = %s
+                        """,
+                        (operation_id,),
                     )
-                for decision in normalized:
-                    operation_id = decision["operation_id"]
-                    operation = operations_by_id[operation_id]
-                    decision_type = decision["type"]
-                    expected_hash = decision["payload_hash"]
-                    if expected_hash and expected_hash != str(operation["payload_hash"]):
-                        raise ValueError(
-                            f"审批载荷已变化，必须重新生成审批: {operation_id}"
-                        )
-                    approved = decision_type == "approve"
-                    self._update_operation(
-                        cur,
-                        operation_id,
-                        status="APPROVED" if approved else "REJECTED",
-                    )
-                    self._insert_event(
-                        cur,
-                        operation=operation,
-                        event_type="approved" if approved else "rejected",
-                        event_key="approved" if approved else "rejected",
-                        actor_id=actor_id,
-                        detail={"decision": decision_type},
-                    )
-                    if not approved:
-                        cur.execute(
-                            """
-                            UPDATE audit.reconcile_jobs
-                            SET job_status = 'DONE', locked_by = NULL,
-                                locked_at = NULL, updated_at = now()
-                            WHERE operation_id = %s
-                            """,
-                            (operation_id,),
-                        )
-                return [str(operation["operation_id"]) for operation in operations]
+                cur.execute(
+                    """
+                    SELECT t.*, o.tool_name, o.payload_hash, o.status AS operation_status
+                    FROM audit.approval_tasks t
+                    JOIN audit.write_operations o USING (operation_id)
+                    WHERE t.operation_id = %s
+                    """,
+                    (operation_id,),
+                )
+                return dict(cur.fetchone())
+
+    def approval_decisions(
+        self,
+        operation_ids: list[str],
+        *,
+        thread_id: str,
+        requester_id: str,
+    ) -> list[dict[str, str]]:
+        """Resolve checkpoint actions from durable decisions in checkpoint order."""
+        if not operation_ids or len(operation_ids) != len(set(operation_ids)):
+            raise ValueError("待恢复操作必须包含唯一 operation_id")
+        with self.pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT t.operation_id, t.status, t.decision_note
+                FROM audit.approval_tasks t
+                JOIN audit.write_operations o USING (operation_id)
+                WHERE t.operation_id = ANY(%s)
+                  AND o.thread_id = %s AND o.user_id = %s
+                """,
+                (operation_ids, thread_id, requester_id),
+            )
+            rows = {str(row["operation_id"]): dict(row) for row in cur.fetchall()}
+        missing = [operation_id for operation_id in operation_ids if operation_id not in rows]
+        if missing:
+            raise ValueError(f"审批任务不存在或不属于申请人: {missing[0]}")
+        pending = [operation_id for operation_id in operation_ids if rows[operation_id]["status"] == "PENDING"]
+        if pending:
+            raise RuntimeError(f"写操作仍在等待独立审批: {pending[0]}")
+        decisions: list[dict[str, str]] = []
+        for operation_id in operation_ids:
+            row = rows[operation_id]
+            decision = "approve" if row["status"] == "APPROVED" else "reject"
+            item = {"type": decision}
+            if decision == "reject" and row.get("decision_note"):
+                item["message"] = str(row["decision_note"])
+            decisions.append(item)
+        return decisions
 
     def mark_dispatching(self, operation_id: str) -> None:
         self._transition(

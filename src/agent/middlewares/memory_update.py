@@ -25,7 +25,6 @@ from ..memory.run_config import current_thread_id
 class MemoryUpdateMiddleware(AgentMiddleware):
     """用户偏好自动更新中间件（WARM 层写入口）。"""
 
-    # 保留旧常量，避免其它模块引用失效
     CHART_KEYWORDS = CHART_KEYWORDS
     OUTPUT_KEYWORDS = OUTPUT_KEYWORDS
 
@@ -34,7 +33,6 @@ class MemoryUpdateMiddleware(AgentMiddleware):
         self._store = store
         self._user_id = user_id or "default_user"
         self._config = config or DEFAULT_MEMORY_CONFIG
-        self._migrated = False
         self.tools = []
 
     @property
@@ -48,10 +46,6 @@ class MemoryUpdateMiddleware(AgentMiddleware):
 
         try:
             keeper = MemoryKeeper(self._store, self._user_id, self._config)
-
-            if not self._migrated:
-                self._migrated = True
-                keeper.migrate_legacy_preferences()
 
             messages = state.get("messages", []) if isinstance(state, dict) else []
             if not messages:

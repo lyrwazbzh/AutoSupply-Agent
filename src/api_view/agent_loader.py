@@ -3,13 +3,21 @@ AgentLoader 单例
 持有 agent 实例、PostgreSQL 资源、create_config、save/get_display_messages
 """
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from ..agent.audit.repository import WriteAuditRepository
+from ..agent.config import AGENT_SESSION_MAX_ENTRIES, AGENT_SESSION_TTL_SECONDS
 from ..agent.log_utils import web_logger
 from ..agent.schema import PROCUREMENT_CONTEXT_CONFIG_KEY, ProcurementContext
+from ..runtime_state import (
+    LeaseHandle,
+    RuntimeLeaseConflict,
+    RuntimeStateRepository,
+    new_instance_id,
+)
 from .app_repository import AppRepository
 
 
@@ -19,10 +27,17 @@ class AgentSession:
 
     user_id: str
     username: str
+    roles: frozenset[str]
+    permissions: frozenset[str]
+    authz_version: int
+    capability_fingerprint: tuple
     agent: Any
     run_lock: asyncio.Lock
     warm_memory_middleware: Any
     user_context: ProcurementContext
+    created_at: float
+    last_accessed_at: float
+    ownership_lease: LeaseHandle
 
 
 class AgentLoader:
@@ -48,11 +63,62 @@ class AgentLoader:
         self._async_pg_pool = None
         self._app_repository: AppRepository | None = None
         self._write_audit_repository: WriteAuditRepository | None = None
+        self._runtime_state_repository: RuntimeStateRepository | None = None
+        self.instance_id = new_instance_id()
         self._sessions: dict[str, AgentSession] = {}
         self._resources_lock: asyncio.Lock | None = None
         self._sessions_lock: asyncio.Lock | None = None
         self._session_build_locks: dict[str, asyncio.Lock] = {}
         web_logger.info("AgentLoader initialized")
+
+    @staticmethod
+    def _capability_fingerprint(
+        user_id: str,
+        username: str,
+        roles: frozenset[str],
+        permissions: frozenset[str],
+        authz_version: int,
+    ) -> tuple:
+        """只包含影响 Agent 能力的稳定身份，不包含短期 access token。"""
+        return (
+            user_id,
+            username,
+            tuple(sorted(roles)),
+            tuple(sorted(permissions)),
+            int(authz_version),
+        )
+
+    def _prune_sessions_locked(
+        self, now: float, *, incoming_user_id: str
+    ) -> list[AgentSession]:
+        """在 ``_sessions_lock`` 内执行 TTL 与 LRU 淘汰，运行中的会话不驱逐。"""
+        evicted: list[AgentSession] = []
+        ttl = max(1, int(AGENT_SESSION_TTL_SECONDS))
+        expired = [
+            user_id
+            for user_id, session in self._sessions.items()
+            if not session.run_lock.locked()
+            and now - session.last_accessed_at >= ttl
+        ]
+        for user_id in expired:
+            session = self._sessions.pop(user_id, None)
+            if session is not None:
+                evicted.append(session)
+
+        limit = max(1, int(AGENT_SESSION_MAX_ENTRIES))
+        if incoming_user_id in self._sessions:
+            return evicted
+        candidates = sorted(
+            (session.last_accessed_at, user_id)
+            for user_id, session in self._sessions.items()
+            if not session.run_lock.locked()
+        )
+        while len(self._sessions) >= limit and candidates:
+            _, user_id = candidates.pop(0)
+            session = self._sessions.pop(user_id, None)
+            if session is not None:
+                evicted.append(session)
+        return evicted
 
     async def _ensure_resources(self):
         """初始化所有用户共享的 PostgreSQL Store / Checkpointer。"""
@@ -94,6 +160,7 @@ class AgentLoader:
             setup_memory_search_schema()
             self._app_repository = AppRepository()
             self._write_audit_repository = WriteAuditRepository()
+            self._runtime_state_repository = RuntimeStateRepository()
             web_logger.info("Shared Agent resources initialized")
         except Exception as e:
             web_logger.error(f"Failed to initialize shared Agent resources: {e}")
@@ -109,46 +176,131 @@ class AgentLoader:
         """Close both PostgreSQL pools and discard agents bound to them."""
         from ..database import close_async_pg_pool, close_pg_pool
 
+        sessions = list(self._sessions.values())
+        if self._runtime_state_repository is not None:
+            await asyncio.gather(
+                *(
+                    asyncio.to_thread(
+                        self._runtime_state_repository.release,
+                        session.ownership_lease,
+                    )
+                    for session in sessions
+                ),
+                return_exceptions=True,
+            )
         self._sessions.clear()
         self.agent = None
         self._checkpointer = None
         self._store = None
         self._app_repository = None
         self._write_audit_repository = None
+        self._runtime_state_repository = None
         self._pg_pool = None
         self._async_pg_pool = None
         self._resources_ready = False
         await close_async_pg_pool()
         await asyncio.to_thread(close_pg_pool)
 
-    async def get_session(self, user_id: str, username: str = "用户") -> AgentSession:
+    async def get_session(
+        self,
+        user_id: str,
+        username: str = "用户",
+        *,
+        access_token: str = "",
+        roles: frozenset[str] | None = None,
+        permissions: frozenset[str] | None = None,
+        authz_version: int = 1,
+    ) -> AgentSession:
         """获取用户独享的 Agent 会话，避免不同用户共享 Sandbox/中间件状态。"""
         await self._ensure_resources()
+
+        normalized_roles = frozenset(roles or ())
+        normalized_permissions = frozenset(permissions or ())
+        fingerprint = self._capability_fingerprint(
+            user_id,
+            username,
+            normalized_roles,
+            normalized_permissions,
+            authz_version,
+        )
+        now = time.monotonic()
+
+        if self._runtime_state_repository is None:
+            raise RuntimeError("Runtime state repository is not initialized")
+        ownership = await asyncio.to_thread(
+            self._runtime_state_repository.acquire_session,
+            user_id,
+            owner_id=self.instance_id,
+            ttl_seconds=AGENT_SESSION_TTL_SECONDS,
+            metadata={
+                "username": username,
+                "authz_version": int(authz_version),
+                "capability_fingerprint": list(fingerprint),
+            },
+        )
+        if ownership is None:
+            raise RuntimeLeaseConflict("该用户的 Agent 正在另一个实例执行，请稍后重试")
 
         if self._sessions_lock is None:
             self._sessions_lock = asyncio.Lock()
         async with self._sessions_lock:
+            evicted = self._prune_sessions_locked(now, incoming_user_id=user_id)
             existing = self._sessions.get(user_id)
+            if existing is not None and existing.capability_fingerprint == fingerprint:
+                existing.last_accessed_at = now
+                existing.ownership_lease = ownership
+                selected = existing
+            else:
+                selected = None
             if existing is not None:
-                return existing
+                if selected is None:
+                    self._sessions.pop(user_id, None)
             build_lock = self._session_build_locks.setdefault(user_id, asyncio.Lock())
+
+        for stale in evicted:
+            # acquire_session() already renewed ownership for the incoming user.
+            # Same-owner renewals intentionally preserve the token so an active
+            # heartbeat is not invalidated; releasing the expired local cache's
+            # identical token here would therefore delete the renewed row.
+            if stale.user_id != user_id:
+                await asyncio.to_thread(
+                    self._runtime_state_repository.release, stale.ownership_lease
+                )
+        if selected is not None:
+            return selected
 
         async with build_lock:
             async with self._sessions_lock:
                 existing = self._sessions.get(user_id)
-                if existing is not None:
+                if existing is not None and existing.capability_fingerprint == fingerprint:
+                    existing.last_accessed_at = time.monotonic()
+                    existing.ownership_lease = ownership
                     return existing
 
-            agent, warm_memory_middleware, user_context = await asyncio.to_thread(
-                self._build_agent_for_user, user_id, username
-            )
+            try:
+                agent, warm_memory_middleware, user_context = await asyncio.to_thread(
+                    self._build_agent_for_user, user_id, username, access_token,
+                    normalized_roles, normalized_permissions, authz_version
+                )
+            except Exception:
+                async with self._sessions_lock:
+                    self._session_build_locks.pop(user_id, None)
+                raise
+            created_at = time.monotonic()
             session = AgentSession(
                 user_id=user_id,
                 username=username,
+                roles=normalized_roles,
+                permissions=normalized_permissions,
+                authz_version=authz_version,
+                capability_fingerprint=fingerprint,
                 agent=agent,
                 run_lock=asyncio.Lock(),
                 warm_memory_middleware=warm_memory_middleware,
                 user_context=user_context,
+                created_at=created_at,
+                last_accessed_at=created_at,
+                ownership_lease=ownership,
             )
             async with self._sessions_lock:
                 self._sessions[user_id] = session
@@ -159,7 +311,10 @@ class AgentLoader:
             web_logger.info(f"Agent session ready for user: {user_id}")
             return session
 
-    def _build_agent_for_user(self, user_id: str, username: str):
+    def _build_agent_for_user(
+        self, user_id: str, username: str, access_token: str,
+        roles: frozenset[str], permissions: frozenset[str], authz_version: int
+    ):
         """在线程池中构建 Agent；其中包含 Docker/PostgreSQL 同步 I/O。"""
         from ..agent.main_agent import create_main_agent
         from ..agent.middlewares.warm_memory import WarmMemoryMiddleware
@@ -167,6 +322,9 @@ class AgentLoader:
         context = ProcurementContext(
             user_id=user_id,
             username=username,
+            roles=sorted(roles),
+            permissions=sorted(permissions),
+            authz_version=authz_version,
         )
         warm_memory_middleware = WarmMemoryMiddleware(
             store=self._store,
@@ -179,6 +337,8 @@ class AgentLoader:
             store=self._store,
             write_audit_repository=self._write_audit_repository,
             warm_memory_middleware=warm_memory_middleware,
+            mcp_auth_token=access_token,
+            permissions=permissions if access_token else None,
         )
         return agent, warm_memory_middleware, context
 
@@ -192,6 +352,12 @@ class AgentLoader:
         if self._write_audit_repository is None:
             raise RuntimeError("Agent resources are not initialized")
         return self._write_audit_repository
+
+    @property
+    def runtime_state_repository(self) -> RuntimeStateRepository:
+        if self._runtime_state_repository is None:
+            raise RuntimeError("Agent resources are not initialized")
+        return self._runtime_state_repository
 
     def create_config(self, thread_id: str, user_id: str = "default_user") -> dict:
         """创建 LangGraph 配置并附带服务端生成的请求级采购上下文。"""

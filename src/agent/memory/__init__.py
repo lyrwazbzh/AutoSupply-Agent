@@ -12,8 +12,8 @@ from .config import DEFAULT_MEMORY_CONFIG, MemoryConfig
 from .keeper import MemoryKeeper
 from .namespaces import (
     episodic_ns,
-    legacy_preferences_ns,
     org_policies_ns,
+    preferences_ns,
     procedural_ns,
     semantic_ns,
     type_ns,
@@ -27,6 +27,8 @@ from .types import (
     SEMANTIC,
     WARM,
     MemoryItem,
+    MemorySearchResult,
+    MemorySearchStatus,
 )
 
 __all__ = [
@@ -34,9 +36,11 @@ __all__ = [
     "MemoryConfig",
     "DEFAULT_MEMORY_CONFIG",
     "MemoryItem",
+    "MemorySearchResult",
+    "MemorySearchStatus",
     "MEMORY_TYPES",
     "SEMANTIC", "EPISODIC", "PROCEDURAL",
     "HOT", "WARM", "COLD",
     "semantic_ns", "episodic_ns", "procedural_ns",
-    "org_policies_ns", "legacy_preferences_ns", "type_ns",
+    "org_policies_ns", "preferences_ns", "type_ns",
 ]

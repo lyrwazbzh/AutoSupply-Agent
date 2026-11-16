@@ -79,10 +79,8 @@ ci_wait_healthy() {
 
 # 诊断落盘。失败时把栈的状态与全量日志留下来 —— 这是 CI 上唯一能事后复盘的东西。
 #
-# 全量日志进 artifact，**但 nginx / backend 的尾巴同时打到 stderr**：2026-10-02
-# 排查 auth-path 那次，根因就是 nginx 错误日志里的一行
-#   open() "/etc/nginx/htpasswd" failed (13: Permission denied)
-# 而它当时只躺在 artifact 里 —— 要先下 artifact、解压、翻文件才看得到。
+# 全量日志进 artifact，**但 nginx / backend 的尾巴同时打到 stderr**，避免必须
+# 下载 artifact 才能看到网关启动错误。
 # 这两行 tail 的代价可以忽略，省掉的是整轮"猜→push→等 CI"。
 ci_dump() {
     local out="${1:-/tmp/erp-agent-ci-diagnostics}"
@@ -108,7 +106,7 @@ ci_http_code() {
 }
 
 # awk 就地改/追加一个 KEY=VALUE。比 sed -i 可移植（GNU/BSD 语法不同），
-# 与 deploy/set_internal_token.sh 的 write_var 是同一手法。
+# 用临时文件替换，兼容 GNU/BSD 工具差异。
 ci_set_var() {
     local file="$1" key="$2" val="$3"
     awk -v key="$key" -v val="$val" '

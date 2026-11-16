@@ -7,8 +7,8 @@
 # 刻意不使用 ${VAR} 插值取密钥 —— 项目根的 .env 是本地开发配置（含 localhost
 # 地址），compose 会自动把它当作插值源，混用会产生歧义。
 #
-# 单副本约束：SandboxManager / sandbox_holder / AgentLoader 全是进程内状态，
-# 不要 --scale backend=N，也不要给 uvicorn 加 workers。详见 README 部署章节。
+# AgentSession、运行租约与沙箱分配以 PostgreSQL 为准；实例内对象只是缓存。
+# 多副本的生成文件下载仍需粘性路由或共享 artifact 存储，详见 README。
 
 name: erp-agent
 
@@ -43,6 +43,74 @@ services:
       timeout: 5s
       retries: 12
       start_period: 20s
+
+  mysql:
+    image: mysql:8.0.40
+    <<: *logging
+    restart: unless-stopped
+    env_file: [./deploy/.env]
+    command:
+      - "--character-set-server=utf8mb4"
+      - "--collation-server=utf8mb4_0900_ai_ci"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    <<: *logging
+    restart: unless-stopped
+    env_file: [./deploy/.env]
+    command:
+      - sh
+      - -c
+      - >
+        exec redis-server
+        --requirepass "$$REDIS_PASSWORD"
+        --appendonly yes
+        --maxmemory 256mb
+        --maxmemory-policy noeviction
+    volumes:
+      - redis-data:/data
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping 2>/dev/null | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 15s
+
+  java-erp:
+    build:
+      context: ./java_erp
+      dockerfile: Dockerfile
+    image: erp-agent-java-erp:local
+    <<: *logging
+    restart: unless-stopped
+    env_file: [./deploy/.env]
+    environment:
+      SPRING_PROFILES_ACTIVE: compose
+      ERP_DB_HOST: mysql
+      ERP_DB_PORT: "3306"
+    volumes:
+      - ./deploy/secrets/erp-jwt-private.pem:/run/secrets/erp-jwt-private.pem:ro
+      - ./deploy/secrets/erp-jwt-public.pem:/run/secrets/erp-jwt-public.pem:ro
+    networks: [data]
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/actuator/health/readiness"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 45s
 
   # ============================================================
   # 沙箱用的 Docker daemon
@@ -117,22 +185,6 @@ services:
       dind: { condition: service_healthy }
 
   # ============================================================
-  # 假 ERP（真 ERP 未开源，这里给一个行为一致的替身）
-  # ============================================================
-  mock-erp:
-    build: { context: ./deploy/mock-erp }
-    image: erp-mock:local
-    <<: *logging
-    restart: unless-stopped
-    networks: [data]
-    healthcheck:
-      test: ["CMD", "python", "-c",
-             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8081/health',timeout=3).status==200 else 1)"]
-      interval: 15s
-      timeout: 5s
-      retries: 6
-
-  # ============================================================
   # MCP Server —— 必须在 backend 之前就绪（Agent 初始化要拉 23 个工具）
   # ============================================================
   mcp:
@@ -141,11 +193,17 @@ services:
     <<: *logging
     restart: unless-stopped
     command: ["python", "-m", "src.mcp_server.server_main"]
+    env_file: [./deploy/.env]
     environment:
-      ERP_BASE_URL: http://mock-erp:8081
+      ERP_BASE_URL: http://java-erp:8080
       LANGGRAPH_STRICT_MSGPACK: "true"
       MCP_HOST: 0.0.0.0
       MCP_PORT: "9000"
+      MCP_AUTH_ENABLED: "true"
+      JWT_PUBLIC_KEY_PATH: /run/secrets/erp-jwt-public.pem
+      JWT_AUDIENCE: mcp
+    volumes:
+      - ./deploy/secrets/erp-jwt-public.pem:/run/secrets/erp-jwt-public.pem:ro
     networks:
       data: {}
       # 静态 IP：backend 把它写进沙箱容器的 /etc/hosts。用静态而不是每次
@@ -154,7 +212,7 @@ services:
       mcp-sandbox:
         ipv4_address: 172.31.0.10
     depends_on:
-      mock-erp: { condition: service_healthy }
+      java-erp: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "python", "-c",
              "import socket;socket.create_connection(('127.0.0.1',9000),3).close()"]
@@ -178,15 +236,16 @@ services:
       # 只覆盖容器内不可达的地址；其余配置（含 SANDBOX_IMAGE、
       # SANDBOX_WARM_POOL_SIZE、PUBLIC_BASE_URL）统一来自 deploy/.env。
       MCP_SERVER_URL: http://mcp:9000
-      ERP_BASE_URL: http://mock-erp:8081
+      ERP_BASE_URL: http://java-erp:8080
       DOCKER_HOST: tcp://dind:2375
       # 容器部署必须关：否则沙箱不可用时会在 backend 进程环境里
       # （含 CHATANYWHERE_API_KEY）执行模型生成的代码。
       ALLOW_LOCAL_SHELL_FALLBACK: "false"
-      # 认人由 nginx 的 auth_basic 做，backend 只信它注入的 X-Authenticated-User。
-      # 前提是 backend 不对外发布端口 —— compose 里确实没有 ports，
-      # 一旦加上，任何人都能伪造这个头，认证形同虚设。
-      AUTH_MODE: proxy
+      # Java ERP 是唯一身份签发方；backend 只接受其 RS256 访问令牌。
+      AUTH_MODE: jwt
+      JWT_PUBLIC_KEY_PATH: /run/secrets/erp-jwt-public.pem
+      JWT_ISSUER: java-erp
+      JWT_AUDIENCE: assistant-api
     volumes:
       # 可写：web_fetch 会把沙箱里验证过的 Skill 写回这里，然后由
       # SkillsSyncMiddleware 再推回沙箱。
@@ -195,9 +254,11 @@ services:
       - ./src/skills:/app/src/skills
       # 用户隔离的临时 Artifact；应用按 TTL 自动清理。
       - artifact-data:/app/.runtime/artifacts
+      - ./deploy/secrets/erp-jwt-public.pem:/run/secrets/erp-jwt-public.pem:ro
     networks: [edge, data, sandbox]
     depends_on:
       postgres:             { condition: service_healthy }
+      java-erp:             { condition: service_healthy }
       mcp:                  { condition: service_healthy }
       dind:                 { condition: service_healthy }
       sandbox-image-loader: { condition: service_completed_successfully }
@@ -300,10 +361,7 @@ services:
       # TLS 开启时（TLS_ENABLED=1）才需要从外部访问 443。留空时 compose
       # 仍然映射但没人会从外面连进来 —— 不额外挡，靠 nginx 上的 if 控制。
       - "${HTTPS_PORT:-443}:443"
-    # 独立的 env 文件：nginx 只需要 INTERNAL_AUTH_TOKEN 和 TLS_ENABLED，
-    # 不该顺带拿到后端密钥。文件含密钥、不入库，所以标 required: false ——
-    # 没建也能起来（等于不校验，backend 会在启动日志里打 WARNING）。容器部署应当先
-    #   cp deploy/nginx.env.example deploy/nginx.env && sh deploy/set_internal_token.sh
+    # nginx 只读取 TLS 开关，不持有登录密码、JWT 私钥或后端密钥。
     env_file:
       - path: ./deploy/nginx.env
         required: false
@@ -312,23 +370,18 @@ services:
       # 镜像入口脚本会把 templates/*.template 用 envsubst 渲染进
       # /etc/nginx/conf.d/，nginx.conf 里 include 的就是渲染结果。
       - ./deploy/nginx/templates:/etc/nginx/templates:ro
-      # 必须先创建这个文件（见 deploy/README.md「创建登录账号」）。
-      # 注意：Docker 在源路径不存在时会**自动建一个同名目录**，于是 nginx
-      # 报的不是"文件不存在"而是 "is a directory"，而且会在仓库里留下一个
-      # 空目录。遇到就 rm -rf deploy/nginx/htpasswd 后按文档重新生成。
-      - ./deploy/nginx/htpasswd:/etc/nginx/htpasswd:ro
       # TLS 证书目录。bootstrap.sh 始终生成一份（certbot 真证书或自签占位），
       # 保证 nginx.conf 里 ssl_certificate 的字面路径永远存在 —— 即使
       # 纯 HTTP 场景也挂载，nginx -t 才不会因为找不到证书文件而失败。
       # 目录在 .gitignore 里，不入库。
       - ./deploy/nginx/tls:/etc/nginx/tls:ro
-    networks: [edge]
+    networks: [edge, data]
     depends_on:
       backend:  { condition: service_healthy }
       frontend: { condition: service_healthy }
     healthcheck:
       # 走 /healthz（nginx 自己的常量响应，不认证）而不是 / —— 后者要
-      # Basic Auth，探针拿不到凭据只会一直 401。
+      # 登录与业务 API 的认证由应用层 JWT 完成。
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz | grep -q ok"]
       interval: 15s
       timeout: 5s
@@ -360,6 +413,8 @@ networks:
 
 volumes:
   postgres-data:
+  mysql-data:
+  redis-data:
   dind-data:
   artifact-data:
   prometheus-data:

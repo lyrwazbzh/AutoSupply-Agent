@@ -1,12 +1,13 @@
 """
-钉钉 HITL 通道适配层
+钉钉独立审批通道适配层
 
-钉钉仅做身份映射与审批卡片通道；写单仍走现有 HumanInTheLoop / order_create。
+钉钉仅做审批人身份映射与审批卡片通道；决定写入独立 approval_tasks，
+申请人会话之后只消费决定。
 支持：
 - 身份映射
 - 审批卡渲染（Interactive Card 协议字段）
 - 出站推送（HTTP webhook / 开放平台机器人，可配置）
-- 入站回调 → HITL resume
+- 入站回调 → 按 operation_id 决策
 - Stream 事件消费骨架（长连接由外部进程喂入事件）
 """
 
@@ -47,6 +48,12 @@ _DEFAULT_IDENTITY_MAP: dict[str, DingTalkIdentity] = {
         display_name="采购员演示账号",
         roles=["purchaser"],
     ),
+    "ding-admin-001": DingTalkIdentity(
+        dingtalk_userid="ding-admin-001",
+        agent_user_id="admin",
+        display_name="审批管理员演示账号",
+        roles=["admin"],
+    ),
 }
 
 
@@ -81,7 +88,7 @@ def map_dingtalk_user(
 
 @dataclass
 class DingTalkApprovalCard:
-    """审批卡片：展示固化建议，回调后转为 HITL decisions。"""
+    """审批卡片：展示固化建议，回调后更新独立审批任务。"""
 
     card_id: str
     thread_id: str
@@ -91,6 +98,7 @@ class DingTalkApprovalCard:
     summary_lines: list[str]
     total_amount: float
     idempotency_key: str
+    operation_id: str
     order_payload: dict[str, Any]
     exposure_level: str = "medium"
     interactive_card: dict[str, Any] = field(default_factory=dict)
@@ -108,6 +116,9 @@ def render_approval_card(
 ) -> DingTalkApprovalCard:
     """从订单审批载荷生成钉钉可渲染的审批卡数据。"""
     payload = frozen_suggestion.get("order_payload") or {}
+    operation_id = str(frozen_suggestion.get("operation_id") or "")
+    if not operation_id:
+        raise ValueError("审批卡必须绑定 operation_id")
     details = payload.get("orderDetail") or []
     amount = float(frozen_suggestion.get("total_amount") or payload.get("totalAmount") or 0)
     lines = [
@@ -136,14 +147,14 @@ def render_approval_card(
                         "label": {"type": "text", "text": "批准"},
                         "action_id": "approve",
                         "status": "primary",
-                        "value": {"decision": "approve", "card_id": card_id, "thread_id": thread_id},
+                        "value": {"decision": "approve", "card_id": card_id, "operation_id": operation_id},
                     },
                     {
                         "type": "button",
                         "label": {"type": "text", "text": "拒绝"},
                         "action_id": "reject",
                         "status": "warning",
-                        "value": {"decision": "reject", "card_id": card_id, "thread_id": thread_id},
+                        "value": {"decision": "reject", "card_id": card_id, "operation_id": operation_id},
                     },
                 ],
             },
@@ -159,6 +170,7 @@ def render_approval_card(
         summary_lines=lines,
         total_amount=amount,
         idempotency_key=str(frozen_suggestion.get("idempotency_key") or ""),
+        operation_id=operation_id,
         order_payload=payload,
         exposure_level=exposure_level,
         interactive_card=interactive,
@@ -176,8 +188,8 @@ def verify_dingtalk_sign(
 
     secret = secret or os.getenv("DINGTALK_CALLBACK_SECRET", "")
     if not secret:
-        # 未配置密钥时开发模式放行，生产应配置
-        return os.getenv("DINGTALK_SKIP_SIGN", "1") == "1"
+        # 仅允许开发者显式降级；未配置密钥时默认拒绝，避免回调入口 fail-open。
+        return os.getenv("DINGTALK_SKIP_SIGN", "0") == "1"
     string_to_sign = f"{timestamp}\n{secret}"
     digest = hmac.new(
         secret.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha256
@@ -190,7 +202,7 @@ def parse_approval_callback(
     body: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    将钉钉审批回调转为 LangGraph HITL resume 载荷。
+    将钉钉审批回调转为独立审批任务决定（不携带或访问对话）。
 
     期望 body：
       { "card_id", "operation_id", "dingtalk_userid", "decision": "approve"|"reject", "thread_id" }
@@ -213,7 +225,7 @@ def parse_approval_callback(
 
     userid = str(body.get("dingtalk_userid") or body.get("userId") or "")
     decision = str(body.get("decision") or "").lower()
-    thread_id = str(body.get("thread_id") or "")
+    operation_id = str(body.get("operation_id") or "")
     identity = map_dingtalk_user(userid)
 
     if identity is None:
@@ -221,36 +233,40 @@ def parse_approval_callback(
             "ok": False,
             "error": f"未映射的钉钉用户: {userid}",
             "identity": None,
-            "hitl_resume": None,
-            "thread_id": thread_id,
+            "approval_decision": None,
         }
     if decision not in ("approve", "reject"):
         return {
             "ok": False,
             "error": "decision 须为 approve|reject",
             "identity": identity.to_dict(),
-            "hitl_resume": None,
-            "thread_id": thread_id,
+            "approval_decision": None,
         }
-    if "purchaser" not in identity.roles and "admin" not in identity.roles:
+    if "admin" not in identity.roles and "approver" not in identity.roles:
         return {
             "ok": False,
-            "error": "无采购审批角色",
+            "error": "无独立审批角色",
             "identity": identity.to_dict(),
-            "hitl_resume": None,
-            "thread_id": thread_id,
+            "approval_decision": None,
         }
-
-    decision_payload: dict[str, Any] = {"type": decision}
-    if body.get("operation_id"):
-        decision_payload["operation_id"] = str(body["operation_id"])
+    if not operation_id:
+        return {
+            "ok": False,
+            "error": "审批回调缺少 operation_id",
+            "identity": identity.to_dict(),
+            "approval_decision": None,
+        }
 
     return {
         "ok": True,
         "error": None,
         "identity": identity.to_dict(),
-        "thread_id": thread_id,
-        "hitl_resume": {"decisions": [decision_payload]},
+        "approval_decision": {
+            "operation_id": operation_id,
+            "decision": decision,
+            "note": str(body.get("note") or ""),
+            "payload_hash": str(body.get("payload_hash") or ""),
+        },
         "card_id": body.get("card_id"),
     }
 
@@ -286,11 +302,11 @@ class DingTalkCardPublisher:
                 "btns": [
                     {
                         "title": "批准",
-                        "actionURL": f"https://hitl.local/approve?card_id={card.card_id}&thread_id={card.thread_id}",
+                        "actionURL": f"https://hitl.local/approve?card_id={card.card_id}&operation_id={card.operation_id}",
                     },
                     {
                         "title": "拒绝",
-                        "actionURL": f"https://hitl.local/reject?card_id={card.card_id}&thread_id={card.thread_id}",
+                        "actionURL": f"https://hitl.local/reject?card_id={card.card_id}&operation_id={card.operation_id}",
                     },
                 ],
             },

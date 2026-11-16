@@ -52,9 +52,9 @@ cd /path/to/Agent-Harness
 bash deploy/cloud/pack.sh /tmp/erp-agent-deploy.tar.gz
 ```
 
-脚本会排除全部**含密钥的文件** —— `deploy/.env`、`deploy/nginx.env`、
-`deploy/nginx/htpasswd` —— 它们在服务器上由 `bootstrap.sh` 重新生成（`nginx.env`
-从模板 `deploy/nginx.env.example` 复制）。打包完脚本会自己抽查一遍，发现这几个
+脚本会排除全部**含密钥的文件** —— `deploy/.env`、`deploy/nginx.env` 与
+`deploy/secrets/**` —— 它们在服务器上由 `bootstrap.sh` 重新生成（`nginx.env`
+从模板 `deploy/nginx.env.example` 复制）。打包完脚本会自己抽查一遍，发现这些
 路径出现在包里就直接失败退出。
 
 ### 2. 传到服务器
@@ -74,8 +74,8 @@ CHATANYWHERE_API_KEY=sk-xxxx bash deploy/cloud/bootstrap.sh <服务器IP或域�
 
 它会依次：装 Docker（走阿里云 apt 源）→ 写 `/etc/docker/daemon.json`
 （镜像加速 + 日志轮转 + 把容器网段挪到 `10.201.0.0/16` 避开云 VPC）→ 必要时建
-swap → 从 `.env.example` 生成 `deploy/.env`（随机 PostgreSQL 密码、`PUBLIC_BASE_URL`
-指向你的 IP）→ 生成 nginx 共享密钥与 Basic Auth 账号 → 构建 → 启动 → 等 healthy。
+swap → 从 `.env.example` 生成 `deploy/.env`（随机 PostgreSQL/MySQL/Redis 密码、`PUBLIC_BASE_URL`
+指向你的 IP）→ 生成 ERP RS256 密钥与一次性管理员 → 构建 → 启动 → 等 healthy。
 
 2 核机器上 `next build` 十几分钟是正常的。结束时它会打印**登录用户名和随机密码
 （只打印这一次）**。
@@ -91,7 +91,7 @@ swap → 从 `.env.example` 生成 `deploy/.env`（随机 PostgreSQL 密码、`P
 
 ```bash
 cd /root/erp-agent
-docker compose ps                                    # 七个服务，除 loader 外全 healthy
+docker compose ps                                    # 除一次性 loader 外，其余服务全 healthy
 curl -s -o /dev/null -w '%{http_code}\n' localhost/healthz   # 200
 curl -s localhost/health                             # {"status":"ok"}
 ```
@@ -102,14 +102,10 @@ curl -s localhost/health                             # {"status":"ok"}
 
 ## 五、安全
 
-- nginx 的 Basic Auth 挡在最外层，弱密码等于没有。想换密码：
-  `LOGIN_USER=admin LOGIN_PASSWORD=新密码 bash deploy/cloud/bootstrap.sh <IP>`。
-- **`INTERNAL_AUTH_TOKEN` 必须配**（bootstrap 已自动配好）。不配的话，沙箱里模型
-  生成的代码可以绕过 nginx 直连 backend 伪造 `X-Authenticated-User`，读到任意
-  用户的会话 —— 见 `deploy/README.md`「认证是怎么工作的」注意二。
-- 目前是 **HTTP 明文**。要用 HTTPS，在 nginx 前面再加一层，或把证书挂进
-  `deploy/nginx/` 后改 `nginx.conf` 加 443 server 块；有域名的话这步值得做。
-- Basic Auth 是明文传凭据的，没有 HTTPS 就只适合自己临时用，别放真实业务数据。
+- Java ERP 是唯一登录签发方；私钥仅挂载给 `java-erp`，backend/MCP 只读公钥。
+- 生产必须设置 `TLS_ENABLED=1`，脚本会同步启用刷新 Cookie 的 `Secure` 标志。
+- 角色或账号状态变更会提高 `authz_version` 并撤销刷新会话；Python 会向 Java ERP
+  做 active check，旧访问令牌立即失效。
 
 ## 六、日常运维
 
@@ -119,12 +115,12 @@ docker compose restart backend            # 重启后端（租约映射持久化
 docker compose down                       # 停栈（数据卷保留）
 docker compose up -d                      # 再起
 
-# 备份：使用 deploy/dr 的 PostgreSQL 备份链路
+# 备份：使用 deploy/dr 的 PostgreSQL + MySQL 备份链路
 bash deploy/dr/backup.sh
 ```
 
-`deploy/dr/backup.sh` 使用 custom-format `pg_dump`、SHA-256 清单和 `pg_restore` 校验；
-恢复演练会启动一次性 PostgreSQL 并检查应用表。详见
+`deploy/dr/backup.sh` 同时生成 PostgreSQL custom dump 与 MySQL 一致性 SQL 快照，并写入 SHA-256 清单；
+恢复演练会启动两个一次性数据库容器检查应用表与库存不变式。详见
 [deploy/dr/README.md](../dr/README.md)。
 
 **改代码后更新**：本机重新 `pack.sh` → `scp` → 服务器上解压覆盖 → `docker compose up -d --build backend`。
@@ -136,7 +132,7 @@ bash deploy/dr/backup.sh
 | 外网打不开，服务器上 `curl localhost` 正常 | 安全组没放行 80，去控制台加规则 |
 | `frontend` 构建时被 Killed | 内存不够。确认 swap 生效：`swapon --show`；仍不行就换 2核4G |
 | `sandbox-image-loader` 一直不退出 | dind 拉不到基础镜像。`docker compose exec dind docker info \| grep -A2 Mirrors` 看加速有没有生效 |
-| 登录后所有请求 401 | `deploy/.env` 与 `deploy/nginx.env` 的 `INTERNAL_AUTH_TOKEN` 不一致。重跑 `sh deploy/set_internal_token.sh` 再 `docker compose up -d backend nginx` |
+| 登录后所有请求 401 | 检查 Java ERP readiness、JWT 公钥挂载和 `ERP_JWT_ISSUER`/`JWT_ISSUER`；若刚改过角色或状态，旧 token 失效是预期行为 |
 | 对话报 LLM 错误 | `deploy/.env` 里 `CHATANYWHERE_API_KEY` 没填或无效；改完要 `docker compose up -d backend mcp`（`restart` 不重读 env_file） |
 | 改了 `deploy/.env` 不生效 | 同上：env_file 在容器**创建**时注入，必须 `up -d` 重建而不是 `restart` |
 

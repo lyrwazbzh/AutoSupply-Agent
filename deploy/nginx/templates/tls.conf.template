@@ -19,7 +19,7 @@
 # 的 default，被 nginx 当变量引用、与 map 目标 $tls_enabled 构成自引用 —— 每个请求
 # 都报 "cycle while evaluating variable tls_enabled" 并 500（无凭据的 /healthz 因
 # 在 rewrite 阶段也求值它而一起挂）。这行由 bootstrap.sh 无条件写入；TLS 特性加入前
-# 装出来的老实例没有它，由 deploy/cd 的 cd_ensure_nginx_auth_and_switch 在 up 前补齐。
+# 装出来的老实例没有它，由 deploy/cd 的 cd_ensure_nginx_runtime 在 up 前补齐。
 #
 # 证书路径**不**走变量：nginx 的 ssl_certificate 在配置加载时解析路径，
 # 不支持运行时变量。证书始终在固定路径 /etc/nginx/tls/{cert,key}.pem，

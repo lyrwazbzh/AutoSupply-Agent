@@ -13,7 +13,6 @@
 #   .env  deploy/.env       含本机的 ChatAnywhere key 与 PostgreSQL 密码。根 .env 是宿主
 #                           进程开发用的（容器不读它，Dockerfile 里也没 COPY），
 #                           deploy/.env 服务器上由 bootstrap.sh 从 .env.example 重新生成
-#   deploy/nginx/htpasswd   认证凭据，服务器上重新生成
 #   tmp/  .runtime/artifacts/ 运行期产物
 #   postgres-data/ .history/   本机残留
 set -euo pipefail
@@ -49,7 +48,6 @@ tar \
     --exclude=./frontend/.next \
     --exclude=./deploy/.env \
     --exclude=./deploy/nginx.env \
-    --exclude=./deploy/nginx/htpasswd \
     --exclude=./tmp \
     --exclude=./.runtime/artifacts \
     --exclude=./postgres-data \
@@ -64,7 +62,7 @@ echo "打包完成：$OUT（$SIZE）"
 echo
 echo "内容抽查（下面这段应当只有 ok）："
 LIST="$(tar -tzf "$OUT")"
-LEAK="$(printf '%s\n' "$LIST" | grep -E '^\./(\.env$|deploy/\.env$|deploy/nginx\.env$|\.git/|\.venv/|frontend/node_modules/|frontend/\.next/|deploy/nginx/htpasswd$|tmp/|\.runtime/artifacts/)' || true)"
+LEAK="$(printf '%s\n' "$LIST" | grep -E '^\./(\.env$|deploy/\.env$|deploy/nginx\.env$|\.git/|\.venv/|frontend/node_modules/|frontend/\.next/|tmp/|\.runtime/artifacts/)' || true)"
 if [ -n "$LEAK" ]; then
     echo "!! 这些不该出现在包里：" >&2
     printf '%s\n' "$LEAK" | head -5 >&2

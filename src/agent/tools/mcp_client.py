@@ -12,10 +12,13 @@ import time
 from typing import List
 
 from langchain_core.tools import BaseTool
-from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.interceptors import MCPToolCallRequest
+from langchain_mcp_adapters.sessions import create_session
+from langchain_mcp_adapters.tools import convert_mcp_tool_to_langchain_tool
 
 from ..config import MCP_SSE_URL
 from ..log_utils import mcp_logger
+from ..runtime_context import get_current_access_token
 
 # 重试配置
 MAX_RETRIES = 3
@@ -28,7 +31,51 @@ _cache_time: float = 0
 CACHE_TTL = 300  # 5分钟缓存
 
 
-async def load_mcp_tools(force_refresh: bool = False) -> List[BaseTool]:
+async def _request_bearer_token_interceptor(request, handler):
+    """在每一次 MCP 工具调用时注入当前请求的 JWT。
+
+    工具 schema 可以缓存，凭据不可以。返回的工具绑定到无认证 connection，因而
+    access token 刷新不会重建 Agent，也不会意外继续使用旧用户的 token。
+    """
+    token = get_current_access_token()
+    headers = dict(request.headers or {})
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    scoped_request: MCPToolCallRequest = request.override(headers=headers)
+    return await handler(scoped_request)
+
+
+async def _load_request_scoped_tools(auth_token: str = "") -> List[BaseTool]:
+    """用当前 token 读取一次工具目录，返回请求级凭据注入的可缓存工具。"""
+    catalog_connection = {"url": MCP_SSE_URL, "transport": "sse"}
+    if auth_token:
+        catalog_connection["headers"] = {"Authorization": f"Bearer {auth_token}"}
+
+    discovered = []
+    async with create_session(catalog_connection) as session:
+        await session.initialize()
+        cursor = None
+        while True:
+            page = await session.list_tools(cursor=cursor)
+            discovered.extend(page.tools)
+            cursor = getattr(page, "nextCursor", None)
+            if not cursor:
+                break
+
+    runtime_connection = {"url": MCP_SSE_URL, "transport": "sse"}
+    return [
+        convert_mcp_tool_to_langchain_tool(
+            None,
+            remote_tool,
+            connection=runtime_connection,
+            server_name="erp",
+            tool_interceptors=[_request_bearer_token_interceptor],
+        )
+        for remote_tool in discovered
+    ]
+
+
+async def load_mcp_tools(force_refresh: bool = False, auth_token: str = "") -> List[BaseTool]:
     """
     异步加载 MCP 工具列表（带重试和缓存）.
 
@@ -50,16 +97,7 @@ async def load_mcp_tools(force_refresh: bool = False) -> List[BaseTool]:
     last_error = None
     for attempt in range(MAX_RETRIES):
         try:
-            client = MultiServerMCPClient(
-                {
-                    "erp": {
-                        "url": MCP_SSE_URL,
-                        "transport": "sse",
-                    }
-                }
-            )
-
-            tools = await client.get_tools()
+            tools = await _load_request_scoped_tools(auth_token)
 
             if tools:
                 _cached_tools = tools
@@ -89,7 +127,7 @@ async def load_mcp_tools(force_refresh: bool = False) -> List[BaseTool]:
     return []
 
 
-def load_mcp_tools_sync(force_refresh: bool = False) -> List[BaseTool]:
+def load_mcp_tools_sync(force_refresh: bool = False, auth_token: str = "") -> List[BaseTool]:
     """
     同步包装：加载 MCP 工具列表
 
@@ -112,11 +150,11 @@ def load_mcp_tools_sync(force_refresh: bool = False) -> List[BaseTool]:
         # 在异步上下文中（如 FastAPI startup）
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, load_mcp_tools(force_refresh))
+            future = pool.submit(asyncio.run, load_mcp_tools(force_refresh, auth_token))
             return future.result(timeout=30)
     else:
         # 无运行中的事件循环
-        return asyncio.run(load_mcp_tools(force_refresh))
+        return asyncio.run(load_mcp_tools(force_refresh, auth_token))
 
 
 def invalidate_cache():

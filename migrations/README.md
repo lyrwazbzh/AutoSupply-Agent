@@ -4,7 +4,10 @@
 `src/database.py` 幂等创建应用表，LangGraph 的 checkpoint/store 表
 分别由 `PostgresSaver.setup()` 和 `PostgresStore.setup()` 创建。
 
-`postgres/` 下的迁移按编号顺序执行，适用于发布前预建结构：
+`postgres/` 下的迁移按编号顺序执行。`0003` 约束 LangGraph 的 `store` 表，
+因此必须在 `PostgresStore.setup()` 已创建该表后执行；应用启动路径会在 setup 后
+通过 `setup_memory_search_schema()` 幂等应用同一约束。`0004` 增加独立审批队列、
+跨实例运行租约、AgentSession 所有权和沙箱分配/暖池所有权。
 
 ```bash
 for migration in migrations/postgres/*.sql; do

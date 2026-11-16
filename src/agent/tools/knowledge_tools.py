@@ -10,6 +10,16 @@ from ..knowledge.bounded_react import run_bounded_search_tool
 from ..knowledge.evidence import BOUNDED_REACT_POLICY
 from ..knowledge.ingest import ingest_text
 from ..knowledge.store import KnowledgeDoc, get_default_store
+from ..runtime_context import has_runtime_permission
+
+KNOWLEDGE_WRITE_PERMISSION = "assistant:knowledge:write"
+
+
+def _knowledge_write_denied() -> str:
+    return json.dumps(
+        {"ok": False, "error": "权限不足：需要 assistant:knowledge:write"},
+        ensure_ascii=False,
+    )
 
 
 @tool
@@ -62,6 +72,9 @@ def ingest_pdf_knowledge(
         split_sections: 是否按标题分段入库
         overwrite: 同 source+title 是否覆盖
     """
+    if not has_runtime_permission(KNOWLEDGE_WRITE_PERMISSION):
+        return _knowledge_write_denied()
+
     from ..knowledge.pdf_pipeline import ingest_pdf
 
     report = ingest_pdf(
@@ -97,6 +110,9 @@ def ingest_business_knowledge(
         version: 版本号
         overwrite: 仅对 same_source_title 覆盖；内容级重复仍拒绝
     """
+    if not has_runtime_permission(KNOWLEDGE_WRITE_PERMISSION):
+        return _knowledge_write_denied()
+
     allowed = {"procurement_sop", "avl", "material_spec", "exception"}
     if domain not in allowed:
         return json.dumps(

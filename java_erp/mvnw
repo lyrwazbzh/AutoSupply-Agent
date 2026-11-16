@@ -1,0 +1,43 @@
+#!/usr/bin/env sh
+set -eu
+
+BASE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+WRAPPER_DIR="$BASE_DIR/.mvn/wrapper"
+PROPS="$WRAPPER_DIR/maven-wrapper.properties"
+DIST_DIR="$WRAPPER_DIR/dists/apache-maven-3.9.9"
+ARCHIVE="$WRAPPER_DIR/dists/apache-maven-3.9.9-bin.tar.gz"
+
+distribution_url=$(sed -n 's/^distributionUrl=//p' "$PROPS" | head -n 1)
+expected_sha=$(sed -n 's/^distributionSha512Sum=//p' "$PROPS" | head -n 1)
+distribution_url=${MAVEN_DISTRIBUTION_URL:-$distribution_url}
+
+if [ ! -x "$DIST_DIR/bin/mvn" ]; then
+  mkdir -p "$(dirname "$ARCHIVE")"
+  if [ ! -f "$ARCHIVE" ]; then
+    if command -v curl >/dev/null 2>&1; then
+      curl -fL --retry 3 --connect-timeout 20 "$distribution_url" -o "$ARCHIVE"
+    elif command -v wget >/dev/null 2>&1; then
+      wget -O "$ARCHIVE" "$distribution_url"
+    else
+      echo "Maven wrapper needs curl or wget to download Maven 3.9.9." >&2
+      exit 1
+    fi
+  fi
+
+  if command -v sha512sum >/dev/null 2>&1; then
+    actual_sha=$(sha512sum "$ARCHIVE" | awk '{print $1}')
+  else
+    actual_sha=$(openssl dgst -sha512 "$ARCHIVE" | awk '{print $NF}')
+  fi
+  if [ "$actual_sha" != "$expected_sha" ]; then
+    rm -f "$ARCHIVE"
+    echo "Maven distribution SHA-512 mismatch." >&2
+    exit 1
+  fi
+
+  rm -rf "$DIST_DIR"
+  tar -xzf "$ARCHIVE" -C "$(dirname "$DIST_DIR")"
+fi
+
+exec "$DIST_DIR/bin/mvn" "$@"
+

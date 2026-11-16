@@ -4,7 +4,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `prepare-stack.sh` | 生成 PostgreSQL 口令、`DATABASE_URL`、nginx 共享密钥和 CI 凭据 |
+| `prepare-stack.sh` | 生成 PostgreSQL/MySQL 口令、RS256 密钥和一次性 ERP 管理员凭据 |
 | `backup-dr.sh` | 启动 PostgreSQL，执行迁移、真实备份、校验、隔离恢复和负向用例 |
 | `migrate-e2e.sh` | 验证迁移、幂等、pgvector/zhparser、checksum 与重复编号保护 |
 | `dr-logic-test.sh` | PostgreSQL DR 脚本的无 Docker 静态门禁 |
@@ -20,7 +20,7 @@
 | 数据库 | 真实 PostgreSQL | 真实 PostgreSQL |
 | ERP/MCP/backend/frontend/nginx | 真实服务 | 真实服务 |
 | dind | Alpine 替身 | 真实 privileged dind |
-| 目标 | 认证、代理、内部共享密钥 | Compose 拓扑、沙箱镜像和预热池 |
+| 目标 | JWT 登录、RBAC、代理与立即失效 | Compose 拓扑、Flyway、沙箱镜像和预热池 |
 
 ## 数据库门禁
 

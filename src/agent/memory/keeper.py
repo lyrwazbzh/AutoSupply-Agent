@@ -27,6 +27,8 @@ from .types import (
     SEMANTIC,
     WARM,
     MemoryItem,
+    MemorySearchResult,
+    MemorySearchStatus,
     new_id,
     now_iso,
 )
@@ -133,13 +135,17 @@ class MemoryKeeper:
             self._store.put(self.namespace(item.type), item.store_key, item.to_dict())
         except Exception:
             return None
-        try:
-            from .postgres_search import index_item
+        # 只有 LangGraph PostgresStore 与这张检索索引表共享同一数据源。
+        # 内存 Store/测试替身不得为了一个可选索引去连 PostgreSQL，
+        # 否则纯单元测试会在每次 put 上等连接超时。
+        if type(self._store).__module__.startswith("langgraph.store.postgres"):
+            try:
+                from .postgres_search import index_item
 
-            index_item(self.user_id, item, self.config)
-        except Exception:
-            # 正文已落库；索引稍后可重建，不阻断写入。
-            pass
+                index_item(self.user_id, item, self.config)
+            except Exception:
+                # 正文已落库；索引稍后可重建，不阻断写入。
+                pass
         return item
 
     def _refresh_embedding(self, item: MemoryItem) -> None:
@@ -246,6 +252,33 @@ class MemoryKeeper:
             return None
 
         item_id = _idempotent_id("sem", idempotency_key) if idempotency_key else ""
+        replacement = MemoryItem(
+            id=item_id or new_id("sem"),
+            type=SEMANTIC,
+            content=content,
+            summary=summary or f"{_PREFERENCE_LABELS.get(key, key)}：{content}",
+            key=key,
+            tags=["preference", key],
+            source=source or {},
+            idempotency_key=idempotency_key,
+            confidence=confidence,
+            evidence=evidence,
+        )
+
+        if type(self._store).__module__.startswith("langgraph.store.postgres"):
+            try:
+                from .postgres_search import atomic_upsert_semantic
+
+                self._refresh_embedding(replacement)
+                return atomic_upsert_semantic(
+                    self.user_id,
+                    key,
+                    replacement,
+                    self.config,
+                )
+            except Exception:
+                return None
+
         if item_id:
             existing_event = self.get(SEMANTIC, item_id)
             if existing_event is not None:
@@ -256,33 +289,8 @@ class MemoryKeeper:
             return current
 
         if current is not None:
-            replacement = MemoryItem(
-                id=item_id or new_id("sem"),
-                type=SEMANTIC,
-                content=content,
-                summary=summary or f"{_PREFERENCE_LABELS.get(key, key)}：{content}",
-                key=key,
-                tags=["preference", key],
-                source=source or {},
-                idempotency_key=idempotency_key,
-                confidence=confidence,
-                evidence=evidence,
-            )
             current.invalidate(by=replacement.id)
             self.put(current)
-        else:
-            replacement = MemoryItem(
-                id=item_id or new_id("sem"),
-                type=SEMANTIC,
-                content=content,
-                summary=summary or f"{_PREFERENCE_LABELS.get(key, key)}：{content}",
-                key=key,
-                tags=["preference", key],
-                source=source or {},
-                idempotency_key=idempotency_key,
-                confidence=confidence,
-                evidence=evidence,
-            )
         return self.put(replacement)
 
     def active_semantic(self, key: str, now: Optional[datetime] = None) -> Optional[MemoryItem]:
@@ -323,6 +331,8 @@ class MemoryKeeper:
         task_type: str = "general",
         tags: Optional[Sequence[str]] = None,
         tools: Optional[Sequence[str]] = None,
+        entities: Optional[Sequence[str]] = None,
+        structured: Optional[dict] = None,
         source: Optional[dict] = None,
     ) -> Optional[MemoryItem]:
         if not self.available or not thread_id:
@@ -338,6 +348,8 @@ class MemoryKeeper:
             existing.tags = sorted(set(list(existing.tags) + list(tags or [])))
             existing.idempotency_key = f"episode:{thread_id}"
             existing.source = source or existing.source
+            existing.entities = list(entities or existing.entities)
+            existing.structured = dict(structured or existing.structured)
             existing.ttl_days = ttl
             return self.put(existing)
 
@@ -350,6 +362,8 @@ class MemoryKeeper:
             tags=sorted(set(["episode", task_type] + list(tags or []))),
             idempotency_key=f"episode:{thread_id}",
             source=source or {},
+            entities=list(entities or []),
+            structured=dict(structured or {}),
             confidence=0.8,
             ttl_days=ttl,
         )
@@ -412,12 +426,12 @@ class MemoryKeeper:
     # ============================================================
 
     def load_preferences(self) -> Dict[str, Any]:
-        """读取 WARM 投影里的偏好字典（旧命名空间，语义已改为投影/缓存）。"""
+        """读取标准记忆命名空间中的 WARM 偏好投影。"""
         if not self.available:
             return {}
         try:
             raw = self._store.get(
-                ns.legacy_preferences_ns(self.user_id), ns.LEGACY_PREFERENCES_KEY
+                ns.preferences_ns(self.user_id), ns.PREFERENCES_KEY
             )
         except Exception:
             return {}
@@ -429,8 +443,8 @@ class MemoryKeeper:
             return
         try:
             self._store.put(
-                ns.legacy_preferences_ns(self.user_id),
-                ns.LEGACY_PREFERENCES_KEY,
+                ns.preferences_ns(self.user_id),
+                ns.PREFERENCES_KEY,
                 dict(preferences or {}),
             )
         except Exception:
@@ -451,20 +465,34 @@ class MemoryKeeper:
         if not self.available or not updates:
             return self.load_preferences()
 
-        merged = self.load_preferences()
-        for field, value in updates.items():
-            if field in STABLE_PREFERENCE_KEYS and value is None:
-                merged.pop(field, None)
-                continue
-            cap = (
-                self.config.max_recent_suppliers
-                if field == "recent_suppliers"
-                else self.config.max_recent_queries
-                if field == "recent_queries"
-                else 20
+        if type(self._store).__module__.startswith("langgraph.store.postgres"):
+            # PostgreSQL is the production Store. Merge there under a row/advisory
+            # lock instead of performing a cross-replica read-modify-write here.
+            from .postgres_search import atomic_merge_preferences
+
+            merged = atomic_merge_preferences(
+                self.user_id,
+                updates,
+                stable_keys=STABLE_PREFERENCE_KEYS,
+                recent_suppliers_cap=self.config.max_recent_suppliers,
+                recent_queries_cap=self.config.max_recent_queries,
             )
-            merged[field] = _merge_value(merged.get(field), value, cap)
-        self.save_preferences(merged)
+        else:
+            # Deterministic in-memory path for unit-test Stores.
+            merged = self.load_preferences()
+            for field, value in updates.items():
+                if field in STABLE_PREFERENCE_KEYS and value is None:
+                    merged.pop(field, None)
+                    continue
+                cap = (
+                    self.config.max_recent_suppliers
+                    if field == "recent_suppliers"
+                    else self.config.max_recent_queries
+                    if field == "recent_queries"
+                    else 20
+                )
+                merged[field] = _merge_value(merged.get(field), value, cap)
+            self.save_preferences(merged)
 
         for field in STABLE_PREFERENCE_KEYS:
             if field in updates:
@@ -565,7 +593,7 @@ class MemoryKeeper:
             now=now,
         )
 
-    def search(
+    def search_result(
         self,
         query: str,
         *,
@@ -573,13 +601,18 @@ class MemoryKeeper:
         now: Optional[datetime] = None,
         touch: bool = True,
         context: str = "",
-    ) -> List[Tuple[MemoryItem, float]]:
+    ) -> MemorySearchResult:
         """COLD：改写 → 双路 Top-k → RRF 归一化 channel → combined_score。"""
-        if not self.available or not query:
-            return []
+        if not self.available:
+            return MemorySearchResult(
+                MemorySearchStatus.UNAVAILABLE,
+                detail="persistent store is not configured",
+            )
+        if not query:
+            return MemorySearchResult(MemorySearchStatus.NO_RESULT)
         rewritten = self._rewrite_query(query, context)
         if not rewritten:
-            return []
+            return MemorySearchResult(MemorySearchStatus.NO_RESULT)
         limit = k or self.config.retrieval_k
         now_dt = now or datetime.now()
         query_embedding = self._embed_query(rewritten)
@@ -590,10 +623,13 @@ class MemoryKeeper:
                 query_embedding=query_embedding,
                 now=now_dt,
             )
-        except Exception:
-            return []
+        except Exception as exc:
+            return MemorySearchResult(
+                MemorySearchStatus.UNAVAILABLE,
+                detail=type(exc).__name__,
+            )
         if not keyword_lane and not vector_lane:
-            return []
+            return MemorySearchResult(MemorySearchStatus.NO_RESULT)
 
         ranked = scoring.rank_from_lanes(
             keyword_lane,
@@ -607,7 +643,23 @@ class MemoryKeeper:
 
         if touch and hits:
             self._record_access([item for item, _ in hits])
-        return hits
+        if not hits:
+            return MemorySearchResult(MemorySearchStatus.NO_RESULT)
+        return MemorySearchResult(MemorySearchStatus.SUCCESS, hits=hits)
+
+    def search(
+        self,
+        query: str,
+        *,
+        k: Optional[int] = None,
+        now: Optional[datetime] = None,
+        touch: bool = True,
+        context: str = "",
+    ) -> List[Tuple[MemoryItem, float]]:
+        """兼容内部排序调用；状态敏感的调用应使用 ``search_result``。"""
+        return self.search_result(
+            query, k=k, now=now, touch=touch, context=context
+        ).hits
 
     def search_text(
         self,
@@ -616,11 +668,15 @@ class MemoryKeeper:
         k: Optional[int] = None,
         context: str = "",
     ) -> str:
-        hits = self.search(query, k=k, context=context)
-        if not hits:
+        result = self.search_result(query, k=k, context=context)
+        if result.status == MemorySearchStatus.UNAVAILABLE:
+            return "记忆服务暂时不可用，请稍后重试。"
+        if result.status == MemorySearchStatus.DEGRADED and not result.hits:
+            return "记忆检索已降级，暂时无法确认是否存在相关历史。"
+        if result.status == MemorySearchStatus.NO_RESULT:
             return "没有找到相关的历史记忆。"
         lines = []
-        for index, (item, score) in enumerate(hits, 1):
+        for index, (item, score) in enumerate(result.hits, 1):
             stamp = item.created_at[:10] or "未知时间"
             lines.append(
                 f"{index}. [{item.type}/{stamp}/相关度 {score:.2f}] {_clip(item.summary or item.content, 200)}"
@@ -711,6 +767,8 @@ class MemoryKeeper:
                 task_type=digest.get("task_type", "general"),
                 tags=digest.get("tags"),
                 tools=digest.get("tools"),
+                entities=digest.get("entities"),
+                structured=digest.get("structured"),
                 source={
                     "thread_id": thread_id,
                     "task_type": digest.get("task_type"),
@@ -721,33 +779,6 @@ class MemoryKeeper:
 
         result["forgotten"] = self.forget(now=now)
         return result
-
-    # ============================================================
-    # 迁移
-    # ============================================================
-
-    def migrate_legacy_preferences(self) -> int:
-        """把旧命名空间里的偏好补建为语义记忆（幂等，重复调用无副作用）。
-
-        只有当某个**稳定偏好 key** 已经存在时才跳过该 key 的迁移；
-        不能因为 semantic 下有别的条目（比如 remember 写的自定义记忆）
-        就整体放弃——那会让老用户的存量偏好永远迁不过来。
-        """
-        if not self.available:
-            return 0
-        existing_keys = {item.key for item in self.list_items(SEMANTIC)}
-        legacy = self.load_preferences()
-        created = 0
-        for field in STABLE_PREFERENCE_KEYS:
-            if field in existing_keys:
-                continue
-            if field in legacy and legacy[field]:
-                if self.upsert_semantic(
-                    field, str(legacy[field]), confidence=0.6,
-                    evidence="迁移自历史偏好", source={"migrated": True},
-                ):
-                    created += 1
-        return created
 
     # ============================================================
     # 调试视图

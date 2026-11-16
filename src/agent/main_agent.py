@@ -1,5 +1,5 @@
 """
-主入口：create_main_agent() + precompute_agent_context()
+主入口：create_main_agent()
 DeepAgent 核心组装 — 严格遵循 Harness Engineering 架构
 """
 import fnmatch
@@ -27,7 +27,6 @@ from .config import (
 )
 from .log_utils import agent_logger
 from .memory.config import DEFAULT_MEMORY_CONFIG
-from .memory.keeper import MemoryKeeper
 from .memory.prompts import MAIN_SYSTEM_PROMPT, MEMORY_USAGE_PROMPT
 from .schema import ProcurementContext
 
@@ -155,106 +154,58 @@ def bootstrap_sandbox(sandbox) -> None:
     agent_logger.info("Sandbox bootstrap complete: project + core Skills restored")
 
 
-def _load_skills_prompt(skills_dir: Path) -> str:
-    """
-    手动加载所有 SKILL.md 文件内容，拼接为提示词段落。
-    解决框架内置 skills 加载器无法解析含中文/空格路径的问题。
-    """
+def _load_skills_index(skills_dir: Path) -> str:
+    """只注入 Skill 索引；具体说明按需从沙箱读取，避免常驻提示词膨胀。"""
     if not skills_dir.exists():
         return ""
 
-    skill_sections = []
+    import re
+
+    import yaml
+
+    entries: list[str] = []
     for skill_md in sorted(skills_dir.rglob("SKILL.md")):
         try:
             content = skill_md.read_text(encoding="utf-8").strip()
-            if content:
-                # 用相对路径作为技能标识
-                rel_path = str(skill_md.relative_to(skills_dir))
-                skill_sections.append(f"### Skill: {rel_path}\n{content}")
+            match = re.match(r"^---\s*\n(.*?)\n---\s*(?:\n|$)", content, re.DOTALL)
+            metadata = yaml.safe_load(match.group(1)) if match else {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            name = str(metadata.get("name") or skill_md.parent.name).strip()
+            description = str(metadata.get("description") or "").strip()
+            rel_path = skill_md.relative_to(skills_dir).as_posix()
+            entries.append(f"- **{name}** — {description}（`/skills/{rel_path}`）")
         except Exception as e:
             agent_logger.warning(f"Failed to load skill {skill_md}: {e}")
 
-    # 也加载独立的 .md 技能文件（非 SKILL.md）
-    for md_file in sorted(skills_dir.rglob("*.md")):
-        if md_file.name == "SKILL.md":
-            continue  # 已处理
-        try:
-            content = md_file.read_text(encoding="utf-8").strip()
-            if content and len(content) > 20:
-                rel_path = str(md_file.relative_to(skills_dir))
-                skill_sections.append(f"### Skill: {rel_path}\n{content}")
-        except Exception:
-            pass
-
-    if not skill_sections:
+    if not entries:
         return ""
-
-    # 构建技能摘要列表（name + description）
-    import re as _re
-    skill_summary = []
-    for section in skill_sections:
-        name_match = _re.search(r"name: (\S+)", section)
-        desc_match = _re.search(r"description: (.+)", section)
-        name = name_match.group(1) if name_match else "?"
-        desc = desc_match.group(1) if desc_match else ""
-        if name not in ("skill-name", "str", "?"):
-            skill_summary.append(f"- **{name}**: {desc}")
-
-    summary_block = "\n".join(skill_summary) if skill_summary else ""
-
     return (
-        "\n\n---\n\n"
-        "## 可用技能 (Skills)\n\n"
-        "以下基础技能已同步到沙箱 **/skills/** 目录，可通过沙箱执行。"
-        "用户自行安装的技能位于 **/skills/custom/**，可通过 ``list_user_skills`` 查询：\n\n"
-        + (summary_block + "\n\n---\n\n" if summary_block else "")
-        + "\n\n".join(skill_sections)
+        "\n\n## Skills 索引\n"
+        "仅当任务明确匹配某项技能时，先读取列出的 `SKILL.md` 再执行；"
+        "不要凭索引描述猜测细节。用户技能位于 `/skills/custom/`，用 "
+        "`list_user_skills` 发现。\n"
+        + "\n".join(entries)
     )
 
 
-async def precompute_agent_context(
-    user_id: str = "default_user",
-    username: str = "用户",
-    store=None,
-) -> ProcurementContext:
+def _load_behavior_policy() -> str:
+    """读取唯一的全局行为策略；动态身份和记忆仍由模板注入。"""
+    policy_path = MEMORY_DIR / "AGENTS.md"
+    try:
+        return policy_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(f"Cannot load canonical agent policy: {policy_path}") from exc
+
+
+def _main_tool_surface(tool_catalog: list) -> list:
+    """主 Agent 保留当前身份可见的完整工具集。
+
+    子 Agent 的 YAML 白名单用于专业分工和最小权限隔离，但不能反向限制总控
+    Agent。知识写入、Skill 安装等身份权限过滤应在构建 ``tool_catalog`` 时完成；
+    ERP 写工具仍由审批策略和 ERPWriteMiddleware 执行纵深校验。
     """
-    预计算 Agent 上下文
-
-    从 Store 加载用户历史偏好与 WARM 层记忆摘要，构造完整的 ProcurementContext。
-    如果 Store 不可用则使用默认值。
-    """
-    preferences = {}
-    warm_memory = ""
-
-    if store is not None:
-        try:
-            namespace = ("user-preferences", user_id)
-            items = store.search(namespace)
-            for item in items:
-                if item.key == "preferences" and isinstance(item.value, dict):
-                    preferences.update(item.value)
-            if preferences:
-                agent_logger.info(
-                    f"Loaded preferences for {user_id}: {list(preferences.keys())}"
-                )
-        except Exception as e:
-            agent_logger.warning(f"Failed to load preferences: {e}")
-
-        try:
-            keeper = MemoryKeeper(store, user_id, DEFAULT_MEMORY_CONFIG)
-            keeper.migrate_legacy_preferences()
-            warm_memory = keeper.build_warm_brief()
-            if not preferences:
-                preferences.update(keeper.load_preferences())
-        except Exception as e:
-            agent_logger.warning(f"Failed to build warm memory: {e}")
-
-    return ProcurementContext(
-        user_id=user_id,
-        username=username,
-        preferences=preferences,
-        warm_memory=warm_memory,
-    )
+    return list(tool_catalog)
 
 
 def create_main_agent(
@@ -263,6 +214,8 @@ def create_main_agent(
     store=None,
     write_audit_repository=None,
     warm_memory_middleware=None,
+    mcp_auth_token: str = "",
+    permissions: frozenset[str] | None = None,
 ):
     """
     创建主 Agent 实例
@@ -360,19 +313,28 @@ def create_main_agent(
     from .tools.web_fetch import install_skill, web_fetch
     from .tools.web_search import web_search
 
-    mcp_tools = load_mcp_tools_sync()
-    custom_tools = [generate_chart, web_search, web_fetch, install_skill, list_user_skills, request_order_info,
-                    search_business_knowledge,
-                    ingest_business_knowledge, ingest_pdf_knowledge,
-                    download_sandbox_file, list_sandbox_files,
-                    generate_document, generate_table_report]
+    mcp_tools = load_mcp_tools_sync(auth_token=mcp_auth_token)
+    tool_catalog = mcp_tools + [
+        generate_chart, web_search, web_fetch, list_user_skills, request_order_info,
+        search_business_knowledge, download_sandbox_file, list_sandbox_files,
+        generate_document, generate_table_report,
+    ]
+
+    # 全局知识写入与运行时 Skill 安装仅对显式授权主体可见；工具内部还有第二层校验。
+    if permissions is None or "assistant:knowledge:write" in permissions:
+        tool_catalog.extend([ingest_business_knowledge, ingest_pdf_knowledge])
+    if permissions is None or "assistant:skill:install" in permissions:
+        tool_catalog.append(install_skill)
 
     # 三层记忆：COLD 层按需检索 + 显式写入（WARM 层已在系统提示词里常驻注入）
     if DEFAULT_MEMORY_CONFIG.memory_tools_enabled:
         from .tools.memory_tools import read_memory, remember
 
-        custom_tools.extend([read_memory, remember])
-    all_tools = mcp_tools + custom_tools
+        tool_catalog.extend([read_memory, remember])
+
+    # 主 Agent 是总控，使用经过当前身份过滤后的完整工具集；两个子 Agent 再通过
+    # 各自 YAML 中的精确工具名白名单划分能力边界。
+    main_tools = _main_tool_surface(tool_catalog)
 
     from .audit.repository import WriteAuditRepository
     from .middlewares.erp_write import ERPWriteMiddleware
@@ -381,20 +343,23 @@ def create_main_agent(
         write_audit_repository = WriteAuditRepository()
 
     agent_logger.info(
-        f"Tools loaded: {len(mcp_tools)} MCP + {len(custom_tools)} custom = {len(all_tools)} total"
+        f"Tools loaded: main={len(main_tools)}, catalog={len(tool_catalog)} "
+        f"(MCP discovered={len(mcp_tools)})"
     )
 
     # ===== 4. 加载子Agent配置 =====
+    from .middleware_config import get_all_subagent_middlewares
     from .subagents.loader import (
         get_delegation_context_prompt,
         load_subagent_configs,
         resolve_subagent_tools,
     )
-    from .middleware_config import get_all_subagent_middlewares
     subagent_configs = load_subagent_configs()
     subagent_middlewares = get_all_subagent_middlewares(
         sandbox_backend=sandbox_backend,
         user_context=user_context,
+        model=llm,
+        compaction_backend=composite_backend,
     )
     for config in subagent_configs:
         subagent_middlewares.setdefault(config["name"], []).append(
@@ -403,17 +368,20 @@ def create_main_agent(
                 user_id=user_context.user_id,
                 agent_name=config["name"],
                 store=store,
+                permissions=permissions,
             )
         )
     subagents = resolve_subagent_tools(
         subagent_configs,
-        all_tools,
+        tool_catalog,
         middleware_by_agent=subagent_middlewares,
         approval_policy=approval_policy_registry,
     )
     # 主 Agent 直调和子 Agent 委派都从同一策略中心投影审批规则。
     # create_deep_agent 负责主路径 HITL 注册，避免再叠加显式 Middleware。
-    compiled_main_policy = approval_policy_registry.main_interrupt_on()
+    compiled_main_policy = approval_policy_registry.subset_for_tools(
+        getattr(tool, "name", "") for tool in main_tools
+    )
     # 生成委派上下文协议（注入主 Agent 提示词）
     delegation_prompt = get_delegation_context_prompt(subagent_configs)
 
@@ -423,8 +391,8 @@ def create_main_agent(
     from .harness import HarnessPhaseMiddleware, load_harness_config
     from .middlewares.grader_transcript import build_grader_messages
     from .middlewares.memory_lifecycle import MemoryLifecycleMiddleware
-    from .middlewares.review_gate import ReviewExecutionGate, SafeRubricMiddleware
     from .middlewares.result_audit import ResultAuditMiddleware
+    from .middlewares.review_gate import ReviewExecutionGate, SafeRubricMiddleware
     from .middlewares.sandbox_breaker import SandboxCircuitBreakerMiddleware
     from .middlewares.sandbox_health import SandboxHealthMiddleware
     from .middlewares.skills_lifecycle import SkillsLifecycleMiddleware
@@ -437,8 +405,9 @@ def create_main_agent(
     router_llm = get_llm(thinking=False, timeout=_review_cfg.get("router_timeout_seconds", 8),
                          max_retries=0, max_tokens=400)
 
-    # 注意：create_deep_agent 内部已自动添加：
-    # - SummarizationMiddleware（自动摘要 + compact_conversation 工具）
+    # create_deep_agent 内部会添加通用 SummarizationMiddleware；下面传入的
+    # 同名采购摘要器会原位替换它。当前不注册手动 compact_conversation 工具。
+    # create_deep_agent 还会自动添加：
     # - FilesystemMiddleware, SkillsMiddleware, SubAgentMiddleware
     # - TodoListMiddleware, PatchToolCallsMiddleware, MemoryMiddleware
     # 我们只需添加自定义中间件 + 调用限制
@@ -493,7 +462,13 @@ def create_main_agent(
         sandbox_health_middleware.mark_unhealthy
     )
 
+    from .context_compaction import create_context_compaction_middleware
+
     middlewares = [
+        create_context_compaction_middleware(
+            model=llm,
+            backend=composite_backend,
+        ),
         sandbox_health_middleware,                      # 沙箱探活 / 重建
         HarnessPhaseMiddleware(router_model=router_llm),  # 是否评审 + task_type + rubric
         warm_memory_middleware,                         # 请求级 WARM 快照
@@ -512,6 +487,7 @@ def create_main_agent(
             user_id=user_context.user_id,
             agent_name="main",
             store=store,
+            permissions=permissions,
         ),
         ModelCallLimitMiddleware(run_limit=MAX_MODEL_CALLS),
         ToolCallLimitMiddleware(run_limit=MAX_TOOL_CALLS),
@@ -523,6 +499,7 @@ def create_main_agent(
         username=user_context.username,
         preferences="以本次动态加载的记忆为准",
         warm_memory=WARM_MEMORY_SLOT,
+        behavior_policy=_load_behavior_policy(),
     )
     if DEFAULT_MEMORY_CONFIG.memory_tools_enabled:
         system_prompt += MEMORY_USAGE_PROMPT
@@ -530,24 +507,24 @@ def create_main_agent(
     if delegation_prompt:
         system_prompt += delegation_prompt
 
-    # ===== 6.5 手动加载 Skill 内容注入提示词 =====
-    # 框架内置 skills 加载器无法解析含中文/空格的路径，改为手动加载
-    skills_prompt = _load_skills_prompt(SKILLS_DIR)
+    # ===== 6.5 仅注入 Skill 索引，细节由 Agent 在命中任务时按需读取 =====
+    skills_prompt = _load_skills_index(SKILLS_DIR)
     if skills_prompt:
         system_prompt += skills_prompt
         agent_logger.info(f"Skills loaded into prompt from {SKILLS_DIR}")
 
     # ===== 7. 创建 Agent =====
     # ❌ 不传 skills 参数（框架内置 SkillsMiddleware 无法处理含中文路径）
-    # ✅ Skills 通过 _load_skills_prompt 注入 system_prompt + SkillsLifecycleMiddleware 同步到沙箱
+    # ✅ Skills 通过索引注入 system_prompt，并由唯一的 SkillsLifecycleMiddleware
+    #    负责核心 Skill 同步与当前用户自定义 Skill 恢复。
     agent = create_deep_agent(
         model=llm,
-        tools=all_tools,
+        tools=main_tools,
         system_prompt=system_prompt,
         middleware=middlewares,
         subagents=subagents if subagents else None,
         skills=None,
-        memory=[str(MEMORY_DIR / "AGENTS.md")],
+        memory=None,
         backend=composite_backend,
         interrupt_on=compiled_main_policy,
         checkpointer=checkpointer,
@@ -556,7 +533,7 @@ def create_main_agent(
     )
 
     agent_logger.info(
-        f"Main agent created: {len(all_tools)} tools, "
+        f"Main agent created: {len(main_tools)} main tools, "
         f"{len(subagents)} subagents, {len(middlewares)} middlewares"
     )
     return agent

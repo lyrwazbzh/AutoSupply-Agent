@@ -11,6 +11,14 @@ import java.util.List;
  */
 public interface SupplierService extends IService<Supplier> {
 
+    Supplier getSupplier(Long id);
+
+    boolean createSupplier(Supplier supplier);
+
+    boolean updateSupplier(Supplier supplier);
+
+    boolean deleteSupplier(Long id);
+
     /**
      * 分页查询供应商
      *
@@ -20,7 +28,7 @@ public interface SupplierService extends IService<Supplier> {
      * @param creditRating 信用评级（可选）
      * @return 分页结果
      */
-    Page<Supplier> pageSuppliers(Page<Supplier> page, String name, Integer status, String creditRating);
+    Page<Supplier> pageSuppliers(Long current, Long size, String name, Integer status, String creditRating);
 
     /**
      * 根据名称搜索供应商
@@ -28,7 +36,9 @@ public interface SupplierService extends IService<Supplier> {
      * @param name 供应商名称关键字
      * @return 供应商列表
      */
-    List<Supplier> searchByName(String name);
+    List<Supplier> searchSuppliers(String name);
+
+    List<Supplier> getSuppliersByIdsOrdered(List<Long> ids);
 
     /**
      * 更新供应商状态

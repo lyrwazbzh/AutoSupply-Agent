@@ -3,7 +3,7 @@
 #
 #   bash deploy/cd/build.sh v1.0.0
 #
-# 产物：erp-agent-app / erp-agent-frontend / erp-mock 各两个 tag
+# 产物：erp-agent-app / erp-agent-frontend / erp-agent-java-erp 各两个 tag
 #   <name>:v1.0.0        人读的语义化版本
 #   <name>:sha-<12>      机器读的不可变 tag（deploy.sh 用的就是它）
 # 两个 tag 指向同一个 image ID；发布时以 state 里记录的 digest 为准。
@@ -31,7 +31,7 @@ IMAGE_KEEP="${IMAGE_KEEP:-5}"
 # 行为与引入 registry 支持之前完全一致。
 APP_IMAGE_NAME="${CD_APP_IMAGE_NAME}"
 FRONTEND_IMAGE_NAME="${CD_FRONTEND_IMAGE_NAME}"
-MOCK_IMAGE_NAME="${CD_MOCK_IMAGE_NAME}"
+JAVA_ERP_IMAGE_NAME="${CD_JAVA_ERP_IMAGE_NAME}"
 REGISTRY_PREFIX="$(cd_registry_prefix)"
 [ -n "$REGISTRY_PREFIX" ] && info "registry 模式：前缀 $REGISTRY_PREFIX（构建后 --push）"
 
@@ -64,7 +64,7 @@ log "构建 $VERSION（$SHA12，镜像 tag $TAG_SHA）"
 # 三个镜像的输入集是已知的、很小的：
 #   app    ← src/**、Dockerfile、requirements*.txt、.dockerignore
 #   frontend ← frontend/**
-#   mock   ← deploy/mock-erp/**
+#   java   ← java_erp/**
 # 其余路径（文档、deploy/cd、deploy/ci、deploy/runner、.github）不影响镜像内容，
 # 不触发重建。
 #
@@ -78,11 +78,11 @@ log "构建 $VERSION（$SHA12，镜像 tag $TAG_SHA）"
 # git describe 就可能挑中那样一个跟发布无关的 tag，「上一个版本」于是变成一个
 # 错误的值 —— 变更集会算错而输出看不出来。加这一个参数的代价是零。
 PREV_TAG="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${VERSION}^" 2>/dev/null || true)"
-need_app=0; need_front=0; need_mock=0
+need_app=0; need_front=0; need_java=0
 
 if [ -z "$PREV_TAG" ]; then
     info "找不到上一个 tag —— 首次构建，三个镜像全建"
-    need_app=1; need_front=1; need_mock=1
+    need_app=1; need_front=1; need_java=1
 else
     info "上个版本 $PREV_TAG，按它算变更集"
     CHANGED="$(git diff --name-only "$PREV_TAG" "$VERSION")"
@@ -92,12 +92,12 @@ else
     while IFS= read -r f; do
         [ -n "$f" ] || continue
         case "$f" in
-            src/*|Dockerfile|requirements.txt|requirements-dev.txt|.dockerignore) need_app=1 ;;
+            src/*|Dockerfile|requirements.in|requirements.lock|requirements.txt|requirements-dev.txt|.dockerignore) need_app=1 ;;
             frontend/*)                                                        need_front=1 ;;
-            deploy/mock-erp/*)                                                 need_mock=1 ;;
+            java_erp/*)                                                        need_java=1 ;;
             docker-compose.yml|deploy/dind-daemon.json)
                 warn "拓扑文件变了（$f）—— 三个镜像全量重建，保证手上有一套完整对应当前树的镜像"
-                need_app=1; need_front=1; need_mock=1 ;;
+                need_app=1; need_front=1; need_java=1 ;;
             *) : ;;
         esac
     done <<<"$CHANGED"
@@ -106,7 +106,7 @@ fi
 building=""
 [ "$need_app" = 1 ]   && building="$building app"
 [ "$need_front" = 1 ] && building="$building frontend"
-[ "$need_mock" = 1 ]  && building="$building mock-erp"
+[ "$need_java" = 1 ]  && building="$building java-erp"
 info "需要构建：${building:-（无 —— 三个镜像都与上一版一致）}"
 
 # ---------------------------------------------------------------- 工具
@@ -161,7 +161,7 @@ retag_from_running() {
 push_to_registry() {
     [ "${CD_HAS_REGISTRY:-0}" = "1" ] || return 0
     local name
-    for name in "$MOCK_FULL" "$APP_FULL" "$FRONT_FULL"; do
+    for name in "$JAVA_ERP_FULL" "$APP_FULL" "$FRONT_FULL"; do
         info "推送 $name:$TAG_SHA"
         docker push "$name:$TAG_SHA" >/dev/null 2>&1 \
             || { warn "push $name:$TAG_SHA 失败 —— 本地镜像仍在，但远程发布会退化"; return 1; }
@@ -175,15 +175,15 @@ push_to_registry() {
 # 带 registry 前缀的完整镜像名（构建 / push / pull 都用它）
 APP_FULL="${REGISTRY_PREFIX}${APP_IMAGE_NAME}"
 FRONT_FULL="${REGISTRY_PREFIX}${FRONTEND_IMAGE_NAME}"
-MOCK_FULL="${REGISTRY_PREFIX}${MOCK_IMAGE_NAME}"
+JAVA_ERP_FULL="${REGISTRY_PREFIX}${JAVA_ERP_IMAGE_NAME}"
 export CD_HAS_REGISTRY="${CD_HAS_REGISTRY:-0}"
 
 # ---------------------------------------------------------------- 构建
-if [ "$need_mock" = 1 ]; then
-    build_image "$MOCK_FULL" "./deploy/mock-erp" "./deploy/mock-erp/Dockerfile"
+if [ "$need_java" = 1 ]; then
+    build_image "$JAVA_ERP_FULL" "./java_erp" "./java_erp/Dockerfile"
 else
-    retag_from_running mock-erp "$MOCK_FULL" \
-        || build_image "$MOCK_FULL" "./deploy/mock-erp" "./deploy/mock-erp/Dockerfile"
+    retag_from_running java-erp "$JAVA_ERP_FULL" \
+        || build_image "$JAVA_ERP_FULL" "./java_erp" "./java_erp/Dockerfile"
 fi
 
 if [ "$need_app" = 1 ]; then
@@ -205,7 +205,7 @@ fi
 # erp-agent-frontend:sha-xxx" —— 那时已经动过生产树了。构建阶段断言比发布阶段
 # 断言便宜得多：此刻生产还没被碰。
 log "断言三个镜像都在本地且指向同一个 digest"
-for name in "$MOCK_FULL" "$APP_FULL" "$FRONT_FULL"; do
+for name in "$JAVA_ERP_FULL" "$APP_FULL" "$FRONT_FULL"; do
     id_sha="$(cd_image_id "$name:$TAG_SHA")"
     id_ver="$(cd_image_id "$name:$VERSION")"
     [ -n "$id_sha" ] || die "$name:$TAG_SHA 不存在 —— buildx --load 没把它导进宿主 daemon"
@@ -258,7 +258,7 @@ prune_repo() {
 }
 prune_repo "$APP_FULL"
 prune_repo "$FRONT_FULL"
-prune_repo "$MOCK_FULL"
+prune_repo "$JAVA_ERP_FULL"
 unset running_ids
 
 # ---------------------------------------------------------------- 推送

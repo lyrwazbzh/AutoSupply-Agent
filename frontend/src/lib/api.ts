@@ -1,4 +1,5 @@
 import { ChatStateResponse, Conversation, ChatRequest, ResumeRequest } from "./types";
+import { authFetch } from "./auth";
 
 // 默认相对路径：由 nginx 把 /api/ 反代到 backend，浏览器与 API 同源，
 // 既不用管 CORS，也不用为每个部署域名重新构建镜像。
@@ -13,7 +14,7 @@ export async function streamChat(
   onChunk: (chunk: string) => void,
   signal?: AbortSignal
 ): Promise<void> {
-  const response = await fetch(`${BASE_URL}/chat/stream`, {
+  const response = await authFetch(`${BASE_URL}/chat/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(request),
@@ -40,7 +41,7 @@ export async function resumeChat(
   onChunk: (chunk: string) => void,
   signal?: AbortSignal
 ): Promise<void> {
-  const response = await fetch(
+  const response = await authFetch(
     `${BASE_URL}/chat/${request.thread_id}/resume`,
     {
       method: "POST",
@@ -67,32 +68,31 @@ export async function resumeChat(
 }
 
 export async function getChatState(threadId: string): Promise<ChatStateResponse> {
-  const res = await fetch(`${BASE_URL}/chat/${threadId}/state`);
+  const res = await authFetch(`${BASE_URL}/chat/${threadId}/state`);
   if (!res.ok) throw new Error(`State failed: ${res.status}`);
   return res.json();
 }
 
 // ===== 历史 API =====
-// 仅本机开发（AUTH_MODE=none）下生效。容器部署走 nginx Basic Auth，backend
-// 会用认证身份覆盖这个值并把它丢弃 —— 前端改它不会、也不能切到别人的会话。
+// 仅本机开发（AUTH_MODE=none）下生效；JWT 模式由令牌 subject 决定会话归属。
 const USER_ID = "user-001";
 
 export async function getConversations(): Promise<Conversation[]> {
-  const res = await fetch(`${BASE_URL}/history?user_id=${USER_ID}`);
+  const res = await authFetch(`${BASE_URL}/history?user_id=${USER_ID}`);
   if (!res.ok) throw new Error(`History failed: ${res.status}`);
   const data = await res.json();
   return data.conversations ?? [];
 }
 
 export async function getMessages(threadId: string) {
-  const res = await fetch(`${BASE_URL}/history/${threadId}/messages`);
+  const res = await authFetch(`${BASE_URL}/history/${threadId}/messages`);
   if (!res.ok) throw new Error(`Messages failed: ${res.status}`);
   const data = await res.json();
   return data.messages ?? [];
 }
 
 export async function deleteConversation(threadId: string): Promise<void> {
-  const res = await fetch(`${BASE_URL}/history/${threadId}`, {
+  const res = await authFetch(`${BASE_URL}/history/${threadId}`, {
     method: "DELETE",
   });
   if (!res.ok) throw new Error(`Delete failed: ${res.status}`);

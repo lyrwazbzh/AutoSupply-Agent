@@ -54,6 +54,55 @@ if ! ci_wait_healthy 600; then
     exit 1
 fi
 
+# 空库由 Flyway 创建结构，测试数据由独立夹具显式写入，不开启 dev Seeder。
+# 脚本使用与 backend/MCP 相同的 data 网络访问 java-erp，同时验证
+# 查询、幂等建单、入出库与 operation 回查契约。
+ci_log "Java ERP/Flyway 核心契约冒烟"
+docker run --rm \
+    --network "${CI_PROJECT}_data" \
+    -v "$CI_REPO_ROOT/java_erp/scripts:/smoke:ro" \
+    --entrypoint python \
+    erp-agent-app:local \
+    /smoke/smoke_harness.py \
+    --base-url http://java-erp:8080 \
+    --username "$CI_ADMIN_USER" \
+    --password "$CI_ADMIN_PASSWORD" \
+    --bootstrap-fixture
+
+ci_log "Redis 查询缓存、登录限流与最近/常用冒烟"
+docker run --rm \
+    --network "${CI_PROJECT}_data" \
+    -v "$CI_REPO_ROOT/java_erp/scripts:/smoke:ro" \
+    --entrypoint python \
+    erp-agent-app:local \
+    /smoke/smoke_redis.py \
+    --base-url http://java-erp:8080 \
+    --username "$CI_ADMIN_USER" \
+    --password "$CI_ADMIN_PASSWORD"
+
+REDIS_PING="$(ci_compose exec -T redis sh -c \
+    'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" ping')"
+[ "$REDIS_PING" = "PONG" ] || ci_die "Redis 密码连接失败: $REDIS_PING"
+PART_CACHE_KEYS="$(ci_compose exec -T redis sh -c \
+    'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" --scan --pattern "erp:cache:v1:part-*"')"
+SUPPLIER_CACHE_KEYS="$(ci_compose exec -T redis sh -c \
+    'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" --scan --pattern "erp:cache:v1:supplier-*"')"
+ACTIVITY_KEYS="$(ci_compose exec -T redis sh -c \
+    'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" --scan --pattern "erp:activity:v1:*"')"
+INVENTORY_KEYS="$(ci_compose exec -T redis sh -c \
+    'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" --scan --pattern "inv:*"')"
+[ -n "$PART_CACHE_KEYS" ] || ci_die "零件查询未产生 Redis 缓存"
+[ -n "$SUPPLIER_CACHE_KEYS" ] || ci_die "供应商查询未产生 Redis 缓存"
+[ -n "$ACTIVITY_KEYS" ] || ci_die "详情访问未产生 Redis activity ZSet"
+[ -z "$INVENTORY_KEYS" ] || ci_die "库存路径错误地产生了 Redis Key: $INVENTORY_KEYS"
+
+JAVA_ERP_CID="$(ci_compose ps -q java-erp)"
+JAVA_ERP_USER="$(docker inspect -f '{{.Config.User}}' "$JAVA_ERP_CID")"
+case "$JAVA_ERP_USER" in
+    ''|root|0) ci_die "Java ERP 镜像以特权用户运行: ${JAVA_ERP_USER:-<empty>}" ;;
+    *) ci_info "ok    Java ERP 非 root 用户: $JAVA_ERP_USER" ;;
+esac
+
 # ---------------------------------------------------------------- 一次性服务
 # sandbox-image-loader 把 python:3.11-slim 预先灌进 dind。它必须是 exit 0 ——
 # 非 0 意味着 dind 拉不到沙箱基础镜像，而首请求时的表现会是"沙箱创建超时"，
@@ -101,6 +150,38 @@ else
     ci_warn "FAIL  GET /healthz → $CODE"
     FAILED=$((FAILED + 1))
 fi
+
+# Readiness 必须反映数据库连接：MySQL 不可用时不得继续接收流量，
+# MySQL 恢复后必须自动回到 UP。放在所有业务冒烟之后，避免故意断库干扰用例。
+ci_log "Readiness 数据库断开/恢复验证"
+ci_compose stop mysql >/dev/null
+READINESS_FAILED=0
+for _ in $(seq 1 30); do
+    if ! ci_compose exec -T java-erp curl -fsS \
+        http://127.0.0.1:8080/actuator/health/readiness >/dev/null 2>&1; then
+        READINESS_FAILED=1
+        break
+    fi
+    sleep 2
+done
+[ "$READINESS_FAILED" = 1 ] || ci_die "MySQL 停止后 Java ERP readiness 仍为 UP"
+ci_compose up -d --no-build mysql >/dev/null
+ci_wait_healthy 180 || ci_die "MySQL 恢复后 Java ERP readiness 未恢复"
+
+ci_log "Readiness Redis 断开/恢复验证"
+ci_compose stop redis >/dev/null
+REDIS_READINESS_FAILED=0
+for _ in $(seq 1 30); do
+    if ! ci_compose exec -T java-erp curl -fsS \
+        http://127.0.0.1:8080/actuator/health/readiness >/dev/null 2>&1; then
+        REDIS_READINESS_FAILED=1
+        break
+    fi
+    sleep 2
+done
+[ "$REDIS_READINESS_FAILED" = 1 ] || ci_die "Redis 停止后 Java ERP readiness 仍为 UP"
+ci_compose up -d --no-build redis >/dev/null
+ci_wait_healthy 180 || ci_die "Redis 恢复后 Java ERP readiness 未恢复"
 
 if [ "$FAILED" -eq 0 ]; then
     ci_log "全栈冒烟全部通过"

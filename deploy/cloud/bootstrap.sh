@@ -6,16 +6,16 @@
 #
 # 可选环境变量：
 #   CHATANYWHERE_API_KEY=sk-xxx  不传则 .env 留空，脚本最后提示你手动补
-#   LOGIN_USER=admin            nginx Basic Auth 用户名
-#   LOGIN_PASSWORD=xxx         不传则随机生成并打印（只打印这一次）
+#   ERP_ADMIN_USER=admin        首个 ERP 管理员用户名
+#   ERP_ADMIN_PASSWORD=xxx     不传则随机生成并打印（只打印这一次）
 #   HTTP_PORT=80               对外 HTTP 端口
 #   HTTPS_PORT=443             对外 HTTPS 端口（TLS_ENABLED=1 时）
 #   TLS_ENABLED=1              启用 HTTPS（生成证书 + nginx 80→443 跳转）
 #   REGISTRY_URL=              配置后构建的镜像会推到 registry（见 deploy/cd/build.sh）
 #
 # 脚本会改的东西：apt 源里加一个 docker-ce 仓库、装 docker、写
-# /etc/docker/daemon.json、必要时建 4G swap、在仓库内生成 deploy/.env 与
-# deploy/nginx/htpasswd。不碰任何已有业务。
+# /etc/docker/daemon.json、必要时建 4G swap、在仓库内生成 deploy/.env 与 JWT
+# 密钥。不碰任何已有业务。
 set -euo pipefail
 
 PUBLIC_HOST="${1:-}"
@@ -36,7 +36,8 @@ HTTP_PORT="${HTTP_PORT:-80}"
 HTTPS_PORT="${HTTPS_PORT:-443}"
 TLS_ENABLED="${TLS_ENABLED:-}"
 REGISTRY_URL="${REGISTRY_URL:-}"
-LOGIN_USER="${LOGIN_USER:-admin}"
+ERP_ADMIN_USER="${ERP_ADMIN_USER:-admin}"
+ERP_ADMIN_PASSWORD="${ERP_ADMIN_PASSWORD:-}"
 CHATANYWHERE_API_KEY="${CHATANYWHERE_API_KEY:-}"
 
 log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
@@ -151,9 +152,18 @@ if [ -f deploy/.env ]; then
 else
     cp deploy/.env.example deploy/.env
     POSTGRES_PW="$(openssl rand -hex 16)"
+    MYSQL_PW="$(openssl rand -hex 24)"
+    MYSQL_ROOT_PW="$(openssl rand -hex 24)"
+    REDIS_PW="$(openssl rand -hex 24)"
+    ERP_ADMIN_PASSWORD="${ERP_ADMIN_PASSWORD:-$(openssl rand -base64 24 | tr -d '\n')}"
     # 生成的是纯 hex，不含 @ : / 之类需要 URL 编码的字符。
     sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$POSTGRES_PW|" deploy/.env
     sed -i "s|^DATABASE_URL=.*|DATABASE_URL=postgresql://erp_agent:$POSTGRES_PW@postgres:5432/erp_agent|" deploy/.env
+    sed -i "s|^MYSQL_PASSWORD=.*|MYSQL_PASSWORD=$MYSQL_PW|" deploy/.env
+    sed -i "s|^MYSQL_ROOT_PASSWORD=.*|MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PW|" deploy/.env
+    sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=$REDIS_PW|" deploy/.env
+    sed -i "s|^ERP_BOOTSTRAP_ADMIN_USERNAME=.*|ERP_BOOTSTRAP_ADMIN_USERNAME=$ERP_ADMIN_USER|" deploy/.env
+    sed -i "s|^ERP_BOOTSTRAP_ADMIN_PASSWORD=.*|ERP_BOOTSTRAP_ADMIN_PASSWORD=$ERP_ADMIN_PASSWORD|" deploy/.env
     sed -i "s|^PUBLIC_BASE_URL=.*|PUBLIC_BASE_URL=http://$PUBLIC_HOST|" deploy/.env
     sed -i "s|^CORS_ALLOW_ORIGINS=.*|CORS_ALLOW_ORIGINS=http://$PUBLIC_HOST|" deploy/.env
     if [ -n "$CHATANYWHERE_API_KEY" ]; then
@@ -163,13 +173,30 @@ else
     # 与 PostgreSQL 密码一样只生成一次，要换改 .env 重跑。
     GRAFANA_PW="$(openssl rand -hex 16)"
     sed -i "s|^GRAFANA_PASSWORD=.*|GRAFANA_PASSWORD=$GRAFANA_PW|" deploy/.env
-    echo "  已生成（PostgreSQL 密码 + Grafana 密码随机）"
+    echo "  已生成（PostgreSQL/MySQL/Redis/Grafana 密码随机）"
 fi
 
-log "生成 nginx 共享密钥（挡住沙箱伪造身份头）"
-# nginx.env 含密钥所以不入库，包里只带模板，这里补出来。
+# 兼容从旧版本升级、已经存在 deploy/.env 的主机：保留现有真实口令，但在
+# Redis 变量缺失或仍为模板占位值时补齐，避免容器拿 localhost/空密码启动。
+if ! grep -q '^REDIS_PASSWORD=.' deploy/.env \
+        || grep -q '^REDIS_PASSWORD=replace-with-' deploy/.env; then
+    REDIS_PW="$(openssl rand -hex 24)"
+    if grep -q '^REDIS_PASSWORD=' deploy/.env; then
+        sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=$REDIS_PW|" deploy/.env
+    else
+        printf 'REDIS_PASSWORD=%s\n' "$REDIS_PW" >> deploy/.env
+    fi
+fi
+grep -q '^REDIS_HOST=' deploy/.env || printf 'REDIS_HOST=redis\n' >> deploy/.env
+grep -q '^REDIS_PORT=' deploy/.env || printf 'REDIS_PORT=6379\n' >> deploy/.env
+grep -q '^REDIS_DATABASE=' deploy/.env || printf 'REDIS_DATABASE=0\n' >> deploy/.env
+grep -q '^REDIS_TIMEOUT=' deploy/.env || printf 'REDIS_TIMEOUT=3s\n' >> deploy/.env
+
+log "生成 ERP JWT 签名密钥"
+bash deploy/generate-jwt-keys.sh | sed 's/^/  /'
+
+log "生成 nginx TLS 配置"
 [ -f deploy/nginx.env ] || cp deploy/nginx.env.example deploy/nginx.env
-sh deploy/set_internal_token.sh | sed 's/^/  /'
 
 log "TLS 证书"
 # 始终生成一份证书到 deploy/nginx/tls/{cert,key}.pem —— 即使 TLS_ENABLED
@@ -232,6 +259,7 @@ fi
 if [ -n "$TLS_ENABLED" ] && [ -f deploy/.env ]; then
     sed -i "s|^PUBLIC_BASE_URL=.*|PUBLIC_BASE_URL=https://$PUBLIC_HOST|" deploy/.env
     sed -i "s|^CORS_ALLOW_ORIGINS=.*|CORS_ALLOW_ORIGINS=https://$PUBLIC_HOST|" deploy/.env
+    sed -i "s|^ERP_COOKIE_SECURE=.*|ERP_COOKIE_SECURE=true|" deploy/.env
 fi
 
 log "镜像仓库"
@@ -257,28 +285,6 @@ else
     echo "  未配 REGISTRY_URL，构建/发布走本地模式（构建机 == 运行机）"
 fi
 
-log "生成 nginx Basic Auth 账号"
-# Docker 在 bind mount 源不存在时会自动建一个同名**目录**，之后 nginx 报的是
-# "is a directory" 而不是"文件不存在"，很难猜。这里先清掉这个坑。
-if [ -d deploy/nginx/htpasswd ]; then
-    rm -rf deploy/nginx/htpasswd
-fi
-if [ -f deploy/nginx/htpasswd ] && [ -z "${LOGIN_PASSWORD:-}" ]; then
-    echo "  htpasswd 已存在，保留（要换密码传 LOGIN_PASSWORD=xxx 重跑）"
-else
-    LOGIN_PASSWORD="${LOGIN_PASSWORD:-$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-16)}"
-    printf '%s:%s\n' "$LOGIN_USER" "$(openssl passwd -apr1 "$LOGIN_PASSWORD")" \
-        > deploy/nginx/htpasswd
-    GENERATED_PW=1
-    echo "  已生成"
-fi
-# 必须 644、不能是 600：nginx master 是 root，但请求期打开 htpasswd 校验口令的是
-# worker（nginx / uid 101）。600 root:root 它读不了 → 每个**带凭据**请求都 500，
-# 而 /healthz 因 auth_basic off 照常 200，表现成"站点活着但一登录就 500"。
-# 文件里是 apr1 哈希不是明文；deploy/ci/prepare-stack.sh 同样按 644 处理（见其注释）。
-# 对「已存在」的老文件也无条件 chmod，顺手修正历史那批改漏落成 600 的实例。
-chmod 644 deploy/nginx/htpasswd
-
 # ---------------------------------------------------------------- 起服务
 log "构建镜像（frontend 的 next build 最慢，2核机器上十几分钟正常）"
 HTTP_PORT="$HTTP_PORT" HTTPS_PORT="$HTTPS_PORT" docker compose build
@@ -300,7 +306,7 @@ while [ $SECONDS -lt $DEADLINE ]; do
 done
 docker compose ps --format 'table {{.Service}}\t{{.State}}\t{{.Health}}'
 
-# 自检：经 nginx 打一次后端。401 = nginx 活着且 Basic Auth 在拦人（预期）。
+# 自检：探活不需要登录；业务 API 由应用层 JWT 保护。
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/healthz" || true)
 CODE2=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/health" || true)
 
@@ -310,9 +316,9 @@ if [ "$TLS_ENABLED" = "1" ]; then
 else
     echo "  访问      http://$PUBLIC_HOST:$HTTP_PORT"
 fi
-echo "  用户名    $LOGIN_USER"
-if [ -n "${GENERATED_PW:-}" ]; then
-    echo "  密码      $LOGIN_PASSWORD          <-- 只打印这一次，自己存好"
+echo "  ERP 管理员 $ERP_ADMIN_USER"
+if [ -n "${ERP_ADMIN_PASSWORD:-}" ]; then
+    echo "  初始密码   $ERP_ADMIN_PASSWORD          <-- 只打印这一次，登录后立即修改"
 fi
 echo "  /healthz  $CODE（200 = nginx 存活）"
 echo "  /health   $CODE2（200 = 后端就绪）"

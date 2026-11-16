@@ -87,16 +87,16 @@ install -o root -g root -m 0700 -d "$SECRET_DIR"
 if [ ! -f "$SECRET_DIR/smoke.env" ]; then
     install -o root -g root -m 0600 /dev/null "$SECRET_DIR/smoke.env"
     cat >"$SECRET_DIR/smoke.env" <<'EOF'
-# 换版后冒烟的 Basic Auth 凭据（deploy/cd/lib.sh 的 cd_smoke 用）。
+# 换版后冒烟的 ERP 管理员凭据（deploy/cd/lib.sh 会先登录换取短期 JWT）。
 # 不填的症状是：发布脚本明确告警「前端与 /api 链路**未验证**」，只探
 # /healthz 与 /health。那两个端点探活全绿从来不足以说明代理链路是好的
 #（阶段 3-B 的坏 PR #5 就是这么放过去的）。
 #
-# 用户名/密码必须与 deploy/nginx/htpasswd 里的一条一致。
-SMOKE_BASIC_USER=admin
-SMOKE_BASIC_PASSWORD=
+# 使用专用低风险冒烟管理员，密码不要提交仓库。
+SMOKE_ERP_USER=admin
+SMOKE_ERP_PASSWORD=
 EOF
-    warn "已生成 $SECRET_DIR/smoke.env 模板 —— 请把 SMOKE_BASIC_PASSWORD 填上（与 htpasswd 一致）"
+    warn "已生成 $SECRET_DIR/smoke.env 模板 —— 请填写 ERP 冒烟账号密码"
 fi
 
 if [ ! -f "$SECRET_DIR/notify.env" ]; then
@@ -255,7 +255,7 @@ echo
 echo "下一步（按顺序）："
 echo "  1. GitHub → Settings → Actions → Runners，确认 $RUNNER_NAME 是 Idle；"
 echo "  2. 填生产密钥（不填也能发，但会少验一层）："
-echo "       $SECRET_DIR/smoke.env   SMOKE_BASIC_PASSWORD（要与 deploy/nginx/htpasswd 一致）"
+echo "       $SECRET_DIR/smoke.env   SMOKE_ERP_PASSWORD（ERP 冒烟管理员密码）"
 echo "       $SECRET_DIR/notify.env  ALERT_WEBHOOK"
 echo "  3. dispatch build.yml —— 这是唯一能证明"长轮询真的连上了"的动作，"
 echo "     开 PR 证明不了：PR 门禁跑在 GitHub 自己的机器上，不碰这台 runner。"

@@ -553,7 +553,7 @@ def _sync_project_files(sandbox: CustomOpenSandbox):
 
     同步内容：
     1. src/skills/       → /skills/       （技能文件）
-    2. requirements.txt  → /workspace/requirements.txt （依赖）
+    2. requirements.txt / requirements.lock → /workspace/（依赖）
     3. src/mcp_server/   → /workspace/mcp_server/ （MCP 工具，可测试调用）
     4. src/agent/tools/  → /workspace/agent_tools/ （Agent 工具脚本）
 
@@ -565,6 +565,7 @@ def _sync_project_files(sandbox: CustomOpenSandbox):
         # (本地路径, 沙箱目标路径, 描述)
         (PROJECT_ROOT / "src" / "skills", "/skills", "Skills"),
         (PROJECT_ROOT / "requirements.txt", "/workspace/requirements.txt", "requirements.txt"),
+        (PROJECT_ROOT / "requirements.lock", "/workspace/requirements.lock", "requirements.lock"),
         (PROJECT_ROOT / "src" / "mcp_server", "/workspace/mcp_server", "MCP Server"),
         (PROJECT_ROOT / "src" / "agent" / "tools", "/workspace/agent_tools", "Agent Tools"),
         (PROJECT_ROOT / "src" / "agent" / "schema.py", "/workspace/schema.py", "Schema"),

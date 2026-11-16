@@ -10,16 +10,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from fastmcp import FastMCP
 
+from src.mcp_server.auth import ERPJwtVerifier
 from src.mcp_server.server_config import MCP_HOST, MCP_PORT
+from src.mcp_server.tools.catalog_tools import register_catalog_tools
 from src.mcp_server.tools.inventory_tools import register_inventory_tools
 from src.mcp_server.tools.order_tools import register_order_tools
 from src.mcp_server.tools.parts_tools import register_parts_tools
+from src.mcp_server.tools.procurement_flow_tools import register_procurement_flow_tools
 from src.mcp_server.tools.suppliers_tools import register_supplier_tools
 
 # 创建 MCP Server 实例
 mcp = FastMCP(
     name="ERP-Procurement-MCP",
-    instructions="汽车制造供应链 MCP 网关：供应商、零部件、订单、库存。",
+    instructions="摩托车零部件采购 MCP 网关：目录适配、供应商报价、采购、收货、库存、补货与退货。",
+    auth=ERPJwtVerifier() if os.getenv("MCP_AUTH_ENABLED", "false").lower() in {"1", "true", "yes"} else None,
 )
 
 # 注册所有工具
@@ -27,6 +31,8 @@ register_supplier_tools(mcp)
 register_parts_tools(mcp)
 register_order_tools(mcp)
 register_inventory_tools(mcp)
+register_catalog_tools(mcp)
+register_procurement_flow_tools(mcp)
 
 
 if __name__ == "__main__":

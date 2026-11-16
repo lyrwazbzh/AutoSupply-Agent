@@ -21,7 +21,6 @@ class WarmMemoryMiddleware(AgentMiddleware):
         self._store = store
         self._user_id = user_id
         self._user_context = user_context or ProcurementContext(user_id=user_id)
-        self._migrated = False
         self._preloaded = False
 
     def _load(self) -> None:
@@ -32,9 +31,6 @@ class WarmMemoryMiddleware(AgentMiddleware):
             return
         try:
             keeper = MemoryKeeper(self._store, self._user_id)
-            if not self._migrated:
-                keeper.migrate_legacy_preferences()
-                self._migrated = True
             self._user_context.preferences = keeper.load_preferences()
             self._user_context.warm_memory = keeper.build_warm_brief(
                 touch=True,

@@ -1,0 +1,13 @@
+services:
+  mock-erp:
+    build: { context: ./deploy/mock-erp }
+    image: erp-mock:contract
+    networks: [mock-contract]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8081/health',timeout=3)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+networks:
+  mock-contract:

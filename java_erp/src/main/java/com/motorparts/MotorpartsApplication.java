@@ -1,6 +1,7 @@
 package com.motorparts;
 
 import org.mybatis.spring.annotation.MapperScan;
+import org.apache.ibatis.annotations.Mapper;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.ComponentScan;
@@ -13,7 +14,7 @@ import org.springframework.transaction.annotation.EnableTransactionManagement;
  * @version 1.0.0
  */
 @SpringBootApplication
-@MapperScan("com.motorparts.mapper")
+@MapperScan(basePackages = "com.motorparts", annotationClass = Mapper.class)
 @ComponentScan(basePackages = "com.motorparts")
 @EnableTransactionManagement
 public class MotorpartsApplication {

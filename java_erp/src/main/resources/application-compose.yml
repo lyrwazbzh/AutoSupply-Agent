@@ -1,0 +1,13 @@
+spring:
+  config:
+    activate:
+      on-profile: compose
+  datasource:
+    url: jdbc:mysql://${ERP_DB_HOST:mysql}:${ERP_DB_PORT:3306}/${MYSQL_DATABASE:motorparts_db}?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
+
+motorparts:
+  security:
+    jwt:
+      require-configured-key: true
+  seed:
+    enabled: false

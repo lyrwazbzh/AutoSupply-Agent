@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
@@ -30,7 +31,18 @@ public class User extends BaseEntity {
      * 密码（加密）
      */
     @NotBlank(message = "密码不能为空")
+    @JsonIgnore
     private String password;
+
+    @TableField("password_hash")
+    @JsonIgnore
+    private String passwordHash;
+
+    @TableField("auth_subject")
+    private String authSubject;
+
+    @TableField("authz_version")
+    private Long authzVersion;
 
     /**
      * 真实姓名
@@ -90,6 +102,13 @@ public class User extends BaseEntity {
     public void setPassword(String password) {
         this.password = password;
     }
+
+    public String getPasswordHash() { return passwordHash; }
+    public void setPasswordHash(String passwordHash) { this.passwordHash = passwordHash; }
+    public String getAuthSubject() { return authSubject; }
+    public void setAuthSubject(String authSubject) { this.authSubject = authSubject; }
+    public Long getAuthzVersion() { return authzVersion; }
+    public void setAuthzVersion(Long authzVersion) { this.authzVersion = authzVersion; }
 
     public String getRealName() {
         return realName;

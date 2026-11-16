@@ -22,6 +22,7 @@ import sys
 import traceback
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from types import ModuleType
 from typing import List, Optional
 from unittest.mock import patch
 
@@ -59,22 +60,26 @@ def _pg_search_shim(keeper: MemoryKeeper):
 
     def recall_lanes(user_id, query, *, limit, config, query_embedding=None, now=None):
         items = [item for item in keeper.all_items() if item.is_valid(now)]
-        lane = items[: max(1, int(limit))]
-        return lane, lane
+        query_tokens = scoring.tokenize(query)
+        documents = [scoring.tokenize(item.searchable_text()) for item in items]
+        scores = scoring.bm25(query_tokens, documents)
+        lane = [
+            item for item, score in sorted(
+                zip(items, scores), key=lambda pair: pair[1], reverse=True
+            ) if score > 0
+        ][: max(1, int(limit))]
+        return lane, []
 
     def touch(user_id, items):
         for item in items:
             item.touch()
             keeper.put(item)
 
-    with (
-        patch("src.agent.memory.postgres_search.index_item"),
-        patch(
-            "src.agent.memory.postgres_search.recall_ranked_lanes",
-            side_effect=recall_lanes,
-        ),
-        patch("src.agent.memory.postgres_search.touch_items", side_effect=touch),
-    ):
+    shim = ModuleType("src.agent.memory.postgres_search")
+    shim.index_item = lambda *args, **kwargs: None
+    shim.recall_ranked_lanes = recall_lanes
+    shim.touch_items = touch
+    with patch.dict(sys.modules, {"src.agent.memory.postgres_search": shim}):
         yield
 
 
@@ -167,15 +172,6 @@ def test_preferences_merge_keeps_previous_fields():
     assert prefs.get("preferred_chart_type") == "pie", f"旧字段被覆盖: {prefs}"
     assert prefs.get("preferred_output") == "table", f"新字段未写入: {prefs}"
 
-    # 显式复现旧行为，证明这个断言确实在防回归
-    legacy_store = FakeStore()
-    legacy_store.put(("user-preferences", "u1"), "preferences", {"preferred_chart_type": "pie"})
-    legacy_store.put(("user-preferences", "u1"), "preferences", {"preferred_output": "table"})
-    assert legacy_store.get(("user-preferences", "u1"), "preferences").value == {
-        "preferred_output": "table"
-    }, "旧行为复现失败，说明测试没有真正覆盖该 Bug"
-
-
 @test
 def test_preferences_merge_list_union_with_cap():
     store = FakeStore()
@@ -236,7 +232,7 @@ def test_namespace_normalization():
     assert episodic_ns("alice") == ("memories", "alice", "episodic")
     assert ns.procedural_ns("alice") == ("memories", "alice", "procedural")
     assert ns.org_policies_ns() == ("memories", "org", "policies")
-    assert ns.legacy_preferences_ns("alice") == ("user-preferences", "alice")
+    assert ns.preferences_ns("alice") == ("memories", "alice", "projection")
 
     info = ns.parse(semantic_ns("alice"))
     assert info["is_memory"] and not info["is_org"] and info["type"] == "semantic"
@@ -249,10 +245,11 @@ def test_items_land_in_normalized_namespaces():
     keeper = MemoryKeeper(store, "alice")
     keeper.upsert_semantic("preferred_chart_type", "pie")
     keeper.archive_episode("t-1", summary="对比了三家供应商")
+    keeper.merge_preferences({"preferred_output": "table"})
 
     assert any(k[0] == ("memories", "alice", "semantic") for k in store.data), store.data.keys()
     assert any(k[0] == ("memories", "alice", "episodic") for k in store.data), store.data.keys()
-    assert ("user-preferences", "alice") in {k[0] for k in store.data} or True
+    assert any(k[0] == ("memories", "alice", "projection") for k in store.data), store.data.keys()
 
 
 @test
@@ -367,7 +364,7 @@ def test_old_episodes_demote_out_of_warm():
 
     # 但老会话仍在 COLD，可被检索到
     with _pg_search_shim(keeper):
-        hits = keeper.search("老会话")
+        hits = keeper.search("老任务")
     assert any(h[0].key == "t-old" for h in hits), hits
 
 
@@ -396,7 +393,7 @@ def test_episode_archive_updates_one_task_per_thread():
     episodes = keeper.list_items("episodic")
     assert len(episodes) == 1
     assert episodes[0].id == "ep_t-1"
-    assert episodes[0].summary == "完成缺料分析"
+    assert episodes[0].summary == "完成采购分析"
 
 
 @test
@@ -423,7 +420,7 @@ def test_episode_summary_shape():
     assert "恒力机械" in digest["summary"], digest
     assert "恒力机械信用评级 AA" in digest["summary"], digest
     assert "supplier_page" in digest["tools"], digest
-    assert "tool_results" not in digest, digest
+    assert digest["structured"]["tool_results"][0]["status"] == "succeeded", digest
 
 
 @test
@@ -443,7 +440,7 @@ def test_episode_summary_uses_full_thread():
     assert digest["goal"] == "分析采购订单", digest
     assert "供应商比较完成" in digest["summary"], digest
     assert digest["tools"] == ["inventory_warning", "supplier_page"], digest
-    assert "tool_results" not in digest, digest
+    assert len(digest["structured"]["tool_results"]) == 2, digest
 
 
 # ---------------------------------------------------------------- 遗忘
@@ -628,34 +625,6 @@ def test_keeper_without_store_is_noop():
 
 
 @test
-def test_legacy_migration_is_idempotent():
-    store = FakeStore()
-    store.put(("user-preferences", "u1"), "preferences", {"preferred_chart_type": "pie"})
-
-    keeper = MemoryKeeper(store, "u1")
-    assert keeper.migrate_legacy_preferences() == 1
-    assert keeper.active_semantic("preferred_chart_type").content == "pie"
-
-    assert keeper.migrate_legacy_preferences() == 0
-
-
-@test
-def test_migration_not_blocked_by_unrelated_semantic():
-    """回归：semantic 下存在与偏好无关的条目时，迁移不应被整体跳过。"""
-    store = FakeStore()
-    store.put(("user-preferences", "u9"), "preferences", {"preferred_chart_type": "pie"})
-    keeper = MemoryKeeper(store, "u9")
-
-    # 用户先用 remember 写了一条自定义语义记忆（key 不是稳定偏好键）
-    keeper.upsert_semantic("预算上限", "单笔采购不超过 50 万")
-
-    assert keeper.migrate_legacy_preferences() == 1
-    assert keeper.active_semantic("preferred_chart_type").content == "pie"
-    assert keeper.active_semantic("预算上限").content == "单笔采购不超过 50 万"
-    assert keeper.migrate_legacy_preferences() == 0
-
-
-@test
 def test_part_args_do_not_leak_into_suppliers():
     """回归：part_search 的参数不应混进 recent_suppliers。"""
     messages = [
@@ -729,11 +698,11 @@ def test_subagent_tool_matching():
              ("order_create", "order_page", "supplier_query", "reorder_item")]
 
     specs = resolve_subagent_tools(
-        [{"name": "sa", "description": "d", "system_prompt": "p", "tools": ["order"]}],
+        [{"name": "sa", "description": "d", "system_prompt": "p", "tools": ["order_create"]}],
         tools,
     )
     matched = [t.name for t in specs[0]["tools"]]
-    assert "order_create" in matched and "order_page" in matched, matched
+    assert matched == ["order_create"], matched
     assert "reorder_item" not in matched, f"子串误命中: {matched}"
     assert "supplier_query" not in matched, matched
 

@@ -6,13 +6,7 @@
     ("memories", <user_id>, "episodic")    用户级情节归档（做过什么）
     ("memories", <user_id>, "procedural")  用户级经验/流程（怎么做事）
     ("memories", "org", "policies")        组织级只读策略
-
-``("user-preferences", <user_id>)`` 这个旧命名空间**保留**，但语义变了：
-它不再是"长期记忆本体"，而是 WARM 层的一份**投影/缓存**（只放偏好字典），
-供 ``precompute_agent_context`` 直接塞进 system_prompt。真正的记忆本体在
-``memories`` 下，投影由 ``MemoryKeeper`` 单向同步，不反向写回。
-
-这样既做了命名空间规范化，又不会破坏已有的读取链路。
+    ("memories", <user_id>, "projection")  WARM 偏好投影
 """
 from __future__ import annotations
 
@@ -24,10 +18,10 @@ SEMANTIC = "semantic"
 EPISODIC = "episodic"
 PROCEDURAL = "procedural"
 POLICIES = "policies"
+PROJECTION = "projection"
 
 ORG_ID = "org"
-LEGACY_PREFERENCES_ROOT = "user-preferences"
-LEGACY_PREFERENCES_KEY = "preferences"
+PREFERENCES_KEY = "preferences"
 
 
 def semantic_ns(user_id: str) -> Tuple[str, str, str]:
@@ -46,8 +40,8 @@ def org_policies_ns() -> Tuple[str, str, str]:
     return (ROOT, ORG_ID, POLICIES)
 
 
-def legacy_preferences_ns(user_id: str) -> Tuple[str, str]:
-    return (LEGACY_PREFERENCES_ROOT, user_id or "default_user")
+def preferences_ns(user_id: str) -> Tuple[str, str, str]:
+    return (ROOT, user_id or "default_user", PROJECTION)
 
 
 def type_ns(user_id: str, memory_type: str) -> Tuple[str, str, str]:

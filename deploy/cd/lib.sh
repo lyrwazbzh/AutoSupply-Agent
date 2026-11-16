@@ -206,17 +206,25 @@ cd_assert_daemon_address_pools() {
 }
 
 cd_assert_token_consistency() {
-    # nginx 用 deploy/nginx.env 渲染 X-Internal-Auth，backend 用 deploy/.env
-    # 校验。两处不一致的表现是「/healthz 与 /health 都 200，所有 /api 401」，
-    # 极难定位。放在前置里直接拦住。
-    local a b
-    a="$(sed -n 's/^INTERNAL_AUTH_TOKEN=//p' "$CD_REPO_ROOT/deploy/.env" | head -1 | tr -d '"'"'"'')"
-    b="$(sed -n 's/^INTERNAL_AUTH_TOKEN=//p' "$CD_REPO_ROOT/deploy/nginx.env" | head -1 | tr -d '"'"'"'')"
-    [ -n "$a" ] || die "deploy/.env 缺 INTERNAL_AUTH_TOKEN。跑 sh deploy/set_internal_token.sh" "$CD_EXIT_PRECHECK"
-    [ -n "$b" ] || die "deploy/nginx.env 缺 INTERNAL_AUTH_TOKEN。跑 sh deploy/set_internal_token.sh" "$CD_EXIT_PRECHECK"
-    [ "$a" = "$b" ] \
-        || die "deploy/.env 与 deploy/nginx.env 的 INTERNAL_AUTH_TOKEN 不一致（当前状态：/health 会 200 但所有 /api 401）。跑 sh deploy/set_internal_token.sh 修" "$CD_EXIT_PRECHECK"
-    info "共享密钥两处一致（len=${#a}，前 4 位 ${a:0:4}…）"
+    # 私钥仅挂给 java-erp，公钥给 backend/mcp。老部署必须先完成一次初始化。
+    local private="$CD_REPO_ROOT/deploy/secrets/erp-jwt-private.pem"
+    local public="$CD_REPO_ROOT/deploy/secrets/erp-jwt-public.pem"
+    [ -s "$private" ] && [ -s "$public" ] \
+        || die "缺 ERP JWT 密钥：先运行 bash deploy/init-security.sh" "$CD_EXIT_PRECHECK"
+    grep -q '^AUTH_MODE=jwt$' "$CD_REPO_ROOT/deploy/.env" \
+        || die "deploy/.env 尚未切换 JWT：先运行 bash deploy/init-security.sh" "$CD_EXIT_PRECHECK"
+    info "ERP JWT 密钥与统一身份配置存在"
+}
+
+cd_assert_redis_secret() {
+    local env_file="$CD_REPO_ROOT/deploy/.env" value
+    value="$(sed -n 's/^REDIS_PASSWORD=//p' "$env_file" 2>/dev/null | head -1)"
+    [ -n "$value" ] || die "deploy/.env 缺 REDIS_PASSWORD" "$CD_EXIT_PRECHECK"
+    case "$value" in
+        replace-with-*|change-me*|changeme*)
+            die "deploy/.env 的 REDIS_PASSWORD 仍是占位值" "$CD_EXIT_PRECHECK" ;;
+    esac
+    info "Redis 独立口令配置存在"
 }
 
 cd_assert_disk() {
@@ -238,8 +246,7 @@ cd_preflight() {
     [ -f "$CD_REPO_ROOT/docker-compose.yml" ] || die "找不到 $CD_REPO_ROOT/docker-compose.yml" "$CD_EXIT_PRECHECK"
     [ -f "$CD_REPO_ROOT/deploy/.env" ] \
         || die "缺 deploy/.env：这台机器没跑过 bootstrap.sh，或包没解全" "$CD_EXIT_PRECHECK"
-    [ -f "$CD_REPO_ROOT/deploy/nginx/htpasswd" ] \
-        || die "缺 deploy/nginx/htpasswd：nginx 起不来。见 deploy/README.md「创建登录账号」" "$CD_EXIT_PRECHECK"
+    cd_assert_redis_secret
     cd_assert_token_consistency
     cd_assert_disk "$CD_DISK_MIN_GB"
 }
@@ -267,7 +274,7 @@ cd_lock() {
 # 两边的输出都看不出问题出在名字上。
 CD_APP_IMAGE_NAME=erp-agent-app
 CD_FRONTEND_IMAGE_NAME=erp-agent-frontend
-CD_MOCK_IMAGE_NAME=erp-mock
+CD_JAVA_ERP_IMAGE_NAME=erp-agent-java-erp
 
 # registry 前缀从 deploy/.env 的 REGISTRY_URL 读。**只在这里读一次**：build.sh
 # 和 deploy.sh 都 source lib.sh，各自再读一遍迟早漂（一处加斜杠一处没加）。
@@ -291,7 +298,7 @@ cd_image_refs() {
     prefix="$(cd_registry_prefix)" || true
     export APP_IMAGE="${prefix}${CD_APP_IMAGE_NAME}:$tag"
     export FRONTEND_IMAGE="${prefix}${CD_FRONTEND_IMAGE_NAME}:$tag"
-    export MOCK_ERP_IMAGE="${prefix}${CD_MOCK_IMAGE_NAME}:$tag"
+    export JAVA_ERP_IMAGE="${prefix}${CD_JAVA_ERP_IMAGE_NAME}:$tag"
     export CD_HAS_REGISTRY=0
     # 必须用 if，不能写 `[ -n "$prefix" ] && export ...`：这是函数最后一条
     # 语句，prefix 为空时整体返回 1，调用方（deploy.sh）在 set -e 下静默退出 ——
@@ -302,7 +309,7 @@ cd_image_refs() {
     fi
 }
 
-cd_all_images() { printf '%s\n' "$APP_IMAGE" "$FRONTEND_IMAGE" "$MOCK_ERP_IMAGE"; }
+cd_all_images() { printf '%s\n' "$APP_IMAGE" "$FRONTEND_IMAGE" "$JAVA_ERP_IMAGE"; }
 
 # 发布引用 digest 而不是 tag（tag 可以被重新指向，digest 不能）。
 cd_image_id() { docker image inspect -f '{{.Id}}' "$1" 2>/dev/null; }
@@ -323,7 +330,7 @@ cd_write_override() {
         printf '# 由 deploy/cd/deploy.sh 生成，不要手改。\n'
         printf '# 只覆盖会换版的服务的 image。别在这里加 postgres/dind/nginx。\n'
         printf 'services:\n'
-        printf '  mock-erp:\n    image: %s\n' "$MOCK_ERP_IMAGE"
+        printf '  java-erp:\n    image: %s\n' "$JAVA_ERP_IMAGE"
         printf '  mcp:\n    image: %s\n' "$APP_IMAGE"
         printf '  backend:\n    image: %s\n' "$APP_IMAGE"
         printf '  frontend:\n    image: %s\n' "$FRONTEND_IMAGE"
@@ -362,8 +369,7 @@ cd_content_hash() {
 
 # 落盘哈希：只覆盖那些**被 bind mount 进容器**的路径。state/、下载目录、
 # 日志会一直变，把它们算进去只会得到假的「不一致」告警。
-# 注意不含 deploy/nginx/htpasswd —— 它是受保护的（同步时不覆盖），轮换密码
-# 属于正常操作，不该让它触发漂移告警。
+# JWT 密钥与 TLS 证书是受保护运行时文件，不参与源码漂移判断。
 CD_BIND_PATHS=(src/skills deploy/nginx/nginx.conf deploy/nginx/templates deploy/dind-daemon.json)
 
 # 同样先取内容再哈希：`find` 一个文件都没找到时会给 sha256sum 喂空输入，
@@ -433,30 +439,12 @@ cd_ensure_nginx_tls_cert() {
     return 0
 }
 
-# up 前对两个 bind-mount 运行时文件做幂等修正。与 cd_ensure_nginx_tls_cert 同属
-# 「bootstrap 只在装机器时跑过、老实例升级补不匀」的兜底，在 cd_apply_and_verify
-# 的 up -d 前调用，正常发布与回滚两路都经过这里。两个坑都只在**带凭据请求**上爆，
-# 无凭据的 /healthz 照常 200，所以平时健康检查根本看不出来。
-cd_ensure_nginx_auth_and_switch() {
-    local nginx_dir="$CD_REPO_ROOT/deploy/nginx"
+# up 前修正老实例缺失的 TLS 开关。与 cd_ensure_nginx_tls_cert 同属
+# 「bootstrap 只在装机器时跑过、老实例升级补不匀」的兜底。
+cd_ensure_nginx_runtime() {
     local nginx_env="$CD_REPO_ROOT/deploy/nginx.env"
 
-    # 1) htpasswd 必须对 worker(nginx uid 101) 可读。老实例（bootstrap 早期漏 chmod
-    #    那批）落的是 600 root:root，worker 在请求期打不开 → 带凭据请求全 500。
-    #    644 即可（apr1 哈希非明文），与 deploy/ci/prepare-stack.sh 保持一致。
-    if [ -f "$nginx_dir/htpasswd" ]; then
-        local mode
-        mode="$(stat -c '%a' "$nginx_dir/htpasswd" 2>/dev/null || true)"
-        if [ "$mode" != "644" ]; then
-            if chmod 644 "$nginx_dir/htpasswd"; then
-                info "nginx htpasswd 权限由 ${mode:-未知} 修正为 644（worker 否则读不了，带凭据请求 500）"
-            else
-                warn "chmod 644 $nginx_dir/htpasswd 失败"
-            fi
-        fi
-    fi
-
-    # 2) nginx.env 必须显式含 TLS_ENABLED= 行（值可空）。缺这行时容器内该变量未
+    # nginx.env 必须显式含 TLS_ENABLED= 行（值可空）。缺这行时容器内该变量未
     #    定义，envsubst 不替换 ${TLS_ENABLED}，它残留进 tls.conf 与 map 目标
     #    $tls_enabled 自引用 → 每个请求 cycle 500。只在「完全没这行」时补空值
     #    （= 纯 HTTP）；已有值（含 TLS_ENABLED=1）绝不动。
@@ -502,11 +490,16 @@ cd_assert_synced() {
     local f missing=""
     for f in docker-compose.yml \
              deploy/.env.example deploy/nginx.env.example deploy/nginx/nginx.conf \
-             deploy/nginx/templates/internal_token.conf.template \
+             deploy/generate-jwt-keys.sh deploy/init-security.sh \
              deploy/cd/lib.sh deploy/cd/deploy.sh deploy/cd/package.filter \
              deploy/dr/backup.sh deploy/dr/lib-dr.sh \
              deploy/dr/offsite.sh deploy/dr/ossutil-install.sh deploy/dr/migrate.sh \
-             deploy/dr/restore-drill.sh \
+             deploy/dr/restore-drill.sh deploy/dr/restore.sh \
+             deploy/mysql/migrate-host.sh \
+             java_erp/Dockerfile java_erp/src/main/resources/db/migration/V1__baseline_schema.sql \
+             java_erp/src/main/resources/db/migration/V2__harness_write_governance.sql \
+             java_erp/src/main/resources/db/migration/V3__security_rbac.sql \
+             java_erp/src/main/resources/db/migration/V4__business_audit.sql \
              deploy/monitor/patrol.sh \
              deploy/prometheus/prometheus.yml \
              deploy/grafana/provisioning/datasources.yml \
@@ -555,10 +548,10 @@ cd_write_state() {
         # digest（tag 可以被重新指向，digest 不能）。回滚时会断言两者仍然一致。
         printf 'APP_IMAGE=%s\n'         "$APP_IMAGE"
         printf 'FRONTEND_IMAGE=%s\n'    "$FRONTEND_IMAGE"
-        printf 'MOCK_ERP_IMAGE=%s\n'    "$MOCK_ERP_IMAGE"
+        printf 'JAVA_ERP_IMAGE=%s\n'    "$JAVA_ERP_IMAGE"
         printf 'APP_IMAGE_ID=%s\n'      "$(cd_image_id "$APP_IMAGE")"
         printf 'FRONTEND_IMAGE_ID=%s\n' "$(cd_image_id "$FRONTEND_IMAGE")"
-        printf 'MOCK_ERP_IMAGE_ID=%s\n' "$(cd_image_id "$MOCK_ERP_IMAGE")"
+        printf 'JAVA_ERP_IMAGE_ID=%s\n' "$(cd_image_id "$JAVA_ERP_IMAGE")"
         printf 'TREE_SNAPSHOT_SHA256=%s\n' "${CD_TREE_HASH:-}"
         printf 'BIND_SNAPSHOT_SHA256=%s\n' "$(cd_bind_hash)"
         printf 'NGINX_TREE_SHA256=%s\n'    "$(cd_nginx_hash)"
@@ -599,7 +592,7 @@ cd_load_state() {
     # 状态文件是我们自己生成的 KEY=VALUE，不含命令替换。
     . "$file"
     set +a
-    export APP_IMAGE FRONTEND_IMAGE MOCK_ERP_IMAGE
+    export APP_IMAGE FRONTEND_IMAGE JAVA_ERP_IMAGE
 }
 
 cd_report_state() {
@@ -647,8 +640,7 @@ cd_smoke() {
     local base="http://127.0.0.1:$HTTP_PORT"
     local bad=0 code body
 
-    # /healthz 与 /health 是 nginx 里仅有的两个 auth_basic off 端点
-    #（见 deploy/nginx/nginx.conf），所以探针不需要密码。
+    # 探活不需要登录；业务 API 由应用层 Bearer JWT 保护。
     body="$(curl -sS --max-time 10 "$base/healthz" 2>/dev/null || true)"
     if [ "$body" = "ok" ]; then info "/healthz ok"
     else warn "/healthz 返回 '$body'（期望 'ok'）"; bad=1; fi
@@ -657,25 +649,36 @@ cd_smoke() {
     if [ "$code" = "200" ]; then info "/health 200（nginx 已代理到 backend）"
     else warn "/health 返回 $code（期望 200）"; bad=1; fi
 
-    # 带认证的深链路：这一条同时验证 nginx 活着、Basic Auth 在放行、以及
-    # nginx→backend 的 X-Internal-Auth 共享密钥两边一致。密钥不一致的表现就是
-    # 所有 /api 401（前置检查里已拦，这里是运行时的第二道）。
-    if [ -n "${SMOKE_BASIC_USER:-}" ] && [ -n "${SMOKE_BASIC_PASSWORD:-}" ]; then
+    # 通过 Java ERP 登录，再用同一 Bearer 同时访问 Python 与 Java API。
+    if [ -n "${SMOKE_ERP_USER:-}" ] && [ -n "${SMOKE_ERP_PASSWORD:-}" ]; then
+        local login token
+        login="$(curl -sS --max-time 15 -H 'Content-Type: application/json' \
+            -d "{\"username\":\"$SMOKE_ERP_USER\",\"password\":\"$SMOKE_ERP_PASSWORD\"}" \
+            "$base/api/auth/login" 2>/dev/null || true)"
+        token="$(printf '%s' "$login" | sed -n 's/.*"accessToken":"\([^"]*\)".*/\1/p')"
+        if [ -z "$token" ]; then
+            warn "ERP 冒烟账号登录失败"; bad=1
+            return "$bad"
+        fi
         code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
-            -u "$SMOKE_BASIC_USER:$SMOKE_BASIC_PASSWORD" "$base/api/history" 2>/dev/null || true)"
+            -H "Authorization: Bearer $token" "$base/api/history" 2>/dev/null || true)"
         case "$code" in
-            200) info "/api/history 200（认证 + 内部密钥链 + PostgreSQL 都通）" ;;
-            401) warn "/api/history 401：密码错，或 nginx 与 backend 的 INTERNAL_AUTH_TOKEN 不一致"
+            200) info "/api/history 200（JWT + Python active check + PostgreSQL 都通）" ;;
+            401) warn "/api/history 401：访问令牌未被 backend 接受"
                  bad=1 ;;
             *)   warn "/api/history 返回 $code"; bad=1 ;;
         esac
 
         code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
-            -u "$SMOKE_BASIC_USER:$SMOKE_BASIC_PASSWORD" "$base/" 2>/dev/null || true)"
+            -H "Authorization: Bearer $token" "$base/api/erp/statistics/dashboard" 2>/dev/null || true)"
+        if [ "$code" = "200" ]; then info "/api/erp/statistics/dashboard 200（Java RBAC 正常）"
+        else warn "ERP dashboard 返回 $code（期望 200）"; bad=1; fi
+
+        code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$base/" 2>/dev/null || true)"
         if [ "$code" = "200" ]; then info "/ 200（前端在跑）"
         else warn "/ 返回 $code（期望 200）"; bad=1; fi
     else
-        warn "未提供 SMOKE_BASIC_USER / SMOKE_BASIC_PASSWORD，跳过认证后的冒烟："
+        warn "未提供 SMOKE_ERP_USER / SMOKE_ERP_PASSWORD，跳过认证后的冒烟："
         warn "  前端与 /api 链路**未验证**（探活全绿说明不了代理链路是好的）。"
         warn "  在部署机上填 /etc/erp-agent/smoke.env —— 它由发布闸门以 root 读取，"
         warn "  不经过 runner 的进程环境。"
@@ -691,16 +694,16 @@ cd_diagnose() {
 }
 
 # ---------------------------------------------------------------- 影子启动
-# 换版**之前**让新镜像以旁观者身份跑一遍（方案 5.5）。单副本 + 进程内状态决定了
-# 真流量切分做不到，这是这个约束下唯一有意义的 canary。
+# 换版**之前**让新镜像以旁观者身份跑一遍（方案 5.5）。当前发布脚本仍采用
+# 单个 Compose backend，所以影子实例只做无流量探测；运行所有权已经由
+# PostgreSQL 租约协调。
 #
 # 它存在的理由是约束 A 里那个数字：坏版本一旦走到换版，停机窗口是 ~134s
 #（compose 探测依赖失败 ~100s + 回滚 ~40s）。影子阶段拦下的故障，生产一秒都不用停。
 #
 # 为什么**不**接 sandbox 网络、不设 DOCKER_HOST、不挂 docker.sock（原始行为）：
-# 让第二个 backend 进程碰到 dind，它的 prune_orphans() 会无条件删掉所有
-# erp-sandbox-warm-*（见 README 架构约束 B）—— 影子启动会把生产的预热池清空，
-# 自己把自己变成一次故障。docker 不可达时那两条启动路径都是优雅降级的
+# 影子实例不需要执行真实沙箱任务，因此仍不接 sandbox 网络、不设 DOCKER_HOST。
+# 暖池所有权现已外置，不再依赖“看到前缀就删除”的进程内判断。
 #（prune 打一行 warning 后 return 0，ensure_warm_pool 逐容器 catch），所以影子
 # 容器照常起得来，验证的也正好是"除沙箱外的一切"。
 #
@@ -845,9 +848,12 @@ cd_shadow() {
             --network "$net_edge" \
             --env-file "$CD_REPO_ROOT/deploy/.env" \
             -e MCP_SERVER_URL=http://mcp:9000 \
-            -e ERP_BASE_URL=http://mock-erp:8081 \
+            -e ERP_BASE_URL=http://java-erp:8080 \
             -e ALLOW_LOCAL_SHELL_FALLBACK=false \
-            -e AUTH_MODE=proxy \
+            -e AUTH_MODE=jwt \
+            -e SMOKE_ERP_USER="${SMOKE_ERP_USER:-}" \
+            -e SMOKE_ERP_PASSWORD="${SMOKE_ERP_PASSWORD:-}" \
+            -v "$CD_REPO_ROOT/deploy/secrets/erp-jwt-public.pem:/run/secrets/erp-jwt-public.pem:ro" \
             -e CD_SHADOW_LLM="${CD_SHADOW_LLM:-1}" \
             -v "$CD_REPO_ROOT/src/skills:/app/src/skills:ro" \
             --tmpfs /app/.runtime/artifacts \

@@ -70,8 +70,8 @@ class PruneOrphansTest(unittest.TestCase):
         return removed, {c.name for c in containers if c.removed}, containers
 
     # ------------------------------------------------------------ 必删
-    def test_warm_container_is_pruned(self):
-        """暖容器在进程重启后必然无主：预热池是纯进程内状态。"""
+    def test_warm_container_without_external_lease_is_pruned(self):
+        """外置暖池租约不存在时，容器才可判定为孤儿。"""
         removed, names, _ = self._run([FakeContainer(WARM)], persisted=set())
         self.assertEqual(removed, 1)
         self.assertEqual(names, {WARM})
@@ -115,13 +115,19 @@ class PruneOrphansTest(unittest.TestCase):
         self.assertEqual(removed, 0, "persisted=None 时不应删任何用户容器")
         self.assertEqual(names, set())
 
-    def test_persisted_none_still_prunes_warm_containers(self):
-        """但暖容器照删 —— 它们与 Mongo 无关，重启后必然无主。"""
+    def test_persisted_none_keeps_warm_containers(self):
+        """暖池归属也已外置；数据库不可用时不能删其它副本的暖容器。"""
         warm = FakeContainer(WARM)
         alice = FakeContainer(USER_ALICE)
         removed, names, _ = self._run([warm, alice], persisted=None)
-        self.assertEqual(removed, 1)
-        self.assertEqual(names, {WARM})
+        self.assertEqual(removed, 0)
+        self.assertEqual(names, set())
+
+    def test_warm_container_with_active_external_lease_is_kept(self):
+        warm = FakeContainer(WARM)
+        removed, names, _ = self._run([warm], persisted={WARM})
+        self.assertEqual(removed, 0)
+        self.assertEqual(names, set())
 
     # ------------------------------------------------------------ 边界
     def test_unrelated_container_is_ignored(self):

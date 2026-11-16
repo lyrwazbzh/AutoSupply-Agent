@@ -74,8 +74,13 @@ jobs:
           python-version: "3.11"    # 与 Dockerfile 的 python:3.11-slim 对齐
           cache: pip
           cache-dependency-path: |
+            requirements.in
+            requirements.lock
             requirements.txt
             requirements-dev.txt
+
+      - name: 依赖锁一致性
+        run: python scripts/check_requirements_lock.py
 
       - name: 装依赖
         run: python -m pip install -r requirements-dev.txt
@@ -88,6 +93,12 @@ jobs:
 
       - name: 语法编译
         run: python -m compileall -q src
+
+      - name: 完整 Agent 评测数据契约
+        run: |
+          python -m src.evaluation \
+            --dataset src/test/evaluation/datasets/schema_examples.jsonl \
+            --validate-only
 
       # 这 6 条是阶段 2 之前就存在、且已逐条核对过的离线回归网。它们全都不碰
       # 真实模型 Key、不碰 PostgreSQL、不碰 Docker、不碰真 ERP。
@@ -120,6 +131,40 @@ jobs:
       # 照着显示值填 37 会当场红）。所以这一步现在**会阻断**，不再只是报告。
       - name: pytest + 覆盖率（地板 36%）
         run: pytest -v --cov --cov-report=term-missing
+
+  # ---------------------------------------------------------------- Java ERP
+  java-erp:
+    name: Java ERP 编译与测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: java_erp/pom.xml
+
+      # Windows 工作区不保存 POSIX executable bit，CI 在执行前显式恢复。
+      - name: Maven Wrapper 与工具链校验
+        working-directory: java_erp
+        run: |
+          chmod +x mvnw
+          ./mvnw -B -ntp validate
+
+      - name: 单元与集成测试
+        working-directory: java_erp
+        run: ./mvnw -B -ntp verify
+
+      - name: 上传 JaCoCo 报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-erp-jacoco
+          path: java_erp/target/site/jacoco
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------- 前端
   frontend:
@@ -254,7 +299,7 @@ jobs:
   # `set $backend http://backend:8000` 改成 :9999，结构断言（test_static_config.py）
   # 一条都不会红 —— 头都在、位置都对、语法也对 —— 但运行起来全是 502。
   #
-  # 栈的形状：postgres + mock-erp + mcp + backend + frontend + nginx 全是真的，
+  # 栈的形状：postgres + mysql + java-erp + mcp + backend + frontend + nginx 全是真的，
   # 只有 dind 与 sandbox-image-loader 是 alpine 替身（见 deploy/ci/compose.ci.yml，
   # 那里解释了为什么 backend 对 dind 缺失是优雅降级的）。
   # 真 dind 的验证在下面的 stack-smoke —— 分开是因为调 dind 会淹没认证链路的失败。
@@ -271,7 +316,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       # 三个镜像预先构建并打成 **compose 期望的 tag**（docker-compose.yml 里写死的
-      # erp-agent-app:local / erp-agent-frontend:local / erp-mock:local），然后由
+      # erp-agent-app:local / erp-agent-frontend:local / erp-agent-java-erp:local），然后由
       # compose 直接使用 —— 所以这里不能图省事用 `docker compose build`。
       #
       # **scope 带 `-auth` 后缀，刻意与 frontend / build-verify 两个 job 分开。**
@@ -303,15 +348,15 @@ jobs:
           cache-from: type=gha,scope=frontend-auth
           cache-to: type=gha,scope=frontend-auth,mode=max
 
-      - name: 构建 mock-erp 镜像
+      - name: 构建 Java ERP 镜像
         uses: docker/build-push-action@v6
         with:
-          context: ./deploy/mock-erp
+          context: ./java_erp
           push: false
           load: true
-          tags: erp-mock:local
-          cache-from: type=gha,scope=mock-erp-auth
-          cache-to: type=gha,scope=mock-erp-auth,mode=max
+          tags: erp-agent-java-erp:local
+          cache-from: type=gha,scope=java-erp-auth
+          cache-to: type=gha,scope=java-erp-auth,mode=max
 
       - name: 构建 PostgreSQL 镜像
         uses: docker/build-push-action@v6
@@ -328,7 +373,7 @@ jobs:
       - name: 确认四个镜像都在本地
         run: |
           docker image inspect \
-            erp-agent-app:local erp-agent-frontend:local erp-mock:local \
+            erp-agent-app:local erp-agent-frontend:local erp-agent-java-erp:local \
             erp-agent-postgres:local \
             --format '{{.RepoTags}} {{.Id}}'
 

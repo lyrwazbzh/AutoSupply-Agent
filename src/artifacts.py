@@ -10,7 +10,6 @@ import uuid
 from pathlib import Path
 from urllib.parse import quote
 
-
 ARTIFACT_ROOT = Path(__file__).resolve().parent.parent / ".runtime" / "artifacts"
 ARTIFACT_TTL_SECONDS = max(60, int(os.getenv("ARTIFACT_TTL_SECONDS", "86400")))
 

@@ -7,6 +7,7 @@ import { useChat } from "@/hooks/useChat";
 import { useHistory } from "@/hooks/useHistory";
 import { getChatState, getMessages } from "@/lib/api";
 import { ChatMessage } from "@/lib/types";
+import RequireAuth from "@/components/auth/RequireAuth";
 
 export default function Home() {
   const chat = useChat();
@@ -74,21 +75,11 @@ export default function Home() {
     [chat]
   );
 
-  const handleApprove = useCallback(() => {
-    const operationIds = chat.interruptData?.operation_ids ?? [];
-    chat.resumeWith({
-      decisions: operationIds.map((operation_id) => ({ operation_id, type: "approve" })),
-    });
+  const handleCheckApproval = useCallback(() => {
+    chat.resumeWith({ check_approval: true });
   }, [chat]);
 
-  const handleReject = useCallback(() => {
-    const operationIds = chat.interruptData?.operation_ids ?? [];
-    chat.resumeWith({
-      decisions: operationIds.map((operation_id) => ({ operation_id, type: "reject" })),
-    });
-  }, [chat]);
-
-  return (
+  return <RequireAuth permission="assistant:use">{
     <div className="flex h-screen overflow-hidden">
       <Sidebar
         conversations={history.conversations}
@@ -113,9 +104,8 @@ export default function Home() {
         error={chat.error}
         onSend={chat.sendMessage}
         onSupplement={handleSupplement}
-        onApprove={handleApprove}
-        onReject={handleReject}
+        onCheckApproval={handleCheckApproval}
       />
     </div>
-  );
+  }</RequireAuth>;
 }

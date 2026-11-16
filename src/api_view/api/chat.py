@@ -9,6 +9,7 @@
 - SSE 事件协议: token / tool_start / tool_args / tool_result / tool_end / interrupt / done
 """
 import asyncio
+import contextlib
 import json
 import uuid
 from datetime import datetime
@@ -18,10 +19,18 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from langgraph.types import Command
 
+from ...agent.config import AGENT_RUN_LEASE_TTL_SECONDS, AGENT_SESSION_TTL_SECONDS
 from ...agent.log_utils import web_logger
 from ...agent.schema import ChatRequest, ResumeRequest
+from ...runtime_state import RuntimeLeaseConflict
 from ..agent_loader import agent_loader
-from ..auth import assert_thread_owner, current_user_id, resolve_user_id
+from ..auth import (
+    assert_permission,
+    assert_thread_owner,
+    current_user_id,
+    get_request_principal,
+    resolve_user_id,
+)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -93,18 +102,54 @@ def _format_interrupt_data(interrupt_value: object) -> dict | None:
     }
 
 
+def _pending_approval_actions(state: object) -> list[dict[str, str]]:
+    """Extract server-side operation identities in LangGraph decision order."""
+    actions: list[dict[str, str]] = []
+    for task in getattr(state, "tasks", ()) or ():
+        for interrupt_item in getattr(task, "interrupts", ()) or ():
+            value = (
+                interrupt_item.value
+                if hasattr(interrupt_item, "value")
+                else interrupt_item
+            )
+            if not isinstance(value, dict):
+                continue
+            action_requests = value.get("action_requests")
+            if not isinstance(action_requests, list) and value.get("type") == "tool_approval":
+                action_requests = [value]
+            if not isinstance(action_requests, list):
+                continue
+            for action in action_requests:
+                if not isinstance(action, dict):
+                    continue
+                name = str(action.get("name") or "").strip().lower()
+                args = action.get("args")
+                operation_id = (
+                    str(args.get("operation_id") or "").strip()
+                    if isinstance(args, dict)
+                    else ""
+                )
+                if name and operation_id:
+                    actions.append({"tool_name": name, "operation_id": operation_id})
+    return actions
+
+
 async def stream_chat_response(
     message: str,
     thread_id: str,
     user_id: str = "default_user",
     username: str = "用户",
     resume_data: dict = None,
+    access_token: str = "",
+    roles: frozenset[str] | None = None,
+    permissions: frozenset[str] | None = None,
+    authz_version: int = 1,
 ) -> AsyncGenerator[str, None]:
     """
     核心流式响应生成器
 
     双流模式（subgraphs=True 时输出为 3-tuple）：
-    - (namespace, "values", data): 检测中断（interrupts 字段）
+    - (namespace, "values", data): 检测中断（__interrupt__ 字段）
     - (namespace, "messages", data): 逐 token 输出 + 工具调用事件
 
     消息累积：
@@ -112,7 +157,15 @@ async def stream_chat_response(
     - 流结束后持久化到 PostgreSQL
     """
     # 每个用户有独立 Agent（含 Proxy、中间件缓存和 SandboxManager 映射）。
-    session = await agent_loader.get_session(user_id, username)
+    try:
+        session = await agent_loader.get_session(
+            user_id, username, access_token=access_token, roles=roles,
+            permissions=permissions, authz_version=authz_version,
+        )
+    except RuntimeLeaseConflict as exc:
+        yield sse_event("error", {"message": str(exc)})
+        yield sse_event("done", {"thread_id": thread_id, "interrupted": False})
+        return
 
     # 当前助手消息累积缓冲
     assistant_content = ""
@@ -131,9 +184,95 @@ async def stream_chat_response(
     from ...agent.runtime_context import bind_runtime, reset_runtime
 
     await session.run_lock.acquire()
-    lease_acquired = sandbox_manager.acquire_lease(user_id)
+    run_lease = await asyncio.to_thread(
+        agent_loader.runtime_state_repository.acquire_run,
+        user_id,
+        owner_id=agent_loader.instance_id,
+        ttl_seconds=AGENT_RUN_LEASE_TTL_SECONDS,
+        metadata={"thread_id": thread_id},
+    )
+    if run_lease is None:
+        session.run_lock.release()
+        yield sse_event("error", {"message": "该用户已有请求在其他实例运行，请稍后重试"})
+        yield sse_event("done", {"thread_id": thread_id, "interrupted": False})
+        return
+
+    try:
+        sandbox_lease = await asyncio.to_thread(
+            sandbox_manager.acquire_lease,
+            user_id,
+            owner_id=agent_loader.instance_id,
+            ttl_seconds=AGENT_RUN_LEASE_TTL_SECONDS,
+        )
+    except Exception:
+        await asyncio.to_thread(
+            agent_loader.runtime_state_repository.release,
+            run_lease,
+        )
+        session.run_lock.release()
+        raise
     sandbox_token = bind_sandbox(user_id)
-    runtime_tokens = bind_runtime(user_id, agent_loader.store)
+    runtime_tokens = bind_runtime(
+        user_id,
+        agent_loader.store,
+        access_token=access_token,
+        permissions=permissions,
+    )
+
+    owner_task = asyncio.current_task()
+
+    async def renew_runtime_leases() -> None:
+        nonlocal run_lease, sandbox_lease
+        interval = max(2, int(AGENT_RUN_LEASE_TTL_SECONDS) // 3)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                renewed_run = await asyncio.to_thread(
+                    agent_loader.runtime_state_repository.renew,
+                    run_lease,
+                    ttl_seconds=AGENT_RUN_LEASE_TTL_SECONDS,
+                )
+                renewed_session = await asyncio.to_thread(
+                    agent_loader.runtime_state_repository.renew,
+                    session.ownership_lease,
+                    ttl_seconds=AGENT_SESSION_TTL_SECONDS,
+                )
+                renewed_sandbox = None
+                if sandbox_lease is not None:
+                    renewed_sandbox = await asyncio.to_thread(
+                        sandbox_manager.renew_lease,
+                        sandbox_lease,
+                        ttl_seconds=AGENT_RUN_LEASE_TTL_SECONDS,
+                    )
+            except Exception as exc:
+                web_logger.critical(
+                    "Distributed lease heartbeat failed user=%s thread=%s: %s",
+                    user_id,
+                    thread_id,
+                    exc,
+                )
+                if owner_task is not None:
+                    owner_task.cancel()
+                return
+            if (
+                renewed_run is None
+                or renewed_session is None
+                or (sandbox_lease is not None and renewed_sandbox is None)
+            ):
+                web_logger.critical(
+                    "Lost distributed Agent lease user=%s thread=%s; cancelling run",
+                    user_id,
+                    thread_id,
+                )
+                if owner_task is not None:
+                    owner_task.cancel()
+                return
+            run_lease = renewed_run
+            session.ownership_lease = renewed_session
+            if renewed_sandbox is not None:
+                sandbox_lease = renewed_sandbox
+
+    heartbeat = asyncio.create_task(renew_runtime_leases())
 
     try:
         # 每个新请求和 HITL resume 都刷新同一个 ProcurementContext.warm_memory；
@@ -220,8 +359,8 @@ async def stream_chat_response(
                                     "todos": plan_items,
                                 })
 
-                    # --- 中断检测（langgraph>=0.2 中断键名为 __interrupt__，兼容旧键 interrupts）---
-                    interrupt_items = chunk.get("__interrupt__") or chunk.get("interrupts")
+                    # --- 中断检测（LangGraph 当前协议键名为 __interrupt__）---
+                    interrupt_items = chunk.get("__interrupt__")
                     if interrupt_items:
                         for interrupt_item in interrupt_items:
                             interrupt_value = (
@@ -348,24 +487,6 @@ async def stream_chat_response(
                         matched_call["result"] = tool_content[:1000]
                         matched_call["status"] = "done"
 
-                    # 检测 TODO 工具调用，发射任务列表更新事件
-                    if "todo" in tool_name.lower() or "task" in tool_name.lower():
-                        try:
-                            # 尝试从工具参数中提取 todo 列表
-                            todo_args = None
-                            for tc in tool_calls_buffer:
-                                if tc["name"] == tool_name and tc.get("args"):
-                                    todo_args = tc["args"]
-                                    break
-                            if todo_args:
-                                yield sse_event("todo_update", {
-                                    "tool": tool_name,
-                                    "args": todo_args[:2000],
-                                    "result": tool_content[:500],
-                                })
-                        except Exception:
-                            pass
-
                     yield sse_event("tool_result", {
                         "name": tool_name,
                         "content": tool_content[:2000],
@@ -418,11 +539,26 @@ async def stream_chat_response(
         yield sse_event("error", {"message": f"服务内部错误: {str(e)[:200]}"})
         yield sse_event("done", {"thread_id": thread_id, "interrupted": False})
     finally:
-        reset_runtime(runtime_tokens)
-        reset_sandbox(sandbox_token)
-        if lease_acquired:
-            sandbox_manager.release_lease(user_id)
-        session.run_lock.release()
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
+        try:
+            reset_runtime(runtime_tokens)
+            reset_sandbox(sandbox_token)
+        finally:
+            try:
+                if sandbox_lease is not None:
+                    await asyncio.to_thread(sandbox_manager.release_lease, sandbox_lease)
+            except Exception as exc:
+                web_logger.error("Failed to release sandbox lease: %s", exc)
+            finally:
+                try:
+                    await asyncio.to_thread(
+                        agent_loader.runtime_state_repository.release,
+                        run_lease,
+                    )
+                finally:
+                    session.run_lock.release()
 
 
 def _remove_background_stream_task(task: asyncio.Task[None]) -> None:
@@ -484,6 +620,8 @@ async def chat_stream(
 ):
     """SSE 流式对话端点"""
     await agent_loader.initialize()
+    principal = get_request_principal()
+    assert_permission("assistant:use")
 
     # 认证身份优先；request.user_id 只在 AUTH_MODE=none 时生效。
     user_id = resolve_user_id(authenticated, request.user_id)
@@ -516,7 +654,11 @@ async def chat_stream(
             message=request.message,
             thread_id=thread_id,
             user_id=user_id,
-            username=request.username,
+            username=principal.username if principal is not None else request.username,
+            access_token=principal.access_token if principal is not None else "",
+            roles=principal.roles if principal is not None else None,
+            permissions=principal.permissions if principal is not None else None,
+            authz_version=principal.authz_version if principal is not None else 1,
         ),
         media_type="text/event-stream",
         headers={
@@ -536,34 +678,61 @@ async def chat_resume(
 ):
     """中断恢复端点"""
     await agent_loader.initialize()
+    principal = get_request_principal()
+    assert_permission("assistant:use")
     owner = await agent_loader.get_conversation_user_id(thread_id)
     assert_thread_owner(thread_id, owner, authenticated)
     user_id = authenticated or owner or "default_user"
 
-    decisions = request.resume.get("decisions")
-    if isinstance(decisions, list):
+    session = await agent_loader.get_session(
+        user_id,
+        principal.username if principal is not None else "用户",
+        access_token=principal.access_token if principal is not None else "",
+        roles=principal.roles if principal is not None else None,
+        permissions=principal.permissions if principal is not None else None,
+        authz_version=principal.authz_version if principal is not None else 1,
+    )
+
+    try:
+        pending_state = await session.agent.aget_state(
+            agent_loader.create_config(thread_id, user_id)
+        )
+    except Exception as exc:
+        web_logger.error("Failed to load pending interrupt state: %s", exc)
+        raise HTTPException(status_code=503, detail="会话中断状态暂时不可用") from exc
+
+    pending_actions = _pending_approval_actions(pending_state)
+    resume_payload = dict(request.resume)
+    if pending_actions:
+        operation_ids = [item["operation_id"] for item in pending_actions]
         try:
-            await asyncio.to_thread(
-                agent_loader.write_audit_repository.mark_thread_decisions,
-                thread_id,
-                decisions=decisions,
-                actor_id=user_id,
+            durable_decisions = await asyncio.to_thread(
+                agent_loader.write_audit_repository.approval_decisions,
+                operation_ids,
+                thread_id=thread_id,
+                requester_id=user_id,
             )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
         except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except Exception as exc:
-            web_logger.error("Failed to persist approval decision: %s", exc)
-            raise HTTPException(
-                status_code=503,
-                detail="审批审计保存失败，写操作未恢复",
-            ) from exc
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        # Client-provided approve/reject values are deliberately ignored. The
+        # applicant only consumes the decision already recorded by a checker.
+        resume_payload = {"decisions": durable_decisions}
+    elif isinstance(request.resume.get("decisions"), list):
+        raise HTTPException(status_code=409, detail="当前会话没有待审批写操作")
 
     return StreamingResponse(
         resilient_stream_chat_response(
             message="",
             thread_id=thread_id,
             user_id=user_id,
-            resume_data=request.resume,
+            resume_data=resume_payload,
+            username=principal.username if principal is not None else "用户",
+            access_token=principal.access_token if principal is not None else "",
+            roles=principal.roles if principal is not None else None,
+            permissions=principal.permissions if principal is not None else None,
+            authz_version=principal.authz_version if principal is not None else 1,
         ),
         media_type="text/event-stream",
         headers={
@@ -581,11 +750,20 @@ async def chat_state(
     authenticated: str | None = Depends(current_user_id),
 ):
     """获取 Agent 状态（是否处于中断中）"""
+    assert_permission("assistant:use")
     await agent_loader.initialize()
+    principal = get_request_principal()
     owner = await agent_loader.get_conversation_user_id(thread_id)
     assert_thread_owner(thread_id, owner, authenticated)
     user_id = authenticated or owner or "default_user"
-    session = await agent_loader.get_session(user_id)
+    session = await agent_loader.get_session(
+        user_id,
+        principal.username if principal is not None else "用户",
+        access_token=principal.access_token if principal is not None else "",
+        roles=principal.roles if principal is not None else None,
+        permissions=principal.permissions if principal is not None else None,
+        authz_version=principal.authz_version if principal is not None else 1,
+    )
     config = agent_loader.create_config(thread_id, user_id)
     try:
         state = await session.agent.aget_state(config)
@@ -624,6 +802,7 @@ async def chat_history(
     authenticated: str | None = Depends(current_user_id),
 ):
     """获取对话消息历史"""
+    assert_permission("assistant:use")
     owner = await agent_loader.get_conversation_user_id(thread_id)
     assert_thread_owner(thread_id, owner, authenticated)
     messages = await agent_loader.get_display_messages(thread_id)

@@ -12,6 +12,7 @@ import io.swagger.v3.oas.annotations.Parameter;
 import lombok.RequiredArgsConstructor;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.validation.annotation.Validated;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDateTime;
@@ -23,6 +24,7 @@ import java.util.List;
 @Tag(name = "物流管理")
 @RestController
 @RequestMapping("/api/logistics")
+@PreAuthorize("hasAuthority('erp:logistics:read')")
 @RequiredArgsConstructor
 @Validated
 public class LogisticsController {
@@ -34,6 +36,7 @@ public class LogisticsController {
      */
     @Operation(summary = "创建物流记录")
     @PostMapping("/create")
+    @PreAuthorize("hasAuthority('erp:logistics:write')")
     public Result<Logistics> create(@Validated @RequestBody Logistics logistics) {
         boolean success = logisticsService.save(logistics);
         if (!success) {
@@ -47,6 +50,7 @@ public class LogisticsController {
      */
     @Operation(summary = "更新物流信息")
     @PutMapping("/update/{id}")
+    @PreAuthorize("hasAuthority('erp:logistics:write')")
     public Result<Logistics> update(
             @Parameter(description = "物流ID") @PathVariable Long id,
             @Validated @RequestBody Logistics logistics) {
@@ -63,6 +67,7 @@ public class LogisticsController {
      */
     @Operation(summary = "删除物流记录")
     @DeleteMapping("/delete/{id}")
+    @PreAuthorize("hasAuthority('erp:logistics:write')")
     public Result<Void> delete(@Parameter(description = "物流ID") @PathVariable Long id) {
         boolean success = logisticsService.removeById(id);
         if (!success) {
@@ -115,6 +120,7 @@ public class LogisticsController {
      */
     @Operation(summary = "更新物流状态")
     @PatchMapping("/update-status/{id}")
+    @PreAuthorize("hasAuthority('erp:logistics:write')")
     public Result<Void> updateStatus(
             @Parameter(description = "物流ID") @PathVariable Long id,
             @Parameter(description = "新状态") @RequestParam Integer status) {
@@ -130,6 +136,7 @@ public class LogisticsController {
      */
     @Operation(summary = "更新发货信息")
     @PatchMapping("/update-shipping/{id}")
+    @PreAuthorize("hasAuthority('erp:logistics:write')")
     public Result<Void> updateShipping(
             @Parameter(description = "物流ID") @PathVariable Long id,
             @Parameter(description = "发货时间") @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd HH:mm:ss") LocalDateTime shipTime,
@@ -147,6 +154,7 @@ public class LogisticsController {
      */
     @Operation(summary = "更新收货信息")
     @PatchMapping("/update-receiving/{id}")
+    @PreAuthorize("hasAuthority('erp:logistics:write')")
     public Result<Void> updateReceiving(
             @Parameter(description = "物流ID") @PathVariable Long id,
             @Parameter(description = "实际到达时间") @RequestParam @DateTimeFormat(pattern = "yyyy-MM-dd HH:mm:ss") LocalDateTime actualArrivalTime,

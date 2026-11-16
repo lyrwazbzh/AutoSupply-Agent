@@ -8,7 +8,7 @@
 #   1) 七个服务都在跑且 healthy 吗
 #   2) 跑着的镜像和 state 文件记的是同一版吗（不一致 = 有人绕过脚本手工 up）
 #   3) 有发布卡在半途吗
-#   4) 共享密钥一致吗
+#   4) 统一身份密钥与 JWT 模式就绪吗
 #   5) 磁盘还够吗
 #   6) 回滚能力还具备吗（prev 快照 + 旧镜像 + 源码树都还在吗）
 #   7) 备份还在吗、新鲜吗、推出去过吗
@@ -42,9 +42,9 @@ else
     # 一次性服务 sandbox-image-loader 跑完就退出，不算异常。
     ps_out="$(cd_compose ps --all --format '{{.Service}}\t{{.Image}}\t{{.State}}\t{{.Health}}' 2>/dev/null || true)"
     if [ -n "$ps_out" ]; then
-        # 9 个服务：7 个核心 + prometheus + grafana（阶段 6 加的可观测栈）。
+        # 核心数据层包含 PostgreSQL、MySQL、Redis；另有应用与可观测服务。
         # sandbox-image-loader 是一次性服务，上面已跳过。
-        expected="postgres dind mock-erp mcp backend frontend nginx prometheus grafana"
+        expected="postgres mysql redis java-erp dind mcp backend frontend nginx prometheus grafana"
         while IFS=$'\t' read -r svc img state health; do
             case "$svc" in sandbox-image-loader|"") continue ;; esac
             expected="$(printf '%s\n' $expected | grep -vx "$svc" | tr '\n' ' ')"
@@ -74,9 +74,9 @@ else
     # 两者 digest 相同 —— 方案里「发布以 digest 为准」说的就是这个。
     running="$(cd_compose ps -q 2>/dev/null | xargs -r docker inspect \
         --format '{{index .Config.Labels "com.docker.compose.service"}} {{.Image}}' 2>/dev/null \
-        | grep -E '^(mock-erp|mcp|backend|frontend) ' | sort || true)"
+        | grep -E '^(java-erp|mcp|backend|frontend) ' | sort || true)"
     want="$( {
-        sed -n 's/^MOCK_ERP_IMAGE_ID=/mock-erp /p' "$CD_STATE_FILE"
+        sed -n 's/^JAVA_ERP_IMAGE_ID=/java-erp /p'   "$CD_STATE_FILE"
         sed -n 's/^APP_IMAGE_ID=/mcp /p'           "$CD_STATE_FILE"
         sed -n 's/^APP_IMAGE_ID=/backend /p'       "$CD_STATE_FILE"
         sed -n 's/^FRONTEND_IMAGE_ID=/frontend /p' "$CD_STATE_FILE"
@@ -90,7 +90,7 @@ else
 
     # 引用完整性：state 记的 digest 必须还是本机那个 tag 现在指着的那个
     #（tag 可以被重新指向，digest 不能）。
-    for key in APP_IMAGE:APP_IMAGE_ID FRONTEND_IMAGE:FRONTEND_IMAGE_ID MOCK_ERP_IMAGE:MOCK_ERP_IMAGE_ID; do
+    for key in APP_IMAGE:APP_IMAGE_ID FRONTEND_IMAGE:FRONTEND_IMAGE_ID JAVA_ERP_IMAGE:JAVA_ERP_IMAGE_ID; do
         ref="$(cd_state_get "$CD_STATE_FILE" "${key%%:*}" || true)"
         id="$(cd_state_get "$CD_STATE_FILE" "${key##*:}" || true)"
         [ -n "$ref" ] && [ -n "$id" ] || continue
@@ -108,16 +108,14 @@ else
     ok pending "没有 pending 残留"
 fi
 
-# ---------------------------------------------------------------- 4. 共享密钥
-head_ 共享密钥
-a="$(sed -n 's/^INTERNAL_AUTH_TOKEN=//p' "$CD_REPO_ROOT/deploy/.env" 2>/dev/null | head -1 | tr -d '"'"'"'')"
-b="$(sed -n 's/^INTERNAL_AUTH_TOKEN=//p' "$CD_REPO_ROOT/deploy/nginx.env" 2>/dev/null | head -1 | tr -d '"'"'"'')"
-if [ -z "$a" ] || [ -z "$b" ]; then
-    bad secret "INTERNAL_AUTH_TOKEN 缺失（.env='${a:+有}' nginx.env='${b:+有}'）—— 共享密钥校验是关的"
-elif [ "$a" = "$b" ]; then
-    ok secret "两处一致（len=${#a}，前 4 位 ${a:0:4}…）"
+# ---------------------------------------------------------------- 4. 统一身份密钥
+head_ 统一身份密钥
+private="$CD_REPO_ROOT/deploy/secrets/erp-jwt-private.pem"
+public="$CD_REPO_ROOT/deploy/secrets/erp-jwt-public.pem"
+if [ -s "$private" ] && [ -s "$public" ] && grep -q '^AUTH_MODE=jwt$' "$CD_REPO_ROOT/deploy/.env" 2>/dev/null; then
+    ok secret "RS256 私钥/公钥存在，backend 已启用 jwt"
 else
-    bad secret "两处不一致 —— /health 会 200 但所有 /api 会 401。跑 sh deploy/set_internal_token.sh"
+    bad secret "统一身份未初始化 —— 运行 bash deploy/init-security.sh"
 fi
 
 # ---------------------------------------------------------------- 5. 磁盘

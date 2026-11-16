@@ -2,6 +2,7 @@
 
 import { CapabilityCard } from "@/lib/types";
 import CapabilityCardComponent from "@/components/common/CapabilityCard";
+import QuickAccess from "./QuickAccess";
 
 const CARDS: CapabilityCard[] = [
   {
@@ -36,8 +37,8 @@ interface Props {
 
 export default function WelcomeScreen({ onPromptClick }: Props) {
   return (
-    <div className="flex-1 flex flex-col items-center justify-center px-8">
-      <div className="max-w-2xl w-full text-center">
+    <div className="flex-1 overflow-y-auto px-8 py-10">
+      <div className="mx-auto max-w-5xl w-full text-center">
         {/* 标题 */}
         <h1 className="text-2xl font-bold text-gray-900 mb-2">
           基于 Harness Engineering 的智能助手
@@ -47,7 +48,7 @@ export default function WelcomeScreen({ onPromptClick }: Props) {
         </p>
 
         {/* 功能卡片 2x2 */}
-        <div className="grid grid-cols-2 gap-4">
+        <div className="mx-auto grid max-w-2xl grid-cols-1 gap-4 sm:grid-cols-2">
           {CARDS.map((card) => (
             <CapabilityCardComponent
               key={card.title}
@@ -56,6 +57,7 @@ export default function WelcomeScreen({ onPromptClick }: Props) {
             />
           ))}
         </div>
+        <QuickAccess onPromptClick={onPromptClick} />
       </div>
     </div>
   );

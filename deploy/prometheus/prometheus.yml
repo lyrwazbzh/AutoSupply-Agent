@@ -20,6 +20,13 @@ scrape_configs:
         labels:
           service: "erp-agent-backend"
 
+  - job_name: "java-erp"
+    metrics_path: "/actuator/prometheus"
+    static_configs:
+      - targets: ["java-erp:8080"]
+        labels:
+          service: "erp-agent-java-erp"
+
   # Prometheus 自身
   - job_name: "prometheus"
     static_configs:

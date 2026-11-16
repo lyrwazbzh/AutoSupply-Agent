@@ -6,8 +6,8 @@ import com.motorparts.mapper.*;
 import com.motorparts.service.PurchaseOrderService;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import io.swagger.v3.oas.annotations.Operation;
-import lombok.RequiredArgsConstructor;
 import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDate;
@@ -20,20 +20,19 @@ import java.util.stream.Collectors;
 @Tag(name = "统计分析")
 @RestController
 @RequestMapping("/api/statistics")
+@PreAuthorize("hasAuthority('erp:statistics:read')")
 public class StatisticsController {
 
     private final PurchaseOrderService purchaseOrderService;
     private final SupplierMapper supplierMapper;
     private final PartMapper partMapper;
-    private final CustomerMapper customerMapper;
     private final UserMapper userMapper;
     private final InventoryMapper inventoryMapper;
 
-    public StatisticsController(PurchaseOrderService purchaseOrderService, SupplierMapper supplierMapper, PartMapper partMapper, CustomerMapper customerMapper, UserMapper userMapper, InventoryMapper inventoryMapper) {
+    public StatisticsController(PurchaseOrderService purchaseOrderService, SupplierMapper supplierMapper, PartMapper partMapper, UserMapper userMapper, InventoryMapper inventoryMapper) {
         this.purchaseOrderService = purchaseOrderService;
         this.supplierMapper = supplierMapper;
         this.partMapper = partMapper;
-        this.customerMapper = customerMapper;
         this.userMapper = userMapper;
         this.inventoryMapper = inventoryMapper;
     }
@@ -54,9 +53,8 @@ public class StatisticsController {
         long partCount = partMapper.selectCount(null);
         dashboard.put("partCount", partCount);
 
-        // 客户总数
-        long customerCount = customerMapper.selectCount(null);
-        dashboard.put("customerCount", customerCount);
+        // 低库存零件数
+        dashboard.put("lowStockCount", inventoryMapper.countWarnings());
 
         // 用户总数
         long userCount = userMapper.selectCount(null);

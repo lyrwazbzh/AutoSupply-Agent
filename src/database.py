@@ -190,6 +190,54 @@ def setup_memory_search_schema() -> None:
                 WHERE prefix LIKE 'memories.%'
                 """
             )
+            # 旧版本可能在并发写入时留下同一逻辑 key 的多个有效版本。先保留
+            # 最新一条、失效其余条目，再建立数据库级唯一约束。
+            cur.execute(
+                """
+                WITH ranked AS (
+                    SELECT prefix,
+                           key AS store_key,
+                           first_value(value->>'id') OVER (
+                               PARTITION BY prefix, value->>'key'
+                               ORDER BY updated_at DESC, key DESC
+                           ) AS winner_id,
+                           row_number() OVER (
+                               PARTITION BY prefix, value->>'key'
+                               ORDER BY updated_at DESC, key DESC
+                           ) AS version_rank
+                    FROM store
+                    WHERE prefix LIKE 'memories.%.semantic'
+                      AND coalesce(value->>'key', '') <> ''
+                      AND coalesce(value->>'invalidated_at', '') = ''
+                )
+                UPDATE store AS item
+                SET value = jsonb_set(
+                                jsonb_set(
+                                    item.value,
+                                    '{invalidated_at}',
+                                    to_jsonb(CURRENT_TIMESTAMP::text),
+                                    true
+                                ),
+                                '{supersedes}',
+                                to_jsonb(ranked.winner_id),
+                                true
+                            ),
+                    updated_at = CURRENT_TIMESTAMP
+                FROM ranked
+                WHERE ranked.version_rank > 1
+                  AND item.prefix = ranked.prefix
+                  AND item.key = ranked.store_key
+                """
+            )
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS store_one_active_semantic_key_idx
+                ON store (prefix, (value->>'key'))
+                WHERE prefix LIKE 'memories.%.semantic'
+                  AND coalesce(value->>'key', '') <> ''
+                  AND coalesce(value->>'invalidated_at', '') = ''
+                """
+            )
         _memory_search_schema_ready = True
 
 
@@ -244,8 +292,39 @@ CREATE TABLE IF NOT EXISTS app.sandbox_cache (
     claimed_at timestamptz,
     last_active_at timestamptz NOT NULL,
     active_runs integer NOT NULL DEFAULT 0,
+    assignment_owner_id text,
+    assignment_version bigint NOT NULL DEFAULT 1,
     updated_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE app.sandbox_cache
+    ADD COLUMN IF NOT EXISTS assignment_owner_id text,
+    ADD COLUMN IF NOT EXISTS assignment_version bigint NOT NULL DEFAULT 1;
+
+CREATE TABLE IF NOT EXISTS app.runtime_leases (
+    resource_type text NOT NULL,
+    resource_key text NOT NULL,
+    owner_id text NOT NULL,
+    lease_token text NOT NULL,
+    lease_expires_at timestamptz NOT NULL,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    version bigint NOT NULL DEFAULT 1,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (resource_type, resource_key),
+    UNIQUE (lease_token)
+);
+CREATE INDEX IF NOT EXISTS runtime_leases_expiry_idx
+    ON app.runtime_leases (lease_expires_at);
+
+CREATE TABLE IF NOT EXISTS app.sandbox_warm_pool (
+    container_name text PRIMARY KEY,
+    owner_id text NOT NULL,
+    lease_expires_at timestamptz NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS sandbox_warm_pool_expiry_idx
+    ON app.sandbox_warm_pool (lease_expires_at);
 
 CREATE TABLE IF NOT EXISTS knowledge.documents (
     id text PRIMARY KEY,
@@ -330,6 +409,31 @@ CREATE INDEX IF NOT EXISTS write_audit_user_created_idx
     ON audit.write_audit_events (user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS write_audit_tool_event_created_idx
     ON audit.write_audit_events (tool_name, event_type, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS audit.approval_tasks (
+    task_id text PRIMARY KEY,
+    operation_id text NOT NULL UNIQUE
+        REFERENCES audit.write_operations(operation_id),
+    requester_id text NOT NULL,
+    status text NOT NULL DEFAULT 'PENDING',
+    decided_by text,
+    decision_note text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    decided_at timestamptz,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT approval_tasks_status_check
+        CHECK (status IN ('PENDING', 'APPROVED', 'REJECTED')),
+    CONSTRAINT approval_tasks_maker_checker_check
+        CHECK (decided_by IS NULL OR decided_by <> requester_id)
+);
+CREATE INDEX IF NOT EXISTS approval_tasks_pending_created_idx
+    ON audit.approval_tasks (created_at, task_id)
+    WHERE status = 'PENDING';
+INSERT INTO audit.approval_tasks(task_id, operation_id, requester_id, status)
+SELECT 'approval:' || operation_id, operation_id, user_id, 'PENDING'
+FROM audit.write_operations
+WHERE approval_required = true AND status = 'PENDING_APPROVAL'
+ON CONFLICT (operation_id) DO NOTHING;
 
 CREATE OR REPLACE FUNCTION audit.reject_audit_event_mutation()
 RETURNS trigger LANGUAGE plpgsql AS $$

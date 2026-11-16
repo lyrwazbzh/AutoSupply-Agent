@@ -63,6 +63,28 @@ class ApprovalPolicyRegistry:
         policy = self.get(tool_name)
         return policy.version if policy else None
 
+    def missing_approver_permissions(
+        self,
+        tool_names: Iterable[str],
+        permissions: Iterable[str],
+    ) -> dict[str, tuple[str, ...]]:
+        """返回当前主体无权审批的工具及其可选权限。
+
+        一个策略中的多个 ``approver_permissions`` 表示可选权限（满足其一即可）；
+        同一批中断里的每个受保护工具都必须分别通过校验。
+        """
+        granted = {str(permission) for permission in permissions}
+        missing: dict[str, tuple[str, ...]] = {}
+        for raw_name in tool_names:
+            tool_name = str(raw_name or "").lower()
+            policy = self.get(tool_name)
+            if not policy or not policy.requires_approval:
+                continue
+            required = policy.approver_permissions
+            if required and not any(permission in granted for permission in required):
+                missing[tool_name] = required
+        return missing
+
 
 approval_policy_registry = ApprovalPolicyRegistry(
     (
@@ -71,21 +93,77 @@ approval_policy_registry = ApprovalPolicyRegistry(
             tool_name="order_create",
             requires_approval=True,
             description="采购订单创建审批：请确认供应商、零部件、数量和金额。",
-            approver_permissions=("order.approve",),
+            approver_permissions=("erp:order:approve",),
         ),
         ApprovalPolicy(
             policy_id="order-update-v1",
             tool_name="order_update",
             requires_approval=True,
             description="采购订单修改审批：请确认修改内容。",
-            approver_permissions=("order.approve",),
+            approver_permissions=("erp:order:approve",),
         ),
         ApprovalPolicy(
             policy_id="order-status-v1",
             tool_name="order_update_status",
             requires_approval=True,
             description="订单状态变更确认：状态变更不可逆，请确认。",
-            approver_permissions=("order.status.approve",),
+            approver_permissions=("erp:order:approve",),
+        ),
+        ApprovalPolicy(
+            policy_id="order-receive-v1",
+            tool_name="order_receive",
+            requires_approval=True,
+            description="采购收货确认：确认后将自动入库并生成库存流水。",
+            approver_permissions=("erp:order:approve",),
+        ),
+        ApprovalPolicy(
+            policy_id="replenishment-create-v1",
+            tool_name="replenishment_create",
+            requires_approval=True,
+            description="补货任务创建确认：请核对零件、建议数量和供应商。",
+            approver_permissions=("erp:order:approve",),
+        ),
+        ApprovalPolicy(
+            policy_id="replenishment-inspect-v1",
+            tool_name="replenishment_inspect",
+            requires_approval=True,
+            description="库存巡检确认：执行后可能批量生成补货任务。",
+            approver_permissions=("erp:order:approve",),
+        ),
+        ApprovalPolicy(
+            policy_id="replenishment-order-v1",
+            tool_name="replenishment_create_order",
+            requires_approval=True,
+            description="补货转采购单确认：请核对供应商、数量和预计到货日。",
+            approver_permissions=("erp:order:approve",),
+        ),
+        ApprovalPolicy(
+            policy_id="replenishment-complete-v1",
+            tool_name="replenishment_complete",
+            requires_approval=True,
+            description="补货任务完成确认。",
+            approver_permissions=("erp:order:approve",),
+        ),
+        ApprovalPolicy(
+            policy_id="replenishment-cancel-v1",
+            tool_name="replenishment_cancel",
+            requires_approval=True,
+            description="补货任务取消确认。",
+            approver_permissions=("erp:order:approve",),
+        ),
+        ApprovalPolicy(
+            policy_id="purchase-return-create-v1",
+            tool_name="purchase_return_create",
+            requires_approval=True,
+            description="采购退货创建确认：请核对采购单、零件、数量和原因。",
+            approver_permissions=("erp:order:approve",),
+        ),
+        ApprovalPolicy(
+            policy_id="purchase-return-confirm-v1",
+            tool_name="purchase_return_confirm",
+            requires_approval=True,
+            description="采购退货确认：确认后将扣减库存并生成库存流水。",
+            approver_permissions=("erp:order:approve",),
         ),
     )
 )

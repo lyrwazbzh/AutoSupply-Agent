@@ -4,7 +4,7 @@ LLM、Store、Checkpointer、沙箱连接参数
 """
 from langchain_openai import ChatOpenAI
 
-from .env_utils import get_env, get_env_int
+from .env_utils import get_env, get_env_float, get_env_int
 
 # ============ LLM 配置 ============
 # ChatAnywhere：OpenAI 兼容的 API 网关，支持 gpt-4o / claude / deepseek 等模型。
@@ -90,32 +90,18 @@ ALLOW_LOCAL_SHELL_FALLBACK = get_env(
 ).lower() in ("1", "true", "yes")
 
 # ============ 认证 ============
-# none  = 不认人，user_id 完全由客户端提供（本机开发，行为与改造前一致）
-# proxy = 信任反向代理注入的身份头，头缺失即 401（容器部署）
+# none = 本机离线开发，不执行认证
+# jwt  = 校验 Java ERP 签发的 RS256 访问令牌（默认容器部署）
 #
-# 容器部署由 nginx 的 auth_basic 认人，然后把 $remote_user 注入
-# AUTH_USER_HEADER。backend 在 proxy 模式下会**丢弃**请求体/查询串里的
-# user_id，改用认证身份 —— 否则前端随手改一个字符串就能读到别人的会话
-# 和沙箱。
-#
-# 只在 backend 不对宿主机发布端口时成立：backend 直接可达的话，任何人都能
-# 伪造这个头。compose 里 backend 没有 ports，只有 nginx 能连。
-#
-# 但"只有 nginx 能连 backend"这条前提在容器网络里并不成立：dind 与 backend
-# 同在 sandbox 网络上（backend 要用 DOCKER_HOST=tcp://dind:2375），而沙箱容器
-# 跑在 dind 自己的 daemon 里，出口流量经 dind MASQUERADE 转发后就落在同一张
-# 网络上 —— 也就是说沙箱里模型生成的代码可以直连 backend，并自己伪造
-# X-Authenticated-User，从而读到任意其他用户的会话。
-#
-# 堵法：nginx 额外注入一个只有它和后端知道的共享密钥头，backend 在 proxy 模式
-# 下校验它。沙箱代码拿不到这个值（它只存在于 nginx 配置与 backend 进程环境里）。
-#
-# 留空 = 不校验，行为与改造前一致（本机已验证的拓扑不变）。为空时 backend 启动
-# 会打一条警告，提醒这条通路仍然敞开。新服务器部署请务必设置。
+# 生产固定使用 jwt：Java ERP 签发 RS256 令牌，backend 验签并检查 audience，
+# 再通过 /api/auth/me 确认账号仍有效。none 只供本机离线开发，
+# 不得用于容器生产环境。
 AUTH_MODE = get_env("AUTH_MODE", "none").strip().lower()
-AUTH_USER_HEADER = get_env("AUTH_USER_HEADER", "X-Authenticated-User")
-INTERNAL_AUTH_TOKEN = get_env("INTERNAL_AUTH_TOKEN", "").strip()
-INTERNAL_AUTH_HEADER = get_env("INTERNAL_AUTH_HEADER", "X-Internal-Auth")
+JWT_PUBLIC_KEY_PATH = get_env("JWT_PUBLIC_KEY_PATH", "").strip()
+JWT_ISSUER = get_env("JWT_ISSUER", "java-erp").strip()
+JWT_AUDIENCE = get_env("JWT_AUDIENCE", "assistant-api").strip()
+ERP_BASE_URL = get_env("ERP_BASE_URL", "http://localhost:8080").rstrip("/")
+JWT_ACTIVE_CHECK_ENABLED = get_env("JWT_ACTIVE_CHECK_ENABLED", "true").lower() in ("1", "true", "yes")
 
 # ============ 沙箱配置 ============
 # 沙箱镜像。容器化部署默认 erp-sandbox:3.11（由 compose 的 sandbox-image-loader
@@ -154,8 +140,6 @@ SANDBOX_MCP_HOST_IP = get_env("SANDBOX_MCP_HOST_IP", "")
 
 # ============ Store 命名空间 ============
 SKILLS_STORE_NAMESPACE = ("persisted-skills",)
-PREFERENCES_STORE_NAMESPACE = ("user-preferences",)
-
 
 def skills_store_namespace(user_id: str) -> tuple[str, str]:
     """Return the isolated Store namespace for one user's custom Skills."""
@@ -164,4 +148,20 @@ def skills_store_namespace(user_id: str) -> tuple[str, str]:
 # ============ Agent 配置 ============
 MAX_MODEL_CALLS = get_env_int("MAX_MODEL_CALLS", 50)
 MAX_TOOL_CALLS = get_env_int("MAX_TOOL_CALLS", 30)
-SUMMARIZATION_THRESHOLD = 0.85  # 85% 上下文窗口时触发摘要
+AGENT_SESSION_TTL_SECONDS = get_env_int("AGENT_SESSION_TTL_SECONDS", 1800)
+AGENT_SESSION_MAX_ENTRIES = get_env_int("AGENT_SESSION_MAX_ENTRIES", 128)
+AGENT_RUN_LEASE_TTL_SECONDS = get_env_int("AGENT_RUN_LEASE_TTL_SECONDS", 180)
+
+# 上下文压缩不再依赖模型名称推断窗口大小。ChatAnywhere 可能把同一个模型名
+# 路由到不同提供方，所以部署者必须同时声明真实输入窗口。压缩模块会在 Agent
+# 创建时校验三个值，并把比例换算成绝对 token 数交给 DeepAgents。
+LLM_CONTEXT_WINDOW_TOKENS = get_env_int("LLM_CONTEXT_WINDOW_TOKENS", 128_000)
+CONTEXT_COMPACTION_TRIGGER_RATIO = get_env_float(
+    "CONTEXT_COMPACTION_TRIGGER_RATIO", 0.75
+)
+CONTEXT_COMPACTION_KEEP_RATIO = get_env_float(
+    "CONTEXT_COMPACTION_KEEP_RATIO", 0.15
+)
+CONTEXT_SUMMARY_SCHEMA_VERSION = get_env(
+    "CONTEXT_SUMMARY_SCHEMA_VERSION", "procurement-v1"
+).strip()

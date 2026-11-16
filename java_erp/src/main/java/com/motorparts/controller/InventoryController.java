@@ -7,13 +7,15 @@ import com.motorparts.common.Result;
 import com.motorparts.common.enums.ResultCode;
 import com.motorparts.dto.InventoryWithPart;
 import com.motorparts.entity.Inventory;
-import com.motorparts.service.ErpOperationService;
+import com.motorparts.inventory.transaction.InventoryCommandService;
 import com.motorparts.service.InventoryService;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import lombok.RequiredArgsConstructor;
 import org.springframework.validation.annotation.Validated;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.ArrayList;
@@ -27,11 +29,13 @@ import java.util.Map;
 @Tag(name = "库存管理")
 @RestController
 @RequestMapping("/api/inventory")
+@PreAuthorize("hasAuthority('erp:inventory:read')")
 @RequiredArgsConstructor
 @Validated
 public class InventoryController {
 
     private final InventoryService inventoryService;
+    private final InventoryCommandService inventoryCommandService;
 
     /**
      * 获取单个库存记录
@@ -66,26 +70,18 @@ public class InventoryController {
      */
     @Operation(summary = "入库操作")
     @PostMapping("/inbound")
-    public Result<Void> inbound(
+    @PreAuthorize("hasAuthority('erp:inventory:inbound')")
     public Result<?> inbound(
             @Parameter(description = "零件ID") @RequestParam Long partId,
             @Parameter(description = "入库数量") @RequestParam Integer quantity,
             @Parameter(description = "仓库位置") @RequestParam(required = false) String warehouseLocation,
+            @Parameter(description = "业务备注") @RequestParam(required = false) String remark,
             @RequestParam(required = false) String operationId,
-            @RequestHeader(value = "X-Operation-Id", required = false) String operationHeader) {
+            @RequestHeader(value = "X-Operation-Id", required = false) String operationHeader,
+            JwtAuthenticationToken authentication) {
         String opId = OperationIds.resolve(null, operationId, operationHeader);
-        Result<?> replay = erpOperationService.replay(opId);
-        if (replay != null) {
-            return replay;
-        }
-        boolean success = inventoryService.inbound(partId, quantity, warehouseLocation);
-        if (!success) {
-            return Result.error();
-        }
-        InventoryWithPart view = inventoryService.getInventoryWithPartByPartId(partId);
-        Result<?> result = Result.success(view, "入库成功");
-        erpOperationService.complete(opId, result);
-        return result;
+        return inventoryCommandService.inbound(partId, quantity, warehouseLocation, opId,
+                operatorId(authentication), remark);
     }
 
     /**
@@ -93,24 +89,17 @@ public class InventoryController {
      */
     @Operation(summary = "出库操作")
     @PostMapping("/outbound")
+    @PreAuthorize("hasAuthority('erp:inventory:outbound')")
     public Result<?> outbound(
             @Parameter(description = "零件ID") @RequestParam Long partId,
             @Parameter(description = "出库数量") @RequestParam Integer quantity,
+            @Parameter(description = "业务备注") @RequestParam(required = false) String remark,
             @RequestParam(required = false) String operationId,
-            @RequestHeader(value = "X-Operation-Id", required = false) String operationHeader) {
+            @RequestHeader(value = "X-Operation-Id", required = false) String operationHeader,
+            JwtAuthenticationToken authentication) {
         String opId = OperationIds.resolve(null, operationId, operationHeader);
-        Result<?> replay = erpOperationService.replay(opId);
-        if (replay != null) {
-            return replay;
-        }
-        boolean success = inventoryService.outbound(partId, quantity);
-        if (!success) {
-            return Result.error(ResultCode.INSUFFICIENT_INVENTORY);
-        }
-        InventoryWithPart view = inventoryService.getInventoryWithPartByPartId(partId);
-        Result<?> result = Result.success(view, "出库成功");
-        erpOperationService.complete(opId, result);
-        return result;
+        return inventoryCommandService.outbound(partId, quantity, opId, operatorId(authentication), remark);
+    }
 
     /**
      * 获取库存预警列表
@@ -127,6 +116,7 @@ public class InventoryController {
      */
     @Operation(summary = "更新安全库存")
     @PatchMapping("/update-safety-stock/{id}")
+    @PreAuthorize("hasAuthority('erp:inventory:safety-stock')")
     public Result<Void> updateSafetyStock(
             @Parameter(description = "库存ID") @PathVariable Long id,
             @Parameter(description = "安全库存量") @RequestParam Integer safetyStock) {
@@ -176,5 +166,23 @@ public class InventoryController {
         result.put("inventoryList", inventoryWithParts);
 
         return Result.success(result);
+    }
+
+    private static Long operatorId(JwtAuthenticationToken authentication) {
+        if (authentication == null) {
+            return null;
+        }
+        Object value = authentication.getToken().getClaims().get("user_id");
+        if (value instanceof Number number) {
+            return number.longValue();
+        }
+        if (value instanceof String text) {
+            try {
+                return Long.valueOf(text);
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+        return null;
     }
 }

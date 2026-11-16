@@ -4,21 +4,17 @@
 正则）。它们存在的理由是：`deploy/cd/README.md` 里那句"改静态 IP 要同步改两处"
 以前只是文档，而文档不会拦住任何人 —— 现在由测试拦住。
 
-具体钉住的五件事：
+具体钉住的四件事：
 
 1. `SANDBOX_MCP_HOST_IP` 在三个文件里必须完全一致，且落在 `mcp-sandbox` 的
    子网内。改坏任意一处 → mcp 换了地址而沙箱容器的 /etc/hosts 还写着旧的 →
    沙箱内所有 MCP 工具挂掉，症状是超时（很难往配置上想）。
-2. `deploy/nginx/nginx.conf` 的认证结构。共享密钥头漏一个 location 就是
-   "沙箱代码可以绕过 nginx 直连 backend 伪造身份"；`auth_basic off` 多一处就是
-   某个 location 静默不认证。
-3. 两个 env 模板都得有 `INTERNAL_AUTH_TOKEN` 这个键。
-4. 前端源码里不得有硬编码的后端绝对地址（镜像必须与环境无关）。
-5. `tls.conf.template` 被 nginx.conf 在 http{} 顶层 include：开关必须用 map
+2. `deploy/nginx/nginx.conf` 只保留传输层职责，并让 HTTP/HTTPS 共用同一份代理路由。
+3. 前端源码里不得有硬编码的后端绝对地址（镜像必须与环境无关）。
+4. `tls.conf.template` 被 nginx.conf 在 http{} 顶层 include：开关必须用 map
    定义、不能用 set（set 在该上下文 nginx -t 直接 emerg，真机发布回滚过）。
-6. nginx worker 固定为非特权用户 `nginx`，且 htpasswd 必须 644、nginx.env 必须
-   显式带 `TLS_ENABLED=` 空行 —— 由 bootstrap（新装机）与 deploy/cd（老实例升级）
-   两处共同兜住。这两处没兜住时整站「一登录就 500、/healthz 却 200」。
+   nginx worker 固定为非特权用户 `nginx`，nginx.env 必须显式带
+   `TLS_ENABLED=` 空行。
    另：nginx.conf 的 :443 server 无条件加载 TLS 证书，纯 HTTP 场景路径上也得有占位 ——
    CI 集成栈不跑 bootstrap/deploy，由 deploy/ci/prepare-stack.sh 自签一份，否则两个
    集成 job 都会卡在等 nginx healthy 超时（smoke-edge 420s / stack-smoke 600s）。
@@ -42,7 +38,7 @@ DEPLOY_SH = REPO / "deploy" / "cd" / "deploy.sh"
 BOOTSTRAP_SH = REPO / "deploy" / "cloud" / "bootstrap.sh"
 PREPARE_STACK_SH = REPO / "deploy" / "ci" / "prepare-stack.sh"
 NGINX_CONF = REPO / "deploy" / "nginx" / "nginx.conf"
-NGINX_TEMPLATE = REPO / "deploy" / "nginx" / "templates" / "internal_token.conf.template"
+PROXY_LOCATIONS_TEMPLATE = REPO / "deploy" / "nginx" / "templates" / "proxy_locations.conf.template"
 TLS_TEMPLATE = REPO / "deploy" / "nginx" / "templates" / "tls.conf.template"
 FRONTEND_SRC = REPO / "frontend" / "src"
 
@@ -86,6 +82,7 @@ def _first_group(pattern: str, text: str, what: str) -> str:
     return m.group(1)
 
 
+@unittest.skip("direct sandbox MCP is intentionally disabled until a down-scoped capability proxy exists")
 class TestSandboxMcpIpConsistency(unittest.TestCase):
     """mcp 的静态 IP 三处一致，且落在子网内。"""
 
@@ -138,123 +135,6 @@ class TestSandboxMcpIpConsistency(unittest.TestCase):
         )
 
 
-class TestNginxAuthStructure(unittest.TestCase):
-    """nginx.conf 的认证结构：认证不能漏 location，开关不能多。"""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.conf = _read(NGINX_CONF)
-
-    def _location_block(self, selector: str) -> str:
-        # `^\s*` 锚定行首：注释行以 # 开头，所以不会被匹配到。
-        # 这个锚定不是洁癖 —— nginx.conf 的注释里真的会出现 "location" 这个词，
-        # 不加锚定的 index()/search() 会命中注释，然后断言就变成了在测注释。
-        m = re.search(r"^[ \t]*location\s+" + re.escape(selector) + r"\s*\{",
-                      self.conf, re.MULTILINE)
-        self.assertIsNotNone(m, f"nginx.conf 里找不到 location {selector}")
-        start = m.end() - 1
-        depth = 0
-        for i in range(start, len(self.conf)):
-            if self.conf[i] == "{":
-                depth += 1
-            elif self.conf[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    return self.conf[start:i + 1]
-        self.fail(f"location {selector} 的花括号不平衡")
-
-    def test_api_locations_forward_both_auth_headers(self):
-        """共享密钥头与身份头，两个 /api location 都得有。
-
-        漏掉 X-Internal-Auth → backend 拒绝所有 /api 请求（401），
-        漏掉 X-Authenticated-User → backend 认为请求没经过 nginx（401）。
-        两者都会"整个 API 挂掉"，但只有后者是安全相关的：
-        它反过来（backend 不校验时）就是沙箱代码可以伪造身份。
-        """
-        for selector in ("/api/chat/", "/api/"):
-            with self.subTest(location=selector):
-                block = self._location_block(selector)
-                self.assertIn("proxy_set_header X-Internal-Auth", block,
-                              f"location {selector} 没有转发 X-Internal-Auth")
-                self.assertIn("proxy_set_header X-Authenticated-User", block,
-                              f"location {selector} 没有转发 X-Authenticated-User")
-
-    def _all_location_blocks(self):
-        """返回 [(selector, block_text), ...]，覆盖每个 server 块里的全部
-        location（:80 与 :443 各有一组探针，所以不能只取第一个匹配）。"""
-        out = []
-        for m in re.finditer(r"^[ \t]*location\s+(.+?)\s*\{", self.conf, re.MULTILINE):
-            selector = m.group(1).strip()
-            start = m.end() - 1
-            depth = 0
-            for i in range(start, len(self.conf)):
-                if self.conf[i] == "{":
-                    depth += 1
-                elif self.conf[i] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        out.append((selector, self.conf[start:i + 1]))
-                        break
-        return out
-
-    def test_auth_basic_off_only_on_health_endpoints(self):
-        """`auth_basic off` 只能出现在探活 location 上，且每个探针都必须免认证。
-
-        不数全局固定数量：:80 与 :443(TLS) 各有一组 /healthz、/health，server
-        块数量会随拓扑增长。直接枚举每个 location 块做两条双向断言更稳：
-          - 任何免认证的 location，选择器必须是 = /healthz 或 = /health
-            （抓住「某个业务 location 被静默放行」这个真实漏洞）；
-          - 这两个探针 location 必须 auth_basic off（探针带不了凭据）。
-        """
-        blocks = self._all_location_blocks()
-        self.assertTrue(blocks, "nginx.conf 里一个 location 块都没解析出来？")
-
-        health = {"= /healthz", "= /health"}
-        off_selectors = []
-        for selector, block in blocks:
-            if re.search(r"^\s*auth_basic\s+off\s*;", block, re.MULTILINE):
-                off_selectors.append(selector)
-
-        unauth = [s for s in off_selectors if s not in health]
-        self.assertEqual(
-            unauth, [],
-            f"这些非探活 location 配了 auth_basic off，属于未认证放行：{unauth}",
-        )
-
-        present = {s for s, _ in blocks}
-        missing = sorted(h for h in health if h in present
-                         and not any(s == h for s in off_selectors))
-        self.assertEqual(
-            missing, [],
-            f"探针 location {missing} 应当 auth_basic off（探针带不了凭据）",
-        )
-        # 至少 :80 一组，防止前面的断言在「整份配置没有任何 off」时被空集绕过。
-        self.assertGreaterEqual(
-            len(off_selectors), 2,
-            f"auth_basic off 只有 {len(off_selectors)} 处，至少应有 :80 的一组探针",
-        )
-
-    def test_internal_token_include_is_in_server_context(self):
-        """include 必须在 server 上下文里，两个 /api location 才继承得到它。"""
-        self.assertIn("include /etc/nginx/conf.d/internal_token.conf;", self.conf)
-        include_at = self.conf.index("include /etc/nginx/conf.d/internal_token.conf;")
-
-        # 锚定行首找第一条真正的 location 指令（注释里的 "location" 不算）。
-        m = re.search(r"^[ \t]*location\s", self.conf, re.MULTILINE)
-        self.assertIsNotNone(m, "nginx.conf 里一个 location 都没有？")
-        self.assertLess(
-            include_at, m.start(),
-            "internal_token.conf 的 include 出现在第一个 location 之后 —— "
-            "如果它被挪进了某个 location，其它 location 就取不到 $internal_token",
-        )
-
-    def test_token_template_exists_and_reads_the_env_var(self):
-        """include 的那个文件是渲染出来的，模板必须存在并引用环境变量。"""
-        template = _read(NGINX_TEMPLATE)
-        self.assertIn("${INTERNAL_AUTH_TOKEN}", template)
-        self.assertIn("set $internal_token", template)
-
-
 class TestNginxTlsSwitchTemplate(unittest.TestCase):
     """tls.conf 在 nginx.conf 的 http{} **顶层**被 include，那里只能用 map。
 
@@ -304,123 +184,70 @@ class TestNginxTlsSwitchTemplate(unittest.TestCase):
         )
 
 
-class TestNginxAuthRuntimeFiles(unittest.TestCase):
-    """钉死两个只在**带凭据请求**上爆、探针看不见的运行时坑（真机 2026-10 踩中）。
-
-    现象是「整站一登录就 500、/healthz 却照常 200」，定位到两个互相独立的问题：
-
-    1. htpasswd 落成 ``600 root:root``，而打开它校验口令的是 worker(nginx
-       uid 101) —— ``open() .../htpasswd (13: Permission denied)`` → 500。
-    2. ``nginx.env`` 缺 ``TLS_ENABLED=`` 行，容器内该变量未定义，envsubst 不替换
-       ``${TLS_ENABLED}``，它残留进 tls.conf 与 map 目标 ``$tls_enabled`` 自引用
-       —— ``cycle while evaluating variable "tls_enabled"`` → 500。
-
-    bootstrap 管全新装机、deploy/cd 管老实例原地升级，两条路径都必须兜住。
-    """
+class TestJwtAuthStructure(unittest.TestCase):
+    """统一身份由 Java ERP 签发；nginx 只透传 Bearer，不再持有用户凭据。"""
 
     @classmethod
     def setUpClass(cls):
         cls.conf = _read(NGINX_CONF)
-        cls.bootstrap = _read(BOOTSTRAP_SH)
-        cls.prepare = _read(PREPARE_STACK_SH)
-        cls.lib = _read(LIB_SH)
-        cls.deploy = _read(DEPLOY_SH)
-        cls.nginx_env_example = _read(NGINX_ENV_EXAMPLE)
+        cls.locations = _read(PROXY_LOCATIONS_TEMPLATE)
+        cls.compose = _read(COMPOSE)
+        cls.env = _read(ENV_EXAMPLE)
 
-    def test_nginx_conf_pins_worker_user_nginx(self):
-        m = re.search(r"(?m)^user\s+nginx\s*;", self.conf)
-        self.assertIsNotNone(m, "nginx.conf 必须显式 user nginx;（固化 worker 非特权用户）")
-        http_m = re.search(r"(?m)^http\s*\{", self.conf)
-        self.assertIsNotNone(http_m)
-        self.assertLess(
-            m.start(), http_m.start(),
-            "user nginx; 必须在 http{} 之前（main 上下文），否则 nginx -t 报错",
-        )
+    def test_nginx_has_no_basic_or_trusted_identity_headers(self):
+        self.assertNotIn("auth_basic", self.conf)
+        self.assertNotIn("X-Authenticated-User", self.conf)
+        self.assertNotIn("X-Internal-Auth", self.conf)
+        self.assertNotIn("X-Authenticated-User", self.locations)
+        self.assertNotIn("X-Internal-Auth", self.locations)
 
-    def test_bootstrap_chmods_htpasswd_644(self):
-        self.assertIn(
-            "chmod 644 deploy/nginx/htpasswd", self.bootstrap,
-            "bootstrap 生成/保留 htpasswd 后必须 chmod 644 —— worker(uid 101) 打不开 "
-            "600 root:root，带凭据请求全 500（deploy/ci/prepare-stack.sh 有同款教训注释）",
-        )
+    def test_nginx_routes_identity_and_erp_to_java(self):
+        self.assertEqual(self.conf.count("include /etc/nginx/conf.d/proxy_locations.conf;"), 2)
+        self.assertEqual(self.locations.count("location /api/auth/"), 1)
+        self.assertEqual(self.locations.count("location /api/erp/"), 1)
+        self.assertGreaterEqual(self.locations.count("proxy_set_header Authorization"), 4)
+        self.assertIn("http://java-erp:8080", self.locations)
 
-    def test_bootstrap_writes_tls_switch_unconditionally(self):
-        idx = self.bootstrap.find("把 TLS_ENABLED 写进 nginx.env")
-        self.assertGreaterEqual(idx, 0, "bootstrap 里找不到写 TLS_ENABLED 进 nginx.env 的段落")
-        # 只截到本段的 fi 为止 —— 紧随其后还有一条 `if [ -n "$TLS_ENABLED" ]`
-        # （TLS 开时改 PUBLIC_BASE_URL），那条是合理的，不能混进来一起判。
-        fi_at = self.bootstrap.index("\nfi\n", idx)
-        block = self.bootstrap[idx: fi_at + 4]
-        self.assertIn(r"printf 'TLS_ENABLED=%s\n'", block)
-        self.assertNotIn(
-            'if [ -n "$TLS_ENABLED" ]', block,
-            "把 TLS_ENABLED 写进 nginx.env 不能以「值非空」为前提：纯 HTTP 也要显式留下"
-            "空行，否则容器内该变量未定义、envsubst 残留 ${TLS_ENABLED} 与 map 目标自引用 cycle 500",
-        )
+    def test_compose_separates_private_and_public_keys(self):
+        java = _yaml_block(self.compose, "java-erp", 2)
+        backend = _yaml_block(self.compose, "backend", 2)
+        mcp = _yaml_block(self.compose, "mcp", 2)
+        self.assertIn("erp-jwt-private.pem", java)
+        self.assertNotIn("erp-jwt-private.pem", backend)
+        self.assertNotIn("erp-jwt-private.pem", mcp)
+        self.assertIn("AUTH_MODE: jwt", backend)
+        self.assertIn("MCP_AUTH_ENABLED", mcp)
 
-    def test_nginx_env_example_declares_empty_tls_switch(self):
-        self.assertRegex(
-            self.nginx_env_example, r"(?m)^TLS_ENABLED=\s*$",
-            "nginx.env.example 必须含一条空的 TLS_ENABLED= —— 新装机从它 cp，缺这行就埋下 cycle",
-        )
+    def test_env_declares_required_jwt_contract(self):
+        for key in (
+            "ERP_JWT_PRIVATE_KEY_PATH", "ERP_JWT_PUBLIC_KEY_PATH",
+            "JWT_PUBLIC_KEY_PATH", "JWT_ISSUER", "JWT_AUDIENCE",
+            "ERP_BOOTSTRAP_ADMIN_USERNAME", "ERP_BOOTSTRAP_ADMIN_PASSWORD",
+        ):
+            self.assertRegex(self.env, rf"(?m)^{key}=", f"缺少 {key}")
 
-    def test_cd_ensures_auth_and_switch_and_is_called_before_up(self):
-        self.assertRegex(self.lib, r"(?m)^cd_ensure_nginx_auth_and_switch\s*\(\)\s*\{")
-        start = self.lib.index("cd_ensure_nginx_auth_and_switch()")
-        body = self.lib[start: self.lib.index("\n}\n", start) + 2]
-        self.assertRegex(
-            body, r"chmod\s+644[^\n]*htpasswd",
-            "cd_ensure_nginx_auth_and_switch 必须把老实例的 htpasswd 修正到 644",
-        )
-        self.assertIn(
-            "TLS_ENABLED=", body,
-            "cd_ensure_nginx_auth_and_switch 必须在 nginx.env 缺行时补 TLS_ENABLED= 空值",
-        )
-        apply_start = self.deploy.index("cd_apply_and_verify()")
-        apply_body = self.deploy[apply_start: self.deploy.index("\n}\n", apply_start) + 2]
-        self.assertIn(
-            "cd_ensure_nginx_auth_and_switch", apply_body,
-            "兜底函数必须在 cd_apply_and_verify 的 up -d 前调用（该函数被正常发布与回滚两路复用）",
-        )
-
-    def test_prepare_stack_generates_tls_placeholder_cert(self):
-        # 占位证书契约的第三条路径：bootstrap 管装机、deploy/cd 管老实例升级、
-        # prepare-stack.sh 管 CI 集成栈。CI 走纯 HTTP（TLS_ENABLED= 空）又不跑
-        # bootstrap/deploy，没人生成证书；少这一步 nginx 加载配置即 emerg，两个集成
-        # job 全卡在等 healthy 超时，认证 / 沙箱断言一条都跑不到 —— 用结构断言在
-        # PR 上秒级拦住，不必等集成栈十几分钟超时。
-        self.assertIn(
-            "deploy/nginx/tls", self.prepare,
-            "prepare-stack.sh 必须准备 deploy/nginx/tls 目录（compose 只读挂进容器）",
-        )
-        self.assertRegex(
-            self.prepare, r"openssl\s+req\s+-x509",
-            "prepare-stack.sh 必须用 openssl req -x509 自签占位证书，与 "
-            "cd_ensure_nginx_tls_cert 保持同一契约",
-        )
-        self.assertIn("cert.pem", self.prepare)
-        self.assertIn("key.pem", self.prepare)
+    def test_production_sync_preserves_runtime_keys(self):
+        package_filter = _read(REPO / "deploy" / "cd" / "package.filter")
+        self.assertIn("- /deploy/secrets/", package_filter)
+        init_security = _read(REPO / "deploy" / "init-security.sh")
+        self.assertIn("deploy/generate-jwt-keys.sh", init_security)
+        self.assertIn("ERP_BOOTSTRAP_ADMIN_PASSWORD", init_security)
 
 
 class TestEnvTemplates(unittest.TestCase):
-    """两个 env 模板必须都提供 INTERNAL_AUTH_TOKEN 这个键。"""
+    """nginx 模板只持有 TLS 开关，应用模板持有 JWT 路径而不含真实密钥。"""
 
-    def test_both_templates_declare_internal_auth_token(self):
-        """deploy/.env 与 deploy/nginx.env 是两个独立文件，靠人去保持一致。
+    def test_nginx_env_contains_only_transport_switches(self):
+        nginx_env = _read(NGINX_ENV_EXAMPLE)
+        self.assertRegex(nginx_env, r"(?m)^TLS_ENABLED=")
+        self.assertNotIn("PASSWORD=", nginx_env)
+        self.assertNotIn("JWT_PRIVATE", nginx_env)
 
-        两个模板都列出这个键，是"两边都该配"这个前提在文档层的体现。
-        只校验键存在、不校验值 —— 值由 deploy/set_internal_token.sh 写，
-        且永远不入库。
-        """
-        for path in (ENV_EXAMPLE, NGINX_ENV_EXAMPLE):
-            with self.subTest(file=path.name):
-                text = _read(path)
-                self.assertRegex(
-                    text, r"(?m)^INTERNAL_AUTH_TOKEN=",
-                    f"{path.name} 里没有 INTERNAL_AUTH_TOKEN= —— "
-                    f"少了它，那边就只能靠猜或者干脆不配，而两边不一致的表现是"
-                    f"/api/* 全 401、/healthz 却照常 200（见 nginx.env.example 的说明）",
-                )
+    def test_application_env_points_to_generated_keys(self):
+        env = _read(ENV_EXAMPLE)
+        self.assertIn("deploy/generate-jwt-keys.sh", env)
+        self.assertIn("/run/secrets/erp-jwt-private.pem", env)
+        self.assertIn("/run/secrets/erp-jwt-public.pem", env)
 
 
 class TestFrontendIsEnvironmentIndependent(unittest.TestCase):

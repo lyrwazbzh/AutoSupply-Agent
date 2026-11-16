@@ -12,13 +12,26 @@ tools:
   - part_page
   - part_query
   - part_by_supplier
+  - supplier_options
+  - vehicle_model_search
+  - vehicle_model_get
+  - part_fitments
+  - part_search_by_vehicle
   - inventory_warning
   - inventory_page
   - inventory_check
+  - inventory_transaction_page
+  - inventory_transaction_get
+  - replenishment_page
+  - purchase_return_page
   - order_search_details
   - order_statistics
   - order_page
   - generate_chart
+  - generate_document
+  - generate_table_report
+  - download_sandbox_file
+  - list_sandbox_files
   - web_search
 
 # ===== 上下文传递协议 =====
@@ -43,9 +56,9 @@ context_protocol:
     sections:
       - summary        # 分析概述（1-2句话）
       - data_table     # 核心数据表格（Markdown）
-      - charts         # 图表文件路径列表
-      - conclusions    # 分析结论
-      - recommendations # 采购建议
+      - evidence       # 工具证据与数据来源
+      - findings       # 有数据支撑的发现
+      - requested_artifacts # 仅包含用户要求的图表/文档/建议
     format: markdown
 
 # ===== 人工介入配置 =====
@@ -76,23 +89,24 @@ system_prompt: |
 
   ### 第2步：数据采集
   使用 MCP 工具获取相关数据：
-  - 供应商数据：supplier_query, supplier_page
-  - 零部件数据：part_search, part_page, part_by_supplier
-  - 库存数据：inventory_warning, inventory_page, inventory_check
+  - 供应商数据：supplier_query, supplier_page, supplier_options
+  - 零部件数据：part_search, part_page, part_by_supplier, part_fitments, part_search_by_vehicle
+  - 库存数据：inventory_warning, inventory_page, inventory_check, inventory_transaction_page
   - 订单数据：order_search_details, order_statistics, order_page
 
   ### 第3步：数据整理
   对获取的原始数据进行清洗、分类、汇总，提取关键指标。
 
-  ### 第4步：可视化生成
-  使用 generate_chart 工具生成图表：
+  ### 第4步：按需生成交付物
+  只有用户明确要求图表时才使用 generate_chart：
   - 对比分析 → bar / horizontal_bar
   - 趋势分析 → line / area
   - 占比分析 → pie / donut
   - 关联分析 → scatter
   - 综合评估 → radar
 
-  如果 user_preferences 中有 preferred_chart_type，优先使用用户偏好的图表类型。
+  用户明确要求文档或表格文件时才生成相应文件。若要求图表且 user_preferences 中有
+  preferred_chart_type，优先使用该偏好。
 
   ### 第5步：输出报告
   生成结构化分析报告，严格包含以下部分：
@@ -100,7 +114,7 @@ system_prompt: |
   2. **数据表格** - Markdown 格式
   3. **图表说明** - 图表路径 + 解读
   4. **分析结论** - 有数据支撑的结论
-  5. **采购建议** - 可操作的建议
+  5. **用户要求的交付物** - 图表、文档或建议；未要求则省略
 
   ## 输出规范
   - 使用 Markdown 格式

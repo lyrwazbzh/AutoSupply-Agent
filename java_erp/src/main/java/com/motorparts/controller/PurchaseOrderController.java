@@ -14,6 +14,8 @@ import com.motorparts.entity.PurchaseOrder;
 import com.motorparts.entity.PurchaseOrderWithDetails;
 import com.motorparts.mapper.OrderDetailMapper;
 import com.motorparts.mapper.PartMapper;
+import com.motorparts.procurement.receiving.OrderReceiveRequest;
+import com.motorparts.procurement.receiving.OrderReceivingService;
 import com.motorparts.service.ErpOperationService;
 import com.motorparts.service.PurchaseOrderService;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -22,6 +24,8 @@ import io.swagger.v3.oas.annotations.Parameter;
 import lombok.RequiredArgsConstructor;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.validation.annotation.Validated;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
 import org.springframework.web.bind.annotation.*;
 
 import jakarta.validation.Valid;
@@ -39,6 +43,7 @@ import java.util.Map;
 @Tag(name = "采购订单管理")
 @RestController
 @RequestMapping("/api/orders")
+@PreAuthorize("hasAuthority('erp:order:read')")
 @RequiredArgsConstructor
 @Validated
 public class PurchaseOrderController {
@@ -47,12 +52,14 @@ public class PurchaseOrderController {
     private final OrderDetailMapper orderDetailMapper;
     private final PartMapper partMapper;
     private final ErpOperationService erpOperationService;
+    private final OrderReceivingService orderReceivingService;
 
     /**
      * 创建采购订单（支持 operationId 回放与 idempotencyKey 幂等）
      */
     @Operation(summary = "创建采购订单")
     @PostMapping("/create")
+    @PreAuthorize("hasAuthority('erp:order:create')")
     public Result<?> create(
             @Valid @RequestBody PurchaseOrderWithDetails order,
             @RequestParam(required = false) String operationId,
@@ -90,6 +97,7 @@ public class PurchaseOrderController {
      */
     @Operation(summary = "更新采购订单")
     @PutMapping("/update/{id}")
+    @PreAuthorize("hasAuthority('erp:order:update')")
     public Result<?> update(
             @Parameter(description = "订单ID") @PathVariable Long id,
             @Valid @RequestBody PurchaseOrderWithDetails order,
@@ -101,6 +109,13 @@ public class PurchaseOrderController {
             return replay;
         }
         order.setId(id);
+        PurchaseOrder existing = purchaseOrderService.getById(id);
+        if (existing == null) {
+            return Result.error(ResultCode.DATA_NOT_EXISTS);
+        }
+        if (order.getStatus() != null && !order.getStatus().equals(existing.getStatus())) {
+            return Result.error(ResultCode.ORDER_STATUS_ERROR, "通用订单编辑不能修改状态");
+        }
         boolean success = purchaseOrderService.updateById(order);
         if (!success) {
             return Result.error(ResultCode.DATA_NOT_EXISTS);
@@ -116,6 +131,7 @@ public class PurchaseOrderController {
      */
     @Operation(summary = "删除采购订单")
     @DeleteMapping("/delete/{id}")
+    @PreAuthorize("hasAuthority('erp:order:delete')")
     public Result<Void> delete(@Parameter(description = "订单ID") @PathVariable Long id) {
         boolean success = purchaseOrderService.removeById(id);
         if (!success) {
@@ -140,6 +156,7 @@ public class PurchaseOrderController {
         // 复制订单基本信息
         orderWithDetails.setId(order.getId());
         orderWithDetails.setOrderNumber(order.getOrderNumber());
+        orderWithDetails.setSupplierId(order.getSupplierId());
         orderWithDetails.setTotalAmount(order.getTotalAmount());
         orderWithDetails.setStatus(order.getStatus());
         orderWithDetails.setOrderTime(order.getOrderTime());
@@ -228,6 +245,7 @@ public class PurchaseOrderController {
             // 复制订单基本信息
             orderWithDetails.setId(order.getId());
             orderWithDetails.setOrderNumber(order.getOrderNumber());
+            orderWithDetails.setSupplierId(order.getSupplierId());
             orderWithDetails.setTotalAmount(order.getTotalAmount());
             orderWithDetails.setStatus(order.getStatus());
             orderWithDetails.setOrderTime(order.getOrderTime());
@@ -288,6 +306,7 @@ public class PurchaseOrderController {
      */
     @Operation(summary = "更新订单状态")
     @PatchMapping("/update-status/{id}")
+    @PreAuthorize("hasAuthority('erp:order:status')")
     public Result<?> updateStatus(
             @Parameter(description = "订单ID") @PathVariable Long id,
             @Parameter(description = "新状态") @RequestParam Integer status,
@@ -310,6 +329,23 @@ public class PurchaseOrderController {
         Result<?> result = Result.success(view, "状态更新成功");
         erpOperationService.complete(opId, result);
         return result;
+    }
+
+    /**
+     * 确认整单到货，库存、流水、订单状态和 operation 结果在同一事务提交。
+     */
+    @Operation(summary = "确认采购订单收货并自动入库")
+    @PostMapping("/{id}/receive")
+    @PreAuthorize("hasAuthority('erp:order:receive')")
+    public Result<?> receive(
+            @Parameter(description = "订单ID") @PathVariable Long id,
+            @RequestBody(required = false) OrderReceiveRequest request,
+            @RequestParam(required = false) String operationId,
+            @RequestHeader(value = "X-Operation-Id", required = false) String operationHeader,
+            JwtAuthenticationToken authentication) {
+        String bodyOperationId = request == null ? null : request.getOperationId();
+        String opId = OperationIds.resolve(bodyOperationId, operationId, operationHeader);
+        return orderReceivingService.receive(id, request, opId, operatorId(authentication));
     }
 
     /**
@@ -366,5 +402,23 @@ public class PurchaseOrderController {
             DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
             return LocalDateTime.parse(dateStr, formatter);
         }
+    }
+
+    private static Long operatorId(JwtAuthenticationToken authentication) {
+        if (authentication == null) {
+            return null;
+        }
+        Object value = authentication.getToken().getClaims().get("user_id");
+        if (value instanceof Number number) {
+            return number.longValue();
+        }
+        if (value instanceof String text) {
+            try {
+                return Long.valueOf(text);
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+        return null;
     }
 }

@@ -15,9 +15,7 @@ router = APIRouter(prefix="/api/evaluation", tags=["evaluation"])
 async def get_metrics(
     _: str | None = Depends(auth.current_user_id),
 ):
-    permission_check = getattr(auth, "assert_permission", None)
-    if permission_check is not None:
-        permission_check("audit:read:all")
+    auth.assert_permission("audit:read:all")
     try:
         return load_report()
     except ValueError as exc:
@@ -29,9 +27,7 @@ async def get_evaluation_trace(
     thread_id: str,
     authenticated: str | None = Depends(auth.current_user_id),
 ):
-    permission_check = getattr(auth, "assert_permission", None)
-    if permission_check is not None:
-        permission_check("assistant:use")
+    auth.assert_permission("assistant:use")
     owner = await agent_loader.get_conversation_user_id(thread_id)
     auth.assert_thread_owner(thread_id, owner, authenticated)
     return {

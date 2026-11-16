@@ -30,6 +30,10 @@ public class PurchaseOrder extends BaseEntity {
     @TableField("order_number")
     private String orderNumber;
 
+    /** 订单供应商；旧订单可为空。 */
+    @TableField("supplier_id")
+    private Long supplierId;
+
     /**
      * 订单总金额
      */
@@ -103,6 +107,14 @@ public class PurchaseOrder extends BaseEntity {
 
     public void setOrderNumber(String orderNumber) {
         this.orderNumber = orderNumber;
+    }
+
+    public Long getSupplierId() {
+        return supplierId;
+    }
+
+    public void setSupplierId(Long supplierId) {
+        this.supplierId = supplierId;
     }
 
     public BigDecimal getTotalAmount() {

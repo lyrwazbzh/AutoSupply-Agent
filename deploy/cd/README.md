@@ -8,7 +8,7 @@
 | `lib.sh` | 共享库：环境常量、compose 包装、锁、状态文件、健康与冒烟、影子启动、通知 |
 | `deploy.sh` | `deploy` / `init` / `rollback`（含 `--check`） |
 | `status.sh` | 只读巡检。给运维人看，**同时也给 `deploy/monitor/patrol.sh` 当输入** —— 它的输出格式是接口，见下 |
-| `build.sh` | 在目标机本地构建三个镜像并打 `sha-<12>` / `vX.Y.Z` 两个 tag。**跑在 CI，不跑在生产树** |
+| `build.sh` | 构建 Java ERP、MCP/Backend、Frontend 镜像并打 `sha-<12>` / `vX.Y.Z` 两个 tag。**跑在 CI，不跑在生产树** |
 | `shadow_probe.py` | 影子容器内跑的断言集，被 `lib.sh` 的 `cd_shadow()` 拷进去执行 |
 | `notify.sh` | 发布通知（飞书/webhook）。**发送失败不影响发布结果** |
 | `package.filter` | rsync 同步源码树时的排除/保护清单 |
@@ -39,10 +39,10 @@ bash deploy/cd/status.sh
 `<tag>` 与 `<sha>` 是两件事：tag 选镜像，sha 选源码树。**两个都要填** ——
 只换镜像不同步树，会让「运行中的代码」和「状态文件记的版本」脱节。
 
-冒烟的深链路（`/` 与 `/api/history`）需要 Basic Auth 凭据，从环境变量注入：
+冒烟的深链路需要 ERP 管理员凭据，脚本先登录取得短期 JWT，再验证 Python 与 Java API：
 
 ```bash
-SMOKE_BASIC_USER=admin SMOKE_BASIC_PASSWORD=xxx bash deploy/cd/deploy.sh deploy ...
+SMOKE_ERP_USER=admin SMOKE_ERP_PASSWORD=xxx bash deploy/cd/deploy.sh deploy ...
 ```
 
 不传这两个变量只会探 `/healthz` 与 `/health`，**前端与 /api 链路不被验证**，
@@ -83,8 +83,10 @@ CI 靠退出码区分处置方式。
 
 ## 架构约束（决定了这套脚本的形状）
 
-**A. backend 必须单副本。** 沙箱注册表、会话、AgentLoader 全是进程内状态。
-每次发布必然停机重建（实测换版 44s、回退 39s，SSE 实断约 20s）。
+**A. 运行所有权已外置。** AgentSession、用户运行租约、沙箱分配与暖池归属以
+PostgreSQL 为准，本地注册表只是可重建缓存。当前脚本仍按单个 Compose backend
+执行停机换版（实测换版 44s、回退 39s）；要做多副本滚动发布，还需把 artifact
+临时目录改成共享存储或为下载路径配置粘性路由。
 
 **坏版本的停机窗口是 ~140s，不是 44s。** 差别在 `docker compose up -d`：它自己会为
 `depends_on` 的健康条件阻塞，镜像永远不达标时要等到 backend 的
@@ -112,7 +114,7 @@ CI 靠退出码区分处置方式。
 `deploy.sh` 用 `NGINX_TREE_SHA256` 的比对自动做这件事（`--no-deps`，防止连带
 重建 dind 杀掉正在跑的沙箱容器）。
 
-**C. 换版只覆盖四个服务。** `state/<env>.override.yml` 只改 mock-erp / mcp /
+**C. 换版只覆盖四个服务。** `state/<env>.override.yml` 只改 java-erp / mcp /
 backend / frontend 的 `image`。postgres / dind / nginx / sandbox-image-loader 不动。
 **这是刻意不修改仓库里 `docker-compose.yml` 的原因**：生产树是同步出来的，改它
 下次同步就没了。
@@ -131,7 +133,7 @@ backend / frontend 的 `image`。postgres / dind / nginx / sandbox-image-loader 
 - 不用 `--inplace`：rsync 默认「写临时文件再 rename」，正在跑的 bash 持有旧
   `deploy.sh` 的文件描述符，改名不影响它；`--inplace` 会就地覆盖正在执行的脚本。
 
-`package.filter` 保护四类东西：四个密钥文件、`deploy/cd/state/`、`node_modules`
+`package.filter` 保护四类东西：运行时密钥、`deploy/cd/state/`、`node_modules`
 之类的构建产物、以及环境模板的例外（`.env.example` 必须进包，否则新机器的
 `bootstrap.sh` 生成不出 `deploy/.env`）。
 
@@ -139,10 +141,10 @@ backend / frontend 的 `image`。postgres / dind / nginx / sandbox-image-loader 
 
 | 类别 | 路径 | 处理 |
 |---|---|---|
-| 自动发布 | `src/**`、`frontend/**`、`deploy/mock-erp/**` | 正常流程 |
+| 自动发布 | `src/**`、`frontend/**`、`java_erp/**` | 正常流程 |
 | 自动发布 + 强制重建 nginx | `deploy/nginx/**` | 自动 `--force-recreate nginx` |
 | **默认拒绝** | `docker-compose.yml`、`deploy/dind-daemon.json` | 检出变化即失败。重建 dind 会停掉在跑的沙箱容器；要自动应用须显式 `CD_ALLOW_INFRA_CHANGE=1` |
-| 永不触碰 | `deploy/.env`、`deploy/nginx.env`、`deploy/nginx/htpasswd`、`deploy/cd/state/**` | 同步时排除；密钥轮换永远是人工动作 |
+| 永不触碰 | `deploy/.env`、`deploy/nginx.env`、`deploy/secrets/**`、`deploy/cd/state/**` | 同步时排除；密钥轮换永远是人工动作 |
 
 ## 状态文件
 
@@ -184,11 +186,11 @@ digest、版本号、可用空间，因为它们每次发布都会变，拿全�
 |---|---|---|
 | 备份 | `deploy/dr/backup.sh`（`cd_backup()` 调） | 运行时枚举库 → dump → **恢复自检** → 剪枝 → 外推 OSS。失败退出码 2，生产没动过 |
 | 迁移 | `deploy/dr/migrate.sh` | 跑在**备份之后、同步之前**，从新 commit 取 `migrations/`。失败退出码 8，生产没动过 |
-| 影子启动 | `lib.sh` 的 `cd_shadow()` + `shadow_probe.py` | 换版前用新镜像起一次性容器，验 `/health`、MCP 可达、`/api` 带令牌 200 / 不带 401、LLM 可达。**生产未被触碰** |
+| 影子启动 | `lib.sh` 的 `cd_shadow()` + `shadow_probe.py` | 换版前用新镜像起一次性容器，真实登录 Java ERP，验 `/health`、MCP 可达、`/api` 带 JWT 200 / 不带 401、LLM 可达。**生产未被触碰** |
 | 观察窗 | `deploy.sh` 的 `cd_soak()` | 默认 300s（`CD_SOAK_SECONDS`），期间健康转差即自动回滚（退出码 6） |
 | 通知 | `notify.sh` | 飞书/webhook，部署开始/成功/失败/回滚各自一条。**发送失败不影响发布结果** |
 | 提权入口 | `deploy/runner/erp-agent-deploy` | runner 唯一的提权点，参数白名单 + 生产密钥由 root 读 |
-| 构建 | `build.sh` | 机器本地构建三个镜像，打 `sha-<12>` 与 `vX.Y.Z` 两个 tag |
+| 构建 | `build.sh` | 构建三个应用镜像，打 `sha-<12>` 与 `vX.Y.Z` 两个 tag |
 | 机内巡检 | `deploy/monitor/patrol.sh`（timer 驱动） | 每 10 分钟跑本目录的 `status.sh`，**状态变迁才告警**；另有每日心跳与死信 ping。见 [deploy/dr/README.md](../dr/README.md) |
 
 ## 尚未实现

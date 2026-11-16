@@ -10,7 +10,7 @@ describe("extractChartPreviews", () => {
         args: "{}",
         status: "done",
         result:
-          "✅ 图表生成成功!\n标题: 供应商评级\n下载链接: http://localhost:8000/api/download/chart_供应商.png\n",
+          "✅ 图表生成成功!\n标题: 供应商评级\n下载链接: /api/download/chart_供应商.png\n",
       },
     ]);
 

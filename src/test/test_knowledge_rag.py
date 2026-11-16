@@ -15,17 +15,14 @@ from src.agent.knowledge.retrieval_flow import (
     retrieve_hybrid,
 )
 from src.agent.knowledge.retrieve import hybrid_retrieve, rrf_merge
-from src.agent.knowledge.store import KnowledgeDoc, KnowledgeStore, get_default_store
+from src.agent.knowledge.store import SEED_PATH, KnowledgeDoc, KnowledgeStore
 
 
 class HybridRetrieveTests(unittest.TestCase):
     def setUp(self):
-        # 种子可能在进程内已缓存；用文件重载保证条数断言稳定
-        store = get_default_store()
-        if len(store.all()) < 8:
-            from src.agent.knowledge.store import SEED_PATH
-
-            store.load_json(SEED_PATH)
+        # 单元测试使用显式内存 store，不触发运行时 PostgreSQL 连接。
+        store = KnowledgeStore()
+        store.load_json(SEED_PATH)
         self.store = store
 
     def test_seed_loaded(self):

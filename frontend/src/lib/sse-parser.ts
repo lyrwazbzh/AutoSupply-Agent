@@ -40,17 +40,10 @@ export class SSEParser {
         const { currentEvent, currentData } = this;
         try {
           const parsed = JSON.parse(currentData);
-          const event: SSEEvent = { type: currentEvent, ...parsed };
+          const event: SSEEvent = { ...parsed, type: currentEvent };
           events.push(event);
         } catch {
-          // 非 JSON data，构造简单事件
-          if (currentEvent === "token") {
-            events.push({
-              type: "token",
-              content: currentData,
-              source: "main",
-            });
-          }
+          // 协议只接受 JSON data；畸形事件丢弃，不猜测旧版载荷。
         }
         this.currentEvent = "";
         this.currentData = "";

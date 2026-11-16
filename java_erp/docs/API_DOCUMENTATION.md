@@ -7,7 +7,7 @@
 | **API文档地址** | http://localhost:8080/swagger-ui.html |
 | **基础路径** | http://localhost:8080/api |
 | **响应格式** | JSON |
-| **认证方式** | 当前系统未配置认证，所有接口可直接访问 |
+| **认证方式** | Bearer JWT；接口同时执行角色/权限校验 |
 | **字符编码** | UTF-8 |
 
 ---
@@ -16,13 +16,16 @@
 
 1. [通用说明](#通用说明)
 2. [Agent-Harness 写治理](#agent-harness-写治理)
-3. [采购订单管理](#1-采购订单管理)
-4. [供应商管理](#2-供应商管理)
-5. [产品零部件管理](#3-产品零部件管理)
-6. [客户管理](#4-客户管理)
-7. [物流管理](#5-物流管理)
-8. [库存管理](#6-库存管理)
-9. [统计分析](#7-统计分析)
+3. [M1 采购目录](#m1-采购目录)
+4. [M2 收货与库存流水](#m2-收货与库存流水)
+5. [M3 补货任务](#m3-补货任务)
+6. [M4 采购退货](#m4-采购退货)
+7. [采购订单管理](#1-采购订单管理)
+8. [供应商管理](#2-供应商管理)
+9. [产品零部件管理](#3-产品零部件管理)
+10. [物流管理](#5-物流管理)
+11. [库存管理](#6-库存管理)
+12. [统计分析](#7-统计分析)
 
 ---
 
@@ -38,7 +41,7 @@
 
 写接口（订单创建/更新/改状态、供应商创建/改状态、零件创建、入出库）在传入 `operationId` 时登记首次成功结果，重复同号直接回放，不二次落库。
 
-订单 `status=0` 或缺省写库前归一为 `1`（待审核）。出库使用 `current_quantity = current_quantity - ? WHERE current_quantity >= ?` CAS。订单/供应商改状态均为允许迁移 + `WHERE id=? AND status=?`。
+新采购单固定以 `status=1`（待审核）创建；`status=0` 为非法状态。出库使用 `current_quantity = current_quantity - ? WHERE current_quantity >= ?` CAS。订单/供应商改状态均为允许迁移 + `WHERE id=? AND status=?`。
 
 | 能力 | 落点 |
 |------|------|
@@ -47,8 +50,137 @@
 | 状态 / 库存 CAS | 订单 `updateOrderStatus`；供应商 `updateStatus`；出库 `qty>=?` |
 | 只回查、不盲重放 | `GET /api/operations/{id}`、`by-idempotency`；写路径 replay 后不二次落库 |
 | 不变式验收 | `scripts/smoke_harness.ps1` + `docs/verify_invariants.sql` |
-| Redis Lua（可开关） | `motorparts.redis.enabled`；热路径扣减，DB CAS 为正确性底线 |
-| local_message / RocketMQ（可开关） | `motorparts.mq.enabled` 定时延迟取消；`rocketmq-enabled` 旁路通知，替代不了 operations 回查 |
+| 待审核订单到期取消 | `order_expiry_task` + `motorparts.order-expiry.enabled` 本地定时任务；不依赖消息队列 |
+
+---
+
+## M1 采购目录
+
+M1 保留 `part.supplier_id` 作为默认供应商字段，同时使用 `supplier_part` 表维护
+同一零件的多供应商报价。MySQL 是报价、车型和适配关系的唯一事实源；零件与
+供应商查询可使用 Redis 短缓存，并在目录写入时主动失效。
+
+### 多供应商报价
+
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| GET | `/api/parts/{partId}/supplier-options` | `erp:supplier-part:read` | 查询并按启用、默认、价格、交期、质量评分排序 |
+| POST | `/api/parts/{partId}/supplier-options` | `erp:supplier-part:write` | 新增供应商报价 |
+| PUT | `/api/parts/{partId}/supplier-options/{supplierId}` | `erp:supplier-part:write` | 更新报价；`defaultSupplier=true` 时同步默认供应商和默认采购价 |
+| DELETE | `/api/parts/{partId}/supplier-options/{supplierId}` | `erp:supplier-part:write` | 删除非默认报价 |
+
+新增/更新请求的报价字段包括：`supplierPartCode`、`purchasePrice`、
+`minimumOrderQuantity`、`leadTimeDays`、`qualityRating`、`enabled` 和
+`defaultSupplier`。新增请求还必须提供 `supplierId`。质量评分范围为 0～5，
+最小采购量至少为 1；停用报价不能设为默认报价。
+
+### 车型和零件适配
+
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| GET | `/api/vehicle-models/search` | `erp:vehicle:read` | 按关键字、品牌、车系、车型、年款和排量搜索 |
+| GET | `/api/vehicle-models/{id}` | `erp:vehicle:read` | 查询车型详情 |
+| POST | `/api/vehicle-models` | `erp:vehicle:write` | 创建车型档案 |
+| PUT | `/api/vehicle-models/{id}` | `erp:vehicle:write` | 更新车型档案 |
+| GET | `/api/parts/{partId}/fitments` | `erp:fitment:read` | 查询零件适配车型 |
+| POST | `/api/parts/{partId}/fitments` | `erp:fitment:write` | 绑定车型，参数为 `vehicleModelId/fitmentNote/verified` |
+| DELETE | `/api/parts/{partId}/fitments/{vehicleModelId}` | `erp:fitment:write` | 删除适配关系 |
+| GET | `/api/parts/search-by-vehicle?vehicleModelId=` | `erp:fitment:read` | 按车型反查零件 |
+
+`displacement` 统一使用 cc 整数。年款为空表示不限定；查询指定年款时，只有
+起止年款覆盖该年份的车型会返回。相同零件和车型只能建立一条适配关系。
+
+---
+
+## M2 收货与库存流水
+
+M2 把库存数量、库存流水、订单收货状态和 operation 结果放入同一个 MySQL
+事务。任一步异常都会整体回滚；Redis 不参与库存正确性。
+
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| POST | `/api/orders/{id}/receive` | `erp:order:receive` | 仅状态 3 的采购单可整单确认收货；自动入库并转为状态 4 |
+| GET | `/api/inventory/transactions/page` | `erp:inventory:transaction:read` | 分页查询库存流水 |
+| GET | `/api/inventory/transactions/{id}` | `erp:inventory:transaction:read` | 查询流水详情 |
+| GET | `/api/parts/{partId}/inventory-transactions` | `erp:inventory:transaction:read` | 查询一个零件的库存流水 |
+
+收货请求体可传 `operationId`、`actualArrivalDate`（`yyyy-MM-dd`）、
+`warehouseLocation` 和 `remark`；`operationId` 也继续支持 query 参数和
+`X-Operation-Id` 请求头。当前阶段不支持部分收货。
+
+流水类型为 `PURCHASE_RECEIPT`、`MANUAL_INBOUND`、`MANUAL_OUTBOUND`、
+`PURCHASE_RETURN`、`STOCK_ADJUSTMENT`。M2 写入前三种，M4 已启用
+`PURCHASE_RETURN`；`STOCK_ADJUSTMENT` 仍为后续库存调整预留。分页接口支持 `partId`、`transactionType`、
+`sourceType`、`sourceId`、`operatorId`、`operationId`、`startTime` 和
+`endTime` 过滤，其中时间使用 ISO-8601，例如 `2026-11-09T08:30:00`。
+
+内置权限：管理员和仓管员可确认收货；管理员、采购员、仓管员和查看者均可
+读取库存流水。
+
+---
+
+## M3 补货任务
+
+M3 使用确定性规则生成补货建议，不调用 LLM，也不依赖 Redis 或消息队列。
+
+```text
+建议采购量 = max(安全库存 × 补货倍数 - 当前库存, 最小采购量)
+```
+
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| GET | `/api/replenishment/page` | `erp:replenishment:read` | 按状态、零件、来源分页查询 |
+| POST | `/api/replenishment/create` | `erp:replenishment:manage` | 人工创建补货任务 |
+| POST | `/api/replenishment/inspect` | `erp:replenishment:manage` | 立即执行低库存巡检 |
+| POST | `/api/replenishment/{id}/create-order` | `erp:replenishment:manage` | 选择有效报价并创建单零件采购单 |
+| POST | `/api/replenishment/{id}/complete` | `erp:replenishment:manage` | 人工完成尚未转订单的待处理任务 |
+| POST | `/api/replenishment/{id}/cancel` | `erp:replenishment:manage` | 取消待处理任务 |
+
+任务状态为 `PENDING`、`ORDER_CREATED`、`COMPLETED`、`CANCELLED`；来源为
+`MANUAL` 或 `AUTO_INSPECTION`。数据库唯一约束保证每个零件同时最多存在一个
+`PENDING`/`ORDER_CREATED` 任务。任务转采购单时会保存供应商到
+`purchase_order.supplier_id`，采购单确认收货后关联任务自动完成。
+
+定时巡检默认每天北京时间 02:00 执行，可通过
+`ERP_REPLENISHMENT_ENABLED`、`ERP_REPLENISHMENT_CRON`、
+`ERP_REPLENISHMENT_ZONE`、`ERP_REPLENISHMENT_TARGET_MULTIPLIER` 配置。每次
+巡检都会保存扫描数、低库存数、新建任务数、跳过数和缺少有效供应商数。
+
+---
+
+## M4 采购退货
+
+M4 只实现已入库采购单的轻量退货，不扩展质检、供应商退款或财务对账模块。
+创建退货单不会立即影响库存；仓管员或采购员确认后，库存扣减、
+`PURCHASE_RETURN` 流水、退货状态和 operation 结果在同一个 MySQL 事务提交。
+
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| GET | `/api/purchase-returns/page` | `erp:order:read` | 按状态、采购单、零件、原因和创建时间分页查询 |
+| POST | `/api/purchase-returns/create` | `erp:order:return` | 为状态 4（已入库）的采购单创建待确认退货单 |
+| POST | `/api/purchase-returns/{id}/confirm` | `erp:order:return` | 重新校验累计可退量，CAS 扣库存并写退货流水 |
+
+创建请求示例：
+
+```json
+{
+  "purchaseOrderId": 9,
+  "partId": 2,
+  "quantity": 3,
+  "reasonType": "QUALITY_ISSUE",
+  "reason": "批次硬度不合格",
+  "operationId": "return-create-20261109-001"
+}
+```
+
+原因类型为 `QUANTITY_MISMATCH`、`DAMAGED`、`SPEC_MISMATCH`、
+`QUALITY_ISSUE`、`OTHER`；`OTHER` 必须填写 `reason`。状态仅有 `PENDING` 和
+`CONFIRMED`。确认接口的 `operationId` 支持 query 参数或 `X-Operation-Id`
+请求头，重复操作直接回放首次结果，不会重复扣库存。
+
+创建和确认都会锁定来源采购单并校验原始明细。已确认退货的累计数量不得超过
+该采购单中对应零件的原采购数量；确认时当前库存不足返回 `code=603`。管理员、
+采购员和仓管员拥有 `erp:order:return`，查看者只能读取退货记录。
 
 ---
 
@@ -138,23 +270,6 @@
 
 创建/改状态时：**历史 MCP 注释中的 `0=停止` 由 ERP 归一为 `2`**；非法码拒绝。改状态走允许迁移 CAS（`WHERE id=? AND status=?`）。
 
-**客户类型 (customerType)**
-
-| 值 | 说明 |
-|----|------|
-| 1 | 经销商 |
-| 2 | 零售店 |
-| 3 | 个人用户 |
-
-**客户折扣等级 (discountLevel)**
-
-| 值 | 说明 |
-|----|------|
-| 1 | 无折扣 |
-| 2 | 银牌 |
-| 3 | 金牌 |
-| 4 | 钻石 |
-
 **物流状态 (status)**
 
 | 值 | 说明 |
@@ -175,14 +290,17 @@
 | 传动类 | 传动类配件 |
 | 外观件 | 外观类配件 |
 
-**用户角色 (role)**
+**内置安全角色（security_role.code）**
 
 | 值 | 说明 |
 |----|------|
-| admin | 管理员 |
-| purchase | 采购员 |
-| warehouse | 仓管员 |
-| sales | 销售员 |
+| ADMIN | 管理员 |
+| PURCHASER | 采购员 |
+| WAREHOUSE | 仓管员 |
+| VIEWER | 查看者 |
+
+旧 `user.role` 字段只用于兼容迁移，不再作为接口授权依据；实际授权来自
+`security_user_role` 与 `security_role_permission`。
 
 **用户状态 (status)**
 
@@ -222,6 +340,7 @@ Content-Type: application/json
 | 参数名 | 类型 | 必填 | 说明 |
 |--------|------|------|------|
 | orderNumber | String | **是** | 订单编号（唯一标识，不可重复） |
+| supplierId | Long | 否 | 本采购订单选择的供应商；旧订单可为空 |
 | totalAmount | BigDecimal | 否 | 订单总金额（不传则自动根据明细计算） |
 | status | Integer | 否 | 订单状态，默认1（待审核） |
 | orderTime | LocalDateTime | 否 | 下单时间，默认当前时间，格式：yyyy-MM-dd HH:mm:ss |
@@ -1577,392 +1696,6 @@ GET /api/parts/supplier/{supplierId}
 
 ---
 
-## 4. 客户管理
-
-**基础路径**: `/api/customers`
-
-### 4.1 创建客户
-
-添加新的客户信息。
-
-**请求**
-
-```
-POST /api/customers/create
-Content-Type: application/json
-```
-
-**请求参数：**
-
-| 参数名 | 类型 | 必填 | 说明 |
-|--------|------|------|------|
-| customerCode | String | **是** | 客户编码（唯一标识） |
-| name | String | **是** | 客户名称 |
-| contactPerson | String | 否 | 联系人 |
-| phone | String | 否 | 联系电话 |
-| email | String | 否 | 邮箱地址（需符合邮箱格式） |
-| address | String | 否 | 地址 |
-| customerType | Integer | 否 | 客户类型（1-经销商，2-零售店，3-个人用户） |
-| discountLevel | Integer | 否 | 折扣等级（1-无折扣，2-银牌，3-金牌，4-钻石） |
-| registeredTime | LocalDateTime | 否 | 注册时间，格式：yyyy-MM-dd HH:mm:ss |
-
-**请求示例：**
-
-```json
-{
-  "customerCode": "CUST001",
-  "name": "摩托车维修店A",
-  "contactPerson": "王五",
-  "phone": "13700137000",
-  "email": "customer@example.com",
-  "address": "广东省佛山市禅城区某某路78号",
-  "customerType": 2,
-  "discountLevel": 2,
-  "registeredTime": "2026-05-06 10:00:00"
-}
-```
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "操作成功",
-  "data": {
-    "id": 1,
-    "customerCode": "CUST001",
-    "name": "摩托车维修店A",
-    "contactPerson": "王五",
-    "phone": "13700137000",
-    "email": "customer@example.com",
-    "address": "广东省佛山市禅城区某某路78号",
-    "customerType": 2,
-    "discountLevel": 2,
-    "registeredTime": "2026-05-06T10:00:00",
-    "deleted": 0,
-    "createTime": "2026-05-06T10:00:00.000",
-    "updateTime": "2026-05-06T10:00:00.000"
-  },
-  "timestamp": 1746508800000
-}
-```
-
----
-
-### 4.2 更新客户
-
-根据ID更新客户信息。
-
-**请求**
-
-```
-PUT /api/customers/update/{id}
-Content-Type: application/json
-```
-
-**路径参数：**
-
-| 参数名 | 类型 | 必填 | 说明 |
-|--------|------|------|------|
-| id | Long | **是** | 客户ID |
-
-**请求参数：**
-
-| 参数名 | 类型 | 必填 | 说明 |
-|--------|------|------|------|
-| customerCode | String | **是** | 客户编码 |
-| name | String | **是** | 客户名称 |
-| contactPerson | String | 否 | 联系人 |
-| phone | String | 否 | 联系电话 |
-| email | String | 否 | 邮箱地址 |
-| address | String | 否 | 地址 |
-| customerType | Integer | 否 | 客户类型 |
-| discountLevel | Integer | 否 | 折扣等级 |
-| registeredTime | LocalDateTime | 否 | 注册时间 |
-
-**请求示例：**
-
-```json
-{
-  "customerCode": "CUST001",
-  "name": "摩托车维修店A（更新）",
-  "contactPerson": "赵六",
-  "phone": "13600136000",
-  "address": "广东省广州市天河区某某路90号",
-  "customerType": 1,
-  "discountLevel": 3
-}
-```
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "操作成功",
-  "data": {
-    "id": 1,
-    "customerCode": "CUST001",
-    "name": "摩托车维修店A（更新）",
-    "contactPerson": "赵六",
-    "phone": "13600136000",
-    "email": "customer@example.com",
-    "address": "广东省广州市天河区某某路90号",
-    "customerType": 1,
-    "discountLevel": 3,
-    "registeredTime": "2026-05-06T10:00:00",
-    "deleted": 0,
-    "createTime": "2026-05-06T10:00:00.000",
-    "updateTime": "2026-05-06T11:00:00.000"
-  },
-  "timestamp": 1746508800000
-}
-```
-
----
-
-### 4.3 删除客户
-
-逻辑删除客户信息。
-
-**请求**
-
-```
-DELETE /api/customers/delete/{id}
-```
-
-**路径参数：**
-
-| 参数名 | 类型 | 必填 | 说明 |
-|--------|------|------|------|
-| id | Long | **是** | 客户ID |
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "操作成功",
-  "data": null,
-  "timestamp": 1746508800000
-}
-```
-
----
-
-### 4.4 获取单个客户
-
-根据ID获取客户详情。
-
-**请求**
-
-```
-GET /api/customers/get/{id}
-```
-
-**路径参数：**
-
-| 参数名 | 类型 | 必填 | 说明 |
-|--------|------|------|------|
-| id | Long | **是** | 客户ID |
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "操作成功",
-  "data": {
-    "id": 1,
-    "customerCode": "CUST001",
-    "name": "摩托车维修店A",
-    "contactPerson": "王五",
-    "phone": "13700137000",
-    "email": "customer@example.com",
-    "address": "广东省佛山市禅城区某某路78号",
-    "customerType": 2,
-    "discountLevel": 2,
-    "registeredTime": "2026-05-06T10:00:00",
-    "deleted": 0,
-    "createTime": "2026-05-06T10:00:00.000",
-    "updateTime": "2026-05-06T10:00:00.000"
-  },
-  "timestamp": 1746508800000
-}
-```
-
----
-
-### 4.5 分页查询客户
-
-分页查询客户列表，支持多条件筛选。
-
-**请求**
-
-```
-GET /api/customers/page?current=1&size=10&name=&customerType=&discountLevel=
-```
-
-**查询参数：**
-
-| 参数名 | 类型 | 必填 | 说明 |
-|--------|------|------|------|
-| current | Long | 否 | 当前页码，默认1 |
-| size | Long | 否 | 每页大小，默认10 |
-| name | String | 否 | 客户名称（模糊匹配） |
-| customerType | Integer | 否 | 客户类型（精确匹配） |
-| discountLevel | Integer | 否 | 折扣等级（精确匹配） |
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "操作成功",
-  "data": {
-    "records": [
-      {
-        "id": 1,
-        "customerCode": "CUST001",
-        "name": "摩托车维修店A",
-        "contactPerson": "王五",
-        "phone": "13700137000",
-        "email": "customer@example.com",
-        "address": "广东省佛山市禅城区某某路78号",
-        "customerType": 2,
-        "discountLevel": 2,
-        "registeredTime": "2026-05-06T10:00:00",
-        "deleted": 0,
-        "createTime": "2026-05-06T10:00:00.000",
-        "updateTime": "2026-05-06T10:00:00.000"
-      }
-    ],
-    "total": 30,
-    "size": 10,
-    "current": 1,
-    "pages": 3
-  },
-  "timestamp": 1746508800000
-}
-```
-
----
-
-### 4.6 搜索客户
-
-根据名称关键字搜索客户列表。
-
-**请求**
-
-```
-GET /api/customers/search?name=摩托车
-```
-
-**查询参数：**
-
-| 参数名 | 类型 | 必填 | 说明 |
-|--------|------|------|------|
-| name | String | **是** | 客户名称关键字（模糊匹配） |
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "操作成功",
-  "data": [
-    {
-      "id": 1,
-      "customerCode": "CUST001",
-      "name": "摩托车维修店A",
-      "contactPerson": "王五",
-      "phone": "13700137000",
-      "email": "customer@example.com",
-      "address": "广东省佛山市禅城区某某路78号",
-      "customerType": 2,
-      "discountLevel": 2,
-      "registeredTime": "2026-05-06T10:00:00",
-      "deleted": 0,
-      "createTime": "2026-05-06T10:00:00.000",
-      "updateTime": "2026-05-06T10:00:00.000"
-    }
-  ],
-  "timestamp": 1746508800000
-}
-```
-
----
-
-### 4.7 更新客户类型
-
-快速更新客户类型。
-
-**请求**
-
-```
-PATCH /api/customers/update-type/{id}?customerType=1
-```
-
-**路径参数：**
-
-| 参数名 | 类型 | 必填 | 说明 |
-|--------|------|------|------|
-| id | Long | **是** | 客户ID |
-
-**查询参数：**
-
-| 参数名 | 类型 | 必填 | 说明 |
-|--------|------|------|------|
-| customerType | Integer | **是** | 新客户类型（1-经销商，2-零售店，3-个人用户） |
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "操作成功",
-  "data": null,
-  "timestamp": 1746508800000
-}
-```
-
----
-
-### 4.8 更新折扣等级
-
-快速更新客户折扣等级。
-
-**请求**
-
-```
-PATCH /api/customers/update-discount/{id}?discountLevel=3
-```
-
-**路径参数：**
-
-| 参数名 | 类型 | 必填 | 说明 |
-|--------|------|------|------|
-| id | Long | **是** | 客户ID |
-
-**查询参数：**
-
-| 参数名 | 类型 | 必填 | 说明 |
-|--------|------|------|------|
-| discountLevel | Integer | **是** | 新折扣等级（1-无折扣，2-银牌，3-金牌，4-钻石） |
-
-**响应示例：**
-
-```json
-{
-  "code": 200,
-  "message": "操作成功",
-  "data": null,
-  "timestamp": 1746508800000
-}
-```
-
----
-
 ## 5. 物流管理
 
 **基础路径**: `/api/logistics`
@@ -2716,7 +2449,7 @@ GET /api/inventory/check
 
 ### 7.1 获取仪表盘统计数据
 
-获取系统总览的统计数据，包括供应商、产品、客户、用户、库存数量以及本月采购统计。
+获取系统总览的统计数据，包括供应商、产品、低库存零件、用户、库存数量以及本月采购统计。
 
 **请求**
 
@@ -2733,7 +2466,7 @@ GET /api/statistics/dashboard
   "data": {
     "supplierCount": 25,
     "partCount": 500,
-    "customerCount": 150,
+    "lowStockCount": 12,
     "userCount": 10,
     "inventoryCount": 480,
     "monthPurchase": {
@@ -2752,7 +2485,7 @@ GET /api/statistics/dashboard
 |------|------|------|
 | supplierCount | Long | 供应商总数 |
 | partCount | Long | 产品总数 |
-| customerCount | Long | 客户总数 |
+| lowStockCount | Long | 低库存零件数 |
 | userCount | Long | 用户总数 |
 | inventoryCount | Long | 库存记录数 |
 | monthPurchase | Object | 本月采购统计 |

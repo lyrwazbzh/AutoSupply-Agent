@@ -54,7 +54,8 @@ RequestContext Loader
    - 工具和中间件不能把用户身份保存在实例字段中。
    - 全局变量不能保存当前请求身份。
 
-项目当前使用 `deepagents>=0.7,<0.8`，生产前应锁定精确版本，避免上下文和子 Agent 行为随依赖更新变化。
+项目已固定使用 `deepagents==0.7.35`，并由 `requirements.lock`、
+`scripts/check_requirements_lock.py` 和 CI 共同防止主 Agent、子 Agent 的上下文行为随依赖更新漂移。
 
 ### 主要检查文件
 

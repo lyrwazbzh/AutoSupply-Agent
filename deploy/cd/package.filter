@@ -21,8 +21,8 @@
 - /.env.*
 - /deploy/.env
 - /deploy/nginx.env
-- /deploy/nginx/htpasswd
 - /deploy/nginx/tls/
+- /deploy/secrets/
 # Prometheus / Grafana 运行时数据 —— 同步时受保护，不被删也不被覆盖
 - /deploy/prometheus/data/
 - /deploy/grafana/data/

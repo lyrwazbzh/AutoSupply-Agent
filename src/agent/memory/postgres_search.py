@@ -123,6 +123,142 @@ def index_item(user_id: str, item: MemoryItem, config: MemoryConfig | None = Non
         )
 
 
+def atomic_upsert_semantic(
+    user_id: str,
+    logical_key: str,
+    replacement: MemoryItem,
+    config: MemoryConfig | None = None,
+) -> MemoryItem:
+    """在一个数据库事务内锁定逻辑 key、失效旧版本并插入新版本。"""
+    prefix = ".".join(ns.semantic_ns(user_id))
+    lock_key = f"{prefix}:{logical_key}"
+    pool = get_pg_pool()
+    with pool.connection() as conn:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,))
+
+            if replacement.idempotency_key:
+                cur.execute(
+                    "SELECT value FROM store WHERE prefix = %s AND key = %s",
+                    (prefix, replacement.store_key),
+                )
+                row = cur.fetchone()
+                existing_event = MemoryItem.from_dict(row["value"]) if row else None
+                if existing_event is not None:
+                    return existing_event
+
+            cur.execute(
+                """
+                SELECT key, value
+                FROM store
+                WHERE prefix = %s
+                  AND value->>'key' = %s
+                  AND coalesce(value->>'invalidated_at', '') = ''
+                ORDER BY updated_at DESC, key DESC
+                FOR UPDATE
+                """,
+                (prefix, logical_key),
+            )
+            rows = cur.fetchall()
+            current = MemoryItem.from_dict(rows[0]["value"]) if rows else None
+            if current is not None and current.content == replacement.content:
+                return current
+
+            for row in rows:
+                stale = MemoryItem.from_dict(row["value"])
+                if stale is None:
+                    continue
+                stale.invalidate(by=replacement.id)
+                cur.execute(
+                    """
+                    UPDATE store
+                    SET value = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE prefix = %s AND key = %s
+                    """,
+                    (Jsonb(stale.to_dict()), prefix, row["key"]),
+                )
+
+            cur.execute(
+                """
+                INSERT INTO store (prefix, key, value, created_at, updated_at)
+                VALUES (%s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT (prefix, key) DO UPDATE
+                SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
+                """,
+                (prefix, replacement.store_key, Jsonb(replacement.to_dict())),
+            )
+
+    # 正文事务已经提交；检索索引是可重建投影，失败不能把一次成功写入伪装成
+    # 失败并诱导调用方重试。与 ``MemoryKeeper.put`` 保持同一降级语义。
+    try:
+        index_item(user_id, replacement, config)
+    except Exception:
+        pass
+    return replacement
+
+
+def atomic_merge_preferences(
+    user_id: str,
+    updates: dict[str, Any],
+    *,
+    stable_keys: Sequence[str],
+    recent_suppliers_cap: int,
+    recent_queries_cap: int,
+) -> dict[str, Any]:
+    """Merge the JSONB projection under one PostgreSQL transaction.
+
+    The advisory lock also serialises the initial insert (where ``FOR UPDATE``
+    has no row to lock), so two replicas cannot lose one another's fields.
+    """
+    prefix = ".".join(ns.preferences_ns(user_id))
+    key = ns.PREFERENCES_KEY
+    lock_key = f"{prefix}:{key}"
+    with get_pg_pool().connection() as conn:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (lock_key,),
+            )
+            cur.execute(
+                "SELECT value FROM store WHERE prefix = %s AND key = %s FOR UPDATE",
+                (prefix, key),
+            )
+            row = cur.fetchone()
+            current = dict(row["value"]) if row and isinstance(row["value"], dict) else {}
+            for field, value in updates.items():
+                if field in stable_keys and value is None:
+                    current.pop(field, None)
+                    continue
+                cap = (
+                    recent_suppliers_cap
+                    if field == "recent_suppliers"
+                    else recent_queries_cap
+                    if field == "recent_queries"
+                    else 20
+                )
+                old = current.get(field)
+                if isinstance(old, list) or isinstance(value, list):
+                    merged: list[Any] = []
+                    candidates = list(value if isinstance(value, list) else [value])
+                    candidates += list(old if isinstance(old, list) else [old])
+                    for candidate in candidates:
+                        if candidate not in merged:
+                            merged.append(candidate)
+                    current[field] = merged[:cap]
+                else:
+                    current[field] = value
+            cur.execute(
+                """
+                INSERT INTO store(prefix, key, value, created_at, updated_at)
+                VALUES (%s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT (prefix, key) DO UPDATE
+                SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
+                """,
+                (prefix, key, Jsonb(current)),
+            )
+            return current
+
+
 def _keyword_lane(user_id: str, query: str, limit: int) -> list[dict[str, Any]]:
     prefixes = _prefixes(user_id)
     with get_pg_pool().connection() as conn, conn.cursor() as cur:

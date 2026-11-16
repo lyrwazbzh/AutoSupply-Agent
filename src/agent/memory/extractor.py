@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -111,6 +112,11 @@ def _tool_calls_of(message: Any) -> List[dict]:
 def _tool_name_of(message: Any) -> str:
     name = getattr(message, "name", None)
     return str(name) if isinstance(name, str) else ""
+
+
+def _tool_call_id_of(message: Any) -> str:
+    value = getattr(message, "tool_call_id", None)
+    return str(value) if value else ""
 
 
 # ---------------------------------------------------------------- 偏好抽取
@@ -287,7 +293,7 @@ def summarize_episode(
     config: Optional[MemoryConfig] = None,
     thread_id: str = "",
 ) -> Dict[str, Any]:
-    """把当前 thread 压成一条情节记忆（轻摘要：首问 + 末答 + 工具名）。"""
+    """把 thread 压成可检索、可恢复采购上下文的结构化情节摘要。"""
     cfg = config or DEFAULT_MEMORY_CONFIG
     window = list(messages or [])
     if not window:
@@ -308,22 +314,75 @@ def summarize_episode(
                 break
 
     tools: List[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    tool_results: list[dict[str, str]] = []
+    completed_tool_names: list[str] = []
+    call_names_by_id: dict[str, str] = {}
     for message in window:
         for call in _tool_calls_of(message):
             name = str(call.get("name") or "")
             if name and name not in tools:
                 tools.append(name)
+            tool_calls.append(call)
+            call_id = str(call.get("id") or "")
+            if call_id and name:
+                call_names_by_id[call_id] = name
         standalone = _tool_name_of(message)
+        if not standalone and _role_of(message) == "tool":
+            standalone = call_names_by_id.get(_tool_call_id_of(message), "")
         if standalone and _role_of(message) == "tool" and standalone not in tools:
             tools.append(standalone)
+        if standalone and _role_of(message) == "tool":
+            result_text = _content_of(message).strip()
+            failed = bool(re.search(
+                r"失败|错误|无权限|超时|exception|traceback|\"ok\"\s*:\s*false",
+                result_text,
+                re.IGNORECASE,
+            ))
+            tool_results.append({
+                "tool": standalone,
+                "status": "failed" if failed else "succeeded",
+                "tool_call_id": _tool_call_id_of(message),
+            })
+            completed_tool_names.append(standalone)
+
+    structured = _extract_procurement_state(window, tool_calls, tool_results)
+    protected_writes = {
+        "order_create", "order_update", "order_update_status", "order_receive",
+        "replenishment_create", "replenishment_inspect",
+        "replenishment_create_order", "replenishment_complete",
+        "replenishment_cancel", "purchase_return_create", "purchase_return_confirm",
+    }
+    remaining_results = list(completed_tool_names)
+    pending_approvals: list[str] = []
+    for call in tool_calls:
+        name = str(call.get("name") or "")
+        if name in remaining_results:
+            remaining_results.remove(name)
+        elif name in protected_writes:
+            pending_approvals.append(name)
+    structured["pending_approvals"] = pending_approvals
+    structured["tool_results"] = tool_results
 
     limit = max(80, cfg.episode_summary_chars)
     summary_parts = []
     if goal:
         summary_parts.append(f"目标：{goal[:120]}")
+    for label, key in (
+        ("采购单", "order_numbers"),
+        ("零件", "part_codes"),
+        ("供应商", "supplier_codes"),
+        ("状态", "statuses"),
+    ):
+        values = structured.get(key) or []
+        if values:
+            summary_parts.append(f"{label}：{', '.join(values[:5])}")
+    if pending_approvals:
+        summary_parts.append(f"待审批：{', '.join(pending_approvals)}")
     if outcome:
-        summary_parts.append(f"结论：{outcome[:limit]}")
+        summary_parts.append(f"结果：{outcome[:limit]}")
     summary = " ｜ ".join(summary_parts) or "（无有效内容）"
+    summary = summary[:limit]
 
     task_type = _classify(f"{goal} {outcome}")
     tags = [task_type]
@@ -336,8 +395,108 @@ def summarize_episode(
         "task_type": task_type,
         "tags": tags,
         "tools": tools[:20],
+        "entities": structured.pop("entities", []),
+        "structured": structured,
         "turns": sum(1 for m in window if _role_of(m) in ("human", "user")),
         "thread_id": thread_id,
+    }
+
+
+_FIELD_ALIASES = {
+    "ordernumber": "order_numbers", "orderno": "order_numbers",
+    "purchaseordernumber": "order_numbers", "purchaseorderno": "order_numbers",
+    "partcode": "part_codes", "materialcode": "part_codes",
+    "suppliercode": "supplier_codes", "vendorcode": "supplier_codes",
+    "operationid": "operation_ids", "idempotencykey": "idempotency_keys",
+    "orderstatus": "statuses", "status": "statuses",
+}
+_CONSTRAINT_MARKERS = ("必须", "不要", "不能", "只要", "只需", "不需要", "保持", "至少", "最多", "固定")
+
+
+def _append_unique(target: dict[str, list[str]], field: str, value: Any) -> None:
+    if isinstance(value, (str, int, float)):
+        text = str(value).strip()
+        if text and len(text) <= 160 and text not in target.setdefault(field, []):
+            target[field].append(text)
+
+
+def _walk_named_values(value: Any, target: dict[str, list[str]]) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            field = _FIELD_ALIASES.get(normalized)
+            if field:
+                if isinstance(child, list):
+                    for item in child:
+                        _append_unique(target, field, item)
+                else:
+                    _append_unique(target, field, child)
+            _walk_named_values(child, target)
+    elif isinstance(value, list):
+        for child in value:
+            _walk_named_values(child, target)
+
+
+def _extract_procurement_state(
+    messages: Sequence[Any],
+    tool_calls: Sequence[dict[str, Any]],
+    tool_results: Sequence[dict[str, str]],
+) -> dict[str, Any]:
+    values: dict[str, list[str]] = {
+        "order_numbers": [], "part_codes": [], "supplier_codes": [],
+        "operation_ids": [], "idempotency_keys": [], "statuses": [],
+    }
+    constraints: list[str] = []
+    unfinished: list[str] = []
+
+    for call in tool_calls:
+        _walk_named_values(call.get("args") or {}, values)
+        if str(call.get("name") or "") == "write_todos":
+            todos = (call.get("args") or {}).get("todos", [])
+            for todo in todos if isinstance(todos, list) else []:
+                if isinstance(todo, dict) and todo.get("status") != "completed":
+                    text = str(todo.get("content") or "").strip()
+                    if text and text not in unfinished:
+                        unfinished.append(text[:160])
+
+    all_text: list[str] = []
+    for message in messages:
+        text = _content_of(message).strip()
+        if not text:
+            continue
+        all_text.append(text)
+        if _role_of(message) in ("human", "user"):
+            for sentence in re.split(r"[。！？;；\n]", text):
+                sentence = sentence.strip()
+                if sentence and any(marker in sentence for marker in _CONSTRAINT_MARKERS):
+                    clipped = sentence[:160]
+                    if clipped not in constraints:
+                        constraints.append(clipped)
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        if payload is not None:
+            _walk_named_values(payload, values)
+
+    for text in all_text:
+        for order_number in re.findall(r"\bPO\d{8,}\b", text, re.IGNORECASE):
+            _append_unique(values, "order_numbers", order_number.upper())
+        for operation_id in re.findall(
+            r"\b(?:op|operation)[-_][A-Za-z0-9._:-]{4,}\b", text, re.IGNORECASE
+        ):
+            _append_unique(values, "operation_ids", operation_id)
+
+    entities = [
+        *(f"order:{value}" for value in values["order_numbers"]),
+        *(f"part:{value}" for value in values["part_codes"]),
+        *(f"supplier:{value}" for value in values["supplier_codes"]),
+    ]
+    return {
+        **values,
+        "confirmed_constraints": constraints[:10],
+        "unfinished_tasks": unfinished[:20],
+        "entities": entities,
     }
 
 

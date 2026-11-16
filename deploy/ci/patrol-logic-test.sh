@@ -70,8 +70,8 @@ fp="$(printf "$FAKE_STATUS" | p_strip_ansi | p_fingerprint)"
 check "$fp" "disk|FAIL
 docker|OK
 pending|OK
-service-postgres|OK
-service-nginx|FAIL" "id 与 OK/FAIL 对，按 id 排序，细节一律丢弃"
+service-nginx|FAIL
+service-postgres|OK" "id 与 OK/FAIL 对，按 id 排序，细节一律丢弃"
 
 # 这条是整个机制的核心不变式：**同一状态、两次不同的细节，指纹必须相同**。
 # 镜像名、digest、版本号、剩余空间全都随发布变，它们要是进了指纹，每次发布都会

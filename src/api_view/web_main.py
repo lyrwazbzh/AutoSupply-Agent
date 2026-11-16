@@ -1,7 +1,4 @@
-"""
-FastAPI 应用入口
-CORS 全开、路由注册、startup/shutdown 事件
-"""
+"""FastAPI 应用入口、受限 CORS、路由注册与生命周期。"""
 import asyncio
 import mimetypes
 import os
@@ -15,24 +12,21 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from ..artifacts import cleanup_expired_artifacts, resolve_artifact
 from ..agent.audit.reconciler import WriteReconciler
 from ..agent.backends.sandbox_manager import sandbox_manager
 from ..agent.config import (
     AUTH_MODE,
-    AUTH_USER_HEADER,
     CORS_ALLOW_ORIGINS,
-    INTERNAL_AUTH_HEADER,
-    INTERNAL_AUTH_TOKEN,
     SANDBOX_MAINTENANCE_INTERVAL_SECONDS,
 )
 from ..agent.log_utils import web_logger
+from ..artifacts import cleanup_expired_artifacts, resolve_artifact
 from .api.chat import router as chat_router
 from .api.dingtalk import router as dingtalk_router
 from .api.evaluation import router as evaluation_router
 from .api.history import router as history_router
 from .api.write_audit import router as write_audit_router
-from .auth import current_user_id
+from .auth import assert_permission, current_user_id
 from .web_config import setup_database
 
 
@@ -62,14 +56,8 @@ async def _sandbox_maintenance(stop_event: asyncio.Event) -> None:
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     web_logger.info("Starting ERP Agent Web Server...")
-    if AUTH_MODE == "proxy" and not INTERNAL_AUTH_TOKEN:
-        web_logger.warning(
-            f"AUTH_MODE=proxy without INTERNAL_AUTH_TOKEN: backend trusts "
-            f"{AUTH_USER_HEADER} from anyone who can reach it. Sandbox code runs "
-            f"inside dind, which shares a Docker network with this container, so it "
-            f"can forge that header and read other users' conversations. Set "
-            f"INTERNAL_AUTH_TOKEN (and inject {INTERNAL_AUTH_HEADER} from nginx) to close it."
-        )
+    if AUTH_MODE not in {"jwt", "none"}:
+        raise RuntimeError("AUTH_MODE 只允许 jwt 或 none")
     stop_event = asyncio.Event()
     maintenance_task = None
     reconciliation_task = None
@@ -127,8 +115,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOW_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
 
 # Prometheus 指标：/metrics 端点由 instrumentator 自动挂载，暴露
@@ -164,6 +152,7 @@ async def download_file(
     user_id: str = Depends(current_user_id),
 ):
     """下载当前用户在 TTL 内保存的临时生成文件。"""
+    assert_permission("assistant:use")
     file_path = resolve_artifact(user_id, file_id, filename)
     if file_path is None:
         raise HTTPException(status_code=404, detail="文件不存在或已过期")
@@ -193,6 +182,6 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-    # workers 必须为 1：SandboxManager / sandbox_holder / AgentLoader 都是进程内
-    # 单例状态，多 worker 会各自认领同一个暖容器并互相覆盖持久化映射。
+    # 单进程是本地默认值；生产可由进程管理器启动多个 worker。跨实例所有权和
+    # 运行租约由 PostgreSQL 协调，本地 Agent/Sandbox 对象只是可重建缓存。
     uvicorn.run(app, host="0.0.0.0", port=8000, workers=1, proxy_headers=True)

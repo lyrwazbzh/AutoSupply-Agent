@@ -2,7 +2,7 @@
 #
 # 关键约束：WORKDIR 必须是 /app。代码里 PROJECT_ROOT 由 __file__ 逐级 parent
 # 解析（main_agent.py / sandbox_setup.py / web_fetch.py 等），必须正好落在
-# /app，src/skills、requirements.txt、src/agent/backends/seccomp.json 才找得到。
+# /app，src/skills、requirements*.txt、src/agent/backends/seccomp.json 才找得到。
 FROM python:3.11-slim
 
 # 默认用阿里云的 pypi 镜像：tuna 会对云主机 IP 返回 403（pip 把它读成
@@ -16,8 +16,8 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # 依赖单独一层，改代码不必重装依赖
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY requirements.txt requirements.in requirements.lock /app/
+RUN pip install --no-cache-dir -r /app/requirements.lock
 
 # 只拷 src/，不要 COPY .：
 #   1) main_agent._upload_project_to_sandbox 用 PROJECT_ROOT.rglob("*") 把整棵树

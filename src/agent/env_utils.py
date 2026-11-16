@@ -36,6 +36,11 @@ def get_env_int(key: str, default: int = 0) -> int:
     return int(os.getenv(key, str(default)))
 
 
+def get_env_float(key: str, default: float = 0.0) -> float:
+    """获取浮点环境变量。"""
+    return float(os.getenv(key, str(default)))
+
+
 # 模块加载时自动加载 .env
 load_env()
 #加载进去之后可以直接通过 os.getenv(key, default) 获取 key是键  default是默认值
