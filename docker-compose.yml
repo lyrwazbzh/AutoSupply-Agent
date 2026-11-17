@@ -98,10 +98,17 @@ services:
       SPRING_PROFILES_ACTIVE: compose
       ERP_DB_HOST: mysql
       ERP_DB_PORT: "3306"
+      OTEL_SERVICE_NAME: erp-agent-java-erp
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+      OTEL_TRACES_SAMPLER: parentbased_traceidratio
     volumes:
       - ./deploy/secrets/erp-jwt-private.pem:/run/secrets/erp-jwt-private.pem:ro
       - ./deploy/secrets/erp-jwt-public.pem:/run/secrets/erp-jwt-public.pem:ro
-    networks: [data]
+    networks: [data, observability]
     depends_on:
       mysql: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -202,10 +209,14 @@ services:
       MCP_AUTH_ENABLED: "true"
       JWT_PUBLIC_KEY_PATH: /run/secrets/erp-jwt-public.pem
       JWT_AUDIENCE: mcp
+      OTEL_SERVICE_NAME: erp-agent-mcp
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      DEPLOYMENT_ENVIRONMENT: compose
     volumes:
       - ./deploy/secrets/erp-jwt-public.pem:/run/secrets/erp-jwt-public.pem:ro
     networks:
       data: {}
+      observability: {}
       # 静态 IP：backend 把它写进沙箱容器的 /etc/hosts。用静态而不是每次
       # 解析，是为了让 mcp 重建换 IP 后沙箱里的地址依然有效。
       # 改这里必须同步改 deploy/.env 的 SANDBOX_MCP_HOST_IP。
@@ -246,6 +257,9 @@ services:
       JWT_PUBLIC_KEY_PATH: /run/secrets/erp-jwt-public.pem
       JWT_ISSUER: java-erp
       JWT_AUDIENCE: assistant-api
+      OTEL_SERVICE_NAME: erp-agent-backend
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      DEPLOYMENT_ENVIRONMENT: compose
     volumes:
       # 可写：web_fetch 会把沙箱里验证过的 Skill 写回这里，然后由
       # SkillsSyncMiddleware 再推回沙箱。
@@ -255,7 +269,7 @@ services:
       # 用户隔离的临时 Artifact；应用按 TTL 自动清理。
       - artifact-data:/app/.runtime/artifacts
       - ./deploy/secrets/erp-jwt-public.pem:/run/secrets/erp-jwt-public.pem:ro
-    networks: [edge, data, sandbox]
+    networks: [edge, data, sandbox, observability]
     depends_on:
       postgres:             { condition: service_healthy }
       java-erp:             { condition: service_healthy }
@@ -296,6 +310,59 @@ services:
   # ============================================================
   # 可观测性（阶段 6）
   # ============================================================
+  tempo:
+    image: grafana/tempo:3.1.1
+    <<: *logging
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yml"]
+    volumes:
+      - ./deploy/tempo/tempo.yml:/etc/tempo/tempo.yml:ro
+      - tempo-data:/var/tempo
+    networks: [observability]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.165.0
+    <<: *logging
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol-contrib/config.yml"]
+    volumes:
+      - ./deploy/otel-collector/config.yml:/etc/otelcol-contrib/config.yml:ro
+    networks: [observability]
+    depends_on:
+      tempo: { condition: service_started }
+
+  alert-webhook:
+    build: { context: ., dockerfile: Dockerfile }
+    image: erp-agent-app:local
+    <<: *logging
+    restart: unless-stopped
+    command: ["python", "-m", "src.observability.alert_webhook"]
+    env_file: [./deploy/.env]
+    environment:
+      OTEL_SERVICE_NAME: erp-agent-alert-webhook
+    networks: [edge, observability]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8010/health',timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+
+  alertmanager:
+    image: prom/alertmanager:v0.35.0
+    <<: *logging
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      - "--data.retention=${ALERTMANAGER_RETENTION:-120h}"
+    volumes:
+      - ./deploy/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    networks: [observability]
+    depends_on:
+      alert-webhook: { condition: service_healthy }
+
   # Prometheus 抓 backend 的 /metrics（prometheus-fastapi-instrumentator
   # 暴露）。不抓 nginx（1.27-alpine 不自带 exporter，指标少且非核心）。
   # 不接 edge 网络：Prometheus 只需够到 backend，不该有出网能力。
@@ -310,7 +377,7 @@ services:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./deploy/prometheus/write-audit-alerts.yml:/etc/prometheus/write-audit-alerts.yml:ro
       - prometheus-data:/prometheus
-    networks: [data]
+    networks: [data, observability]
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -337,11 +404,12 @@ services:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
-    networks: [edge]
+    networks: [edge, observability]
     ports:
       - "${GRAFANA_PORT:-13000}:3000"
     depends_on:
       prometheus: { condition: service_healthy }
+      tempo: { condition: service_started }
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/api/health || exit 1"]
       interval: 15s
@@ -393,6 +461,8 @@ networks:
     # 默认网络：backend 靠它出网调 ChatAnywhere API
   data:
     internal: true
+  observability:
+    internal: true
   sandbox:
     # dind 要出网拉 python:3.11-slim
     driver_opts:
@@ -419,3 +489,5 @@ volumes:
   artifact-data:
   prometheus-data:
   grafana-data:
+  tempo-data:
+  alertmanager-data:

@@ -21,6 +21,7 @@ from ..agent.config import (
 )
 from ..agent.log_utils import web_logger
 from ..artifacts import cleanup_expired_artifacts, resolve_artifact
+from ..observability import instrument_fastapi
 from .api.chat import router as chat_router
 from .api.dingtalk import router as dingtalk_router
 from .api.evaluation import router as evaluation_router
@@ -180,8 +181,19 @@ async def health():
     return {"status": "ok"}
 
 
+instrument_fastapi(app, "erp-agent-backend")
+
+
 if __name__ == "__main__":
     import uvicorn
     # 单进程是本地默认值；生产可由进程管理器启动多个 worker。跨实例所有权和
     # 运行租约由 PostgreSQL 协调，本地 Agent/Sandbox 对象只是可重建缓存。
-    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1, proxy_headers=True)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        workers=1,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+        log_config=None,
+    )

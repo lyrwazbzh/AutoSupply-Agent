@@ -19,7 +19,7 @@ class EvidenceBundle:
 
 class EvaluationEnvironment(Protocol):
     async def reset(
-        self, case: EvaluationCase, *, run_id: str, trial_index: int
+        self, case: EvaluationCase, *, thread_id: str, trial_index: int
     ) -> None: ...
 
     async def snapshot(
@@ -27,9 +27,8 @@ class EvaluationEnvironment(Protocol):
         case: EvaluationCase,
         phase: str,
         *,
-        run_id: str,
-        trial_index: int,
         thread_id: str,
+        trial_index: int,
         operation_ids: list[str] | None = None,
     ) -> EvidenceBundle: ...
 
@@ -38,7 +37,7 @@ class EvaluationEnvironment(Protocol):
         profile: str,
         *,
         case: EvaluationCase,
-        run_id: str,
+        thread_id: str,
         trial_index: int,
     ) -> None: ...
 
@@ -46,7 +45,7 @@ class EvaluationEnvironment(Protocol):
         self,
         *,
         case: EvaluationCase,
-        run_id: str,
+        thread_id: str,
         trial_index: int,
     ) -> None: ...
 
@@ -55,7 +54,7 @@ class NoopEvaluationEnvironment:
     """Read-only default; refuses cases that require isolated ERP reset."""
 
     async def reset(
-        self, case: EvaluationCase, *, run_id: str, trial_index: int
+        self, case: EvaluationCase, *, thread_id: str, trial_index: int
     ) -> None:
         if case.environment.requires_reset:
             raise RuntimeError("写入评测要求配置独立ERP重置端点")
@@ -65,9 +64,8 @@ class NoopEvaluationEnvironment:
         case: EvaluationCase,
         phase: str,
         *,
-        run_id: str,
-        trial_index: int,
         thread_id: str,
+        trial_index: int,
         operation_ids: list[str] | None = None,
     ) -> EvidenceBundle:
         if case.environment.probes:
@@ -79,7 +77,7 @@ class NoopEvaluationEnvironment:
         profile: str,
         *,
         case: EvaluationCase,
-        run_id: str,
+        thread_id: str,
         trial_index: int,
     ) -> None:
         raise RuntimeError("稳定性故障用例要求配置故障注入端点")
@@ -88,7 +86,7 @@ class NoopEvaluationEnvironment:
         self,
         *,
         case: EvaluationCase,
-        run_id: str,
+        thread_id: str,
         trial_index: int,
     ) -> None:
         return None
@@ -143,22 +141,20 @@ class HttpEvaluationEnvironment:
     @staticmethod
     def _context(
         case: EvaluationCase,
-        run_id: str,
+        thread_id: str,
         trial_index: int,
-        thread_id: str = "",
         operation_id: str = "",
     ) -> dict[str, Any]:
         return {
             "case_id": case.case_id,
-            "run_id": run_id,
-            "trial_index": trial_index,
             "thread_id": thread_id,
+            "trial_index": trial_index,
             "operation_id": operation_id,
             "user_id": case.request.user_id,
         }
 
     async def reset(
-        self, case: EvaluationCase, *, run_id: str, trial_index: int
+        self, case: EvaluationCase, *, thread_id: str, trial_index: int
     ) -> None:
         if not case.environment.requires_reset:
             return
@@ -166,7 +162,7 @@ class HttpEvaluationEnvironment:
             raise RuntimeError("写入评测要求配置EVALUATION_RESET_PATH")
         payload = {
             **case.environment.reset_payload,
-            **self._context(case, run_id, trial_index),
+            **self._context(case, thread_id, trial_index),
         }
         await self._request("POST", self._reset_path, body=payload)
 
@@ -175,9 +171,8 @@ class HttpEvaluationEnvironment:
         case: EvaluationCase,
         phase: str,
         *,
-        run_id: str,
-        trial_index: int,
         thread_id: str,
+        trial_index: int,
         operation_ids: list[str] | None = None,
     ) -> EvidenceBundle:
         bundle = EvidenceBundle()
@@ -197,7 +192,7 @@ class HttpEvaluationEnvironment:
             collected: dict[str, Any] = {}
             for operation_id in probe_operation_ids:
                 context = self._context(
-                    case, run_id, trial_index, thread_id, operation_id
+                    case, thread_id, trial_index, operation_id
                 )
                 path = probe.path.format_map(context)
                 params = {
@@ -232,7 +227,7 @@ class HttpEvaluationEnvironment:
         profile: str,
         *,
         case: EvaluationCase,
-        run_id: str,
+        thread_id: str,
         trial_index: int,
     ) -> None:
         if not self._fault_path:
@@ -243,7 +238,7 @@ class HttpEvaluationEnvironment:
             body={
                 "action": "enable",
                 "profile": profile,
-                **self._context(case, run_id, trial_index),
+                **self._context(case, thread_id, trial_index),
             },
         )
 
@@ -251,7 +246,7 @@ class HttpEvaluationEnvironment:
         self,
         *,
         case: EvaluationCase,
-        run_id: str,
+        thread_id: str,
         trial_index: int,
     ) -> None:
         if not self._fault_path:
@@ -261,6 +256,6 @@ class HttpEvaluationEnvironment:
             self._fault_path,
             body={
                 "action": "clear",
-                **self._context(case, run_id, trial_index),
+                **self._context(case, thread_id, trial_index),
             },
         )

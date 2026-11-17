@@ -1,111 +1,135 @@
 {
-  "annotations": {
-    "list": []
-  },
+  "annotations": {"list": []},
   "editable": true,
   "fiscalYearStartMonth": 0,
-  "graphTooltip": 0,
+  "graphTooltip": 1,
   "id": null,
   "links": [],
   "liveNow": false,
   "panels": [
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps"
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "green", "value": 1}
+            ]
+          }
         }
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 0
-      },
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 0},
       "id": 1,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
       "targets": [
         {
-          "expr": "sum(rate(http_requests_total[1m]))",
-          "legendFormat": "QPS",
+          "expr": "min(up{job=~\"backend|java-erp|prometheus|alertmanager\"})",
+          "legendFormat": "service availability",
           "refId": "A"
         }
       ],
-      "title": "Backend QPS",
-      "type": "timeseries"
+      "title": "Core Services Up",
+      "type": "stat"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s"
-        }
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 0
-      },
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "gridPos": {"h": 6, "w": 9, "x": 6, "y": 0},
       "id": 2,
       "targets": [
-        {
-          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
-          "legendFormat": "p95",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
-          "legendFormat": "p50",
-          "refId": "B"
-        }
+        {"expr": "sum(rate(http_requests_total[1m]))", "legendFormat": "backend", "refId": "A"},
+        {"expr": "sum(rate(http_server_requests_seconds_count[1m]))", "legendFormat": "java-erp", "refId": "B"}
       ],
-      "title": "Request Latency (p50/p95)",
+      "title": "HTTP Throughput",
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent"
-        }
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 8
-      },
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "gridPos": {"h": 6, "w": 9, "x": 15, "y": 0},
       "id": 3,
       "targets": [
-        {
-          "expr": "sum(rate(http_requests_total{status=~\"5..\"}[1m])) / sum(rate(http_requests_total[1m])) * 100",
-          "legendFormat": "5xx error rate %",
-          "refId": "A"
-        }
+        {"expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "backend p95", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum(rate(http_server_requests_seconds_bucket[5m])) by (le))", "legendFormat": "java-erp p95", "refId": "B"}
+      ],
+      "title": "HTTP Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percent"}},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 6},
+      "id": 4,
+      "targets": [
+        {"expr": "100 * sum(rate(http_requests_total{status=~\"5..\"}[5m])) / clamp_min(sum(rate(http_requests_total[5m])), 1)", "legendFormat": "backend", "refId": "A"},
+        {"expr": "100 * sum(rate(http_server_requests_seconds_count{status=~\"5..\"}[5m])) / clamp_min(sum(rate(http_server_requests_seconds_count[5m])), 1)", "legendFormat": "java-erp", "refId": "B"}
       ],
       "title": "5xx Error Rate",
       "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 6},
+      "id": 5,
+      "targets": [
+        {"expr": "sum(increase(erp_write_reconcile_total[15m])) by (outcome)", "legendFormat": "{{outcome}}", "refId": "A"}
+      ],
+      "title": "ERP Write Reconciliation",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 6},
+      "id": 6,
+      "targets": [
+        {"expr": "sum(ALERTS{alertstate=\"firing\"}) by (severity)", "legendFormat": "{{severity}}", "refId": "A"}
+      ],
+      "title": "Firing Alerts",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "bytes"}},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 13},
+      "id": 7,
+      "targets": [
+        {"expr": "sum(jvm_memory_used_bytes{area=\"heap\"})", "legendFormat": "heap used", "refId": "A"}
+      ],
+      "title": "Java ERP Heap",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "tempo", "uid": "tempo"},
+      "fieldConfig": {"defaults": {}},
+      "gridPos": {"h": 7, "w": 16, "x": 8, "y": 13},
+      "id": 8,
+      "targets": [
+        {"limit": 20, "query": "{ resource.service.name =~ `erp-agent-.*` }", "queryType": "traceql", "refId": "A"}
+      ],
+      "title": "Backend → MCP → ERP Traces",
+      "type": "traces"
     }
   ],
+  "refresh": "30s",
   "schemaVersion": 39,
-  "tags": ["erp-agent"],
-  "templating": {
-    "list": []
-  },
-  "time": {
-    "from": "now-1h",
-    "to": "now"
-  },
+  "tags": ["erp-agent", "observability"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
   "title": "ERP Agent Overview",
   "uid": "erp-agent-overview",
-  "version": 1
+  "version": 2
 }

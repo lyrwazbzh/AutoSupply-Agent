@@ -19,6 +19,7 @@ from langchain_mcp_adapters.tools import convert_mcp_tool_to_langchain_tool
 from ..config import MCP_SSE_URL
 from ..log_utils import mcp_logger
 from ..runtime_context import get_current_access_token
+from ...observability import trace_headers
 
 # 重试配置
 MAX_RETRIES = 3
@@ -38,7 +39,7 @@ async def _request_bearer_token_interceptor(request, handler):
     access token 刷新不会重建 Agent，也不会意外继续使用旧用户的 token。
     """
     token = get_current_access_token()
-    headers = dict(request.headers or {})
+    headers = trace_headers(dict(request.headers or {}))
     if token:
         headers["Authorization"] = f"Bearer {token}"
     scoped_request: MCPToolCallRequest = request.override(headers=headers)

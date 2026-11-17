@@ -32,6 +32,4 @@ EXPOSE 8000
 
 # workers 必须为 1：SandboxManager / sandbox_holder / AgentLoader 都是进程内
 # 单例状态，多 worker 会各自认领同一个暖容器并互相覆盖 PostgreSQL 里的映射。
-CMD ["uvicorn", "src.api_view.web_main:app", \
-     "--host", "0.0.0.0", "--port", "8000", \
-     "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "*"]
+CMD ["python", "-m", "src.api_view.web_main"]

@@ -252,7 +252,7 @@ def test_report_aggregates_pass3_and_fault_recovery():
     results = [
         EvaluationResult(
             case_id="STABLE-1",
-            run_id=f"run-{index}",
+            thread_id=f"thread-{index}",
             trial_index=index,
             domain="inventory",
             difficulty="L3",
@@ -306,7 +306,7 @@ def test_runner_resets_each_mutating_trial_and_collects_state(tmp_path):
     class FakeClient:
         async def run(self, case, **kwargs):
             return CaseObservation(
-                run_id=kwargs["run_id"],
+                thread_id=kwargs["thread_id"],
                 trial_index=kwargs["trial_index"],
                 final_answer=case.request.message,
                 tool_calls=[ToolCallObservation(name="inventory_inbound")],

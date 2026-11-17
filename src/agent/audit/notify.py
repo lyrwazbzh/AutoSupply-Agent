@@ -17,11 +17,13 @@ logger = logging.getLogger(__name__)
 
 def _dingtalk_targets() -> tuple[str, str]:
     webhook = (
-        os.getenv("WRITE_AUDIT_DINGTALK_WEBHOOK", "").strip()
+        os.getenv("ALERT_DINGTALK_WEBHOOK", "").strip()
+        or os.getenv("WRITE_AUDIT_DINGTALK_WEBHOOK", "").strip()
         or os.getenv("DINGTALK_WEBHOOK_URL", "").strip()
     )
     token = (
-        os.getenv("WRITE_AUDIT_DINGTALK_TOKEN", "").strip()
+        os.getenv("ALERT_DINGTALK_TOKEN", "").strip()
+        or os.getenv("WRITE_AUDIT_DINGTALK_TOKEN", "").strip()
         or os.getenv("DINGTALK_ACCESS_TOKEN", "").strip()
     )
     return webhook.rstrip("/"), token
@@ -29,15 +31,32 @@ def _dingtalk_targets() -> tuple[str, str]:
 
 def _email_config() -> dict[str, str]:
     return {
-        "host": os.getenv("WRITE_AUDIT_SMTP_HOST", "").strip(),
-        "port": os.getenv("WRITE_AUDIT_SMTP_PORT", "587").strip(),
-        "user": os.getenv("WRITE_AUDIT_SMTP_USER", "").strip(),
-        "password": os.getenv("WRITE_AUDIT_SMTP_PASSWORD", "").strip(),
-        "from_addr": (
-            os.getenv("WRITE_AUDIT_SMTP_FROM", "").strip()
+        "host": (
+            os.getenv("ALERT_SMTP_HOST", "").strip()
+            or os.getenv("WRITE_AUDIT_SMTP_HOST", "").strip()
+        ),
+        "port": (
+            os.getenv("ALERT_SMTP_PORT", "").strip()
+            or os.getenv("WRITE_AUDIT_SMTP_PORT", "587").strip()
+        ),
+        "user": (
+            os.getenv("ALERT_SMTP_USER", "").strip()
             or os.getenv("WRITE_AUDIT_SMTP_USER", "").strip()
         ),
-        "to_addrs": os.getenv("WRITE_AUDIT_ALERT_EMAIL", "").strip(),
+        "password": (
+            os.getenv("ALERT_SMTP_PASSWORD", "").strip()
+            or os.getenv("WRITE_AUDIT_SMTP_PASSWORD", "").strip()
+        ),
+        "from_addr": (
+            os.getenv("ALERT_SMTP_FROM", "").strip()
+            or os.getenv("ALERT_SMTP_USER", "").strip()
+            or os.getenv("WRITE_AUDIT_SMTP_FROM", "").strip()
+            or os.getenv("WRITE_AUDIT_SMTP_USER", "").strip()
+        ),
+        "to_addrs": (
+            os.getenv("ALERT_EMAIL_TO", "").strip()
+            or os.getenv("WRITE_AUDIT_ALERT_EMAIL", "").strip()
+        ),
     }
 
 

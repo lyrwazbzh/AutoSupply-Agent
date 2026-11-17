@@ -11,6 +11,11 @@ global:
 rule_files:
   - /etc/prometheus/write-audit-alerts.yml
 
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
   # backend 的 /metrics 端点（prometheus-fastapi-instrumentator 暴露）
   - job_name: "backend"
@@ -31,3 +36,7 @@ scrape_configs:
   - job_name: "prometheus"
     static_configs:
       - targets: ["localhost:9090"]
+
+  - job_name: "alertmanager"
+    static_configs:
+      - targets: ["alertmanager:9093"]

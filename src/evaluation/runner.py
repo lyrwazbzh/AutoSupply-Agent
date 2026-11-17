@@ -308,7 +308,6 @@ class AgentSseClient:
         self,
         case: EvaluationCase,
         *,
-        run_id: str = "",
         trial_index: int = 1,
         thread_id: str | None = None,
     ) -> CaseObservation:
@@ -316,7 +315,7 @@ class AgentSseClient:
         request["thread_id"] = (
             thread_id
             or request.get("thread_id")
-            or f"eval-{case.case_id.lower()}-{trial_index}-{run_id[:8]}"
+            or f"eval-{case.case_id.lower()}-{trial_index}-{uuid.uuid4().hex[:8]}"
         )
         try:
             events = await self._post_stream("/api/chat/stream", request)
@@ -341,7 +340,7 @@ class AgentSseClient:
                 )
                 events.extend(resumed)
                 first = observation_from_events(events, case)
-            first.run_id = run_id
+            first.thread_id = str(request["thread_id"])
             first.trial_index = trial_index
             if self._fetch_persisted_trace:
                 first.harness_trace = await self._get_harness_trace(
@@ -350,7 +349,7 @@ class AgentSseClient:
             return first
         except (httpx.HTTPError, OSError, RuntimeError) as exc:
             return CaseObservation(
-                run_id=run_id,
+                thread_id=str(request["thread_id"]),
                 trial_index=trial_index,
                 infra_error=f"Agent API不可用: {exc}",
             )
@@ -388,42 +387,42 @@ class EvaluationRunner:
         fault_profile: str | None = None,
     ) -> EvaluationResult:
         trial_case = self._trial_case(case, trial_index)
-        run_id = str(uuid.uuid4())
-        thread_id = f"eval-{case.case_id.lower()}-{trial_index}-{run_id[:8]}"
+        thread_id = (
+            f"eval-{case.case_id.lower()}-{trial_index}-{uuid.uuid4().hex[:8]}"
+        )
         fault_injected = False
-        observation = CaseObservation(run_id=run_id, trial_index=trial_index)
+        observation = CaseObservation(
+            thread_id=thread_id, trial_index=trial_index
+        )
         try:
             await self._environment.reset(
-                trial_case, run_id=run_id, trial_index=trial_index
+                trial_case, thread_id=thread_id, trial_index=trial_index
             )
             if fault_profile:
                 await self._environment.inject_fault(
                     fault_profile,
                     case=trial_case,
-                    run_id=run_id,
+                    thread_id=thread_id,
                     trial_index=trial_index,
                 )
                 fault_injected = True
             before = await self._environment.snapshot(
                 trial_case,
                 "before",
-                run_id=run_id,
-                trial_index=trial_index,
                 thread_id=thread_id,
+                trial_index=trial_index,
                 operation_ids=[],
             )
             observation = await self._client.run(
                 trial_case,
-                run_id=run_id,
                 trial_index=trial_index,
                 thread_id=thread_id,
             )
             after = await self._environment.snapshot(
                 trial_case,
                 "after",
-                run_id=run_id,
-                trial_index=trial_index,
                 thread_id=thread_id,
+                trial_index=trial_index,
                 operation_ids=[
                     call.operation_id
                     for call in observation.tool_calls
@@ -441,13 +440,13 @@ class EvaluationRunner:
                 try:
                     await self._environment.clear_faults(
                         case=trial_case,
-                        run_id=run_id,
+                        thread_id=thread_id,
                         trial_index=trial_index,
                     )
                 except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
                     observation.infra_error = f"故障注入清理失败: {exc}"
 
-        observation.run_id = run_id
+        observation.thread_id = thread_id
         observation.trial_index = trial_index
         observation.fault_profile = fault_profile
         observation.fault_injected = fault_injected

@@ -129,7 +129,7 @@ class EvaluationOracle:
 
         return EvaluationResult(
             case_id=case.case_id,
-            run_id=observation.run_id,
+            thread_id=observation.thread_id,
             trial_index=observation.trial_index,
             domain=case.domain,
             difficulty=case.difficulty,

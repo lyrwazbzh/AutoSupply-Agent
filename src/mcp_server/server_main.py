@@ -9,7 +9,9 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from fastmcp import FastMCP
+import uvicorn
 
+from src.agent.log_utils import mcp_logger
 from src.mcp_server.auth import ERPJwtVerifier
 from src.mcp_server.server_config import MCP_HOST, MCP_PORT
 from src.mcp_server.tools.catalog_tools import register_catalog_tools
@@ -18,6 +20,7 @@ from src.mcp_server.tools.order_tools import register_order_tools
 from src.mcp_server.tools.parts_tools import register_parts_tools
 from src.mcp_server.tools.procurement_flow_tools import register_procurement_flow_tools
 from src.mcp_server.tools.suppliers_tools import register_supplier_tools
+from src.observability import instrument_asgi
 
 # 创建 MCP Server 实例
 mcp = FastMCP(
@@ -36,5 +39,8 @@ register_procurement_flow_tools(mcp)
 
 
 if __name__ == "__main__":
-    print(f"🚀 Starting MCP Server on {MCP_HOST}:{MCP_PORT} (SSE transport)")
-    mcp.run(transport="sse", host=MCP_HOST, port=MCP_PORT)
+    mcp_logger.info(
+        "Starting MCP Server on %s:%s (SSE transport)", MCP_HOST, MCP_PORT
+    )
+    app = instrument_asgi(mcp.http_app(transport="sse"), "erp-agent-mcp")
+    uvicorn.run(app, host=MCP_HOST, port=MCP_PORT, log_config=None)

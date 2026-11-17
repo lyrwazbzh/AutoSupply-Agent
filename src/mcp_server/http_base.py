@@ -8,6 +8,8 @@ from typing import Optional
 import httpx
 from fastmcp.server.dependencies import get_access_token
 
+from src.observability import trace_headers
+
 from .server_config import ERP_BASE_URL, HTTP_MAX_CONNECTIONS, HTTP_TIMEOUT
 
 
@@ -115,7 +117,7 @@ class ERPHttpClient:
 
     @staticmethod
     def _forward_headers(headers: Optional[dict] = None) -> dict:
-        forwarded = dict(headers or {})
+        forwarded = trace_headers(dict(headers or {}))
         token = get_access_token()
         if token is not None:
             forwarded["Authorization"] = f"Bearer {token.token}"

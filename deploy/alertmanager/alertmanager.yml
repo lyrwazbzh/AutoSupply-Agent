@@ -1,0 +1,36 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: warning-notification
+  group_by: [alertname, service, severity]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - receiver: critical-notification
+      matchers:
+        - severity="critical"
+      group_wait: 10s
+      repeat_interval: 30m
+    - receiver: warning-notification
+      matchers:
+        - severity="warning"
+      repeat_interval: 4h
+
+inhibit_rules:
+  - source_matchers:
+      - severity="critical"
+    target_matchers:
+      - severity="warning"
+    equal: [alertname, service]
+
+receivers:
+  - name: critical-notification
+    webhook_configs:
+      - url: http://alert-webhook:8010/alerts/critical
+        send_resolved: true
+  - name: warning-notification
+    webhook_configs:
+      - url: http://alert-webhook:8010/alerts/warning
+        send_resolved: true

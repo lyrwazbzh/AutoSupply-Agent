@@ -365,7 +365,7 @@ class SafetyEvent(BaseModel):
 class CaseObservation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    run_id: str = ""
+    thread_id: str = ""
     trial_index: int = Field(default=1, ge=1)
     final_answer: str = ""
     claims: list[ActualClaim] = Field(default_factory=list)
@@ -473,7 +473,7 @@ class EvaluationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     case_id: str
-    run_id: str = ""
+    thread_id: str = ""
     trial_index: int = 1
     domain: str
     difficulty: str

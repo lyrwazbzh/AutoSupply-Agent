@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <appender name="JSON_STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <customFields>{"service.name":"java-erp"}</customFields>
+            <includeMdc>true</includeMdc>
+            <mdcKeyFieldName>trace_id=trace.id</mdcKeyFieldName>
+            <mdcKeyFieldName>span_id=span.id</mdcKeyFieldName>
+            <mdcKeyFieldName>trace_flags=trace.flags</mdcKeyFieldName>
+            <fieldNames>
+                <timestamp>@timestamp</timestamp>
+                <level>log.level</level>
+                <logger>log.logger</logger>
+                <stackTrace>error.stack_trace</stackTrace>
+                <version>[ignore]</version>
+            </fieldNames>
+        </encoder>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="JSON_STDOUT"/>
+    </root>
+</configuration>
