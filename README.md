@@ -1,251 +1,339 @@
 # AutoSupply-Agent
 
-面向汽车与摩托车零部件采购场景的全栈 Agent 系统。项目以 DeepAgents 与 LangGraph
-为执行底座，通过 Planning、Executing、Review、Result 四阶段 Harness 编排采购分析、
-供应商查询、库存操作和采购订单处理，并以 MCP 隔离 Agent 与 ERP 接口。
+面向汽车与摩托车零部件采购的全栈智能采购平台。项目聚焦供应商、零部件、报价、采购订单、
+收货入库、库存流水、补货和采购退货，不涉及整车采购、整车销售或整车生产。
 
-系统同时提供规则优先、LLM 兜底的质量评审，写操作前人工审批，写后持久化审计与对账，
-以及用户级 Docker 沙箱、三层记忆、SSE 前端和容器化部署能力。本地联调和生产 Compose
-均对接仓库内 `java_erp`（Spring Boot 采购 ERP）；Mock ERP 仅用于 CI 契约测试。
+系统由两部分共同组成：
+
+- 以 DeepAgents、LangGraph 和 FastMCP 为核心的采购 Agent，负责自然语言交互、任务规划、
+  数据分析、受控写操作、人工审批和结果审查。
+- 以 Spring Boot、MySQL 和 Redis 为核心的 Java ERP，负责身份权限、采购业务、库存事务、
+  幂等写入和业务审计。
+
+Next.js 前端同时提供对话式智能助手和结构化 ERP 管理台，既可以用自然语言完成采购任务，
+也可以直接在业务页面中管理报价、订单、库存、补货、退货、审批与账号权限。
+
+## 项目边界
+
+| 范围 | 当前实现 |
+|---|---|
+| 采购对象 | 汽车与摩托车零部件 |
+| 供应链目录 | 零部件、供应商、多供应商报价、MOQ、交期、质量评分 |
+| 适配数据 | 摩托车车型档案与零部件适配关系，仅用于选件和采购校验 |
+| 采购执行 | 建单、审核、采购中、整单收货入库、取消和待处理订单过期 |
+| 库存 | 手工入库/出库、库存 CAS、不可变库存流水、库存预警 |
+| 补货 | 基于安全库存、目标倍数和最小采购量的确定性补货任务 |
+| 退货 | 已入库采购单的轻量退货申请与库存扣减 |
+| 不包含 | 整车采购、整车销售、零售客户、电商页面、生产制造和复杂售后结算 |
+
+车型数据只承担零部件适配查询，不代表系统在采购整车。当前采购退货也不包含质检、
+供应商结算、退款和复杂售后流程。
 
 ## 核心能力
 
-- **Harness 编排与评审**：使用图状态维护 Planning、Executing、Review、Result 四阶段；
-  `ReviewPolicy` 先执行确定性规则，无法判断时调用 Router LLM，超时或 Schema 无效时保守评审；
-  完整 Agent 质量由版本化离线数据集和 Java ERP 事实金标独立评测。
-- **固定 Rubric 与安全返工**：LLM 只决定是否评审及检查维度，具体标准从 YAML 预设中选择；
-  多工具、写操作、委派和失败信号会升级审查。只读任务最多返工 3 轮，写入及委派任务只评审一次，
-  不自动重放副作用链路。
-- **主 Agent 与两个子 Agent**：主 Agent 通过 DeepAgents 的 `task` 工具按需选择采购分析或
-  订单操作子 Agent；服务端从可信 `configurable` 自动注入用户身份、偏好和 WARM 记忆，
-  不要求主 Agent 在委派文本中重复传递上下文。
-- **MCP 采购网关**：FastMCP 封装供应商、零部件、订单、库存四组工具，通过 HTTP 对接 ERP；
-  契约为 `{code,message,data}`，业务错误保持 HTTP 200 + `body.code`。
-- **Java ERP 写契约**：`java_erp` 提供订单幂等键、同键不同 payload → `409`、
-  `GET /api/operations/{id}` 回查、`by-idempotency` 回查，以及订单/供应商状态与库存 CAS；
-  Redis 只承担零件/供应商查询缓存、登录限流和最近/常用访问，库存正确性始终由 MySQL 保证。
-- **采购目录 M1**：Java ERP 已支持一个零件对应多个供应商报价，并提供摩托车车型档案、
-  零件适配关系和按车型反查零件；保留 `part.supplier_id` 作为默认供应商兼容字段。
-- **审批、评审与审计分层**：审批在 ERP 写入前阻断执行，Rubric 在执行后检查结果质量，
-  写审计则持久化操作事实。三者职责独立，但主 Agent 直调和子 Agent 调用共享同一审批策略中心。
-- **通用写治理与结果审计**：订单、库存、供应商和零部件写入统一生成操作记录与追加式审计事件；
-  使用 `thread_id + tool_call_id` 保证调用幂等，ERP 终态未知时进入补偿对账，不因审计保存失败重复写入。
-  Result 阶段对写声明做门禁：有写声明须有回执、失败后不得再声称成功、最终答案须被回执覆盖。
-- **三层记忆**：HOT 使用 LangGraph checkpoint，WARM 在每次新请求或 HITL resume 时生成请求级快照，
-  COLD 使用 PostgreSQL 中文全文检索与 pgvector 召回，通过 RRF 融合并维护访问频次、TTL、容量和冲突失效。
-- **用户级安全沙箱**：每个用户领取独立 Docker 沙箱，应用只读根文件系统、tmpfs、资源上限、
-  Capability 裁剪、seccomp 和 PID 限制；预热池、generation 热替换、受控 workspace 探针和
-  3 次基础设施故障 / 60 秒熔断共同处理运行时故障。
-- **全栈交付**：FastAPI 提供 SSE、HITL 恢复、历史、写审计、评测指标和文件下载接口；
-  Next.js 前端展示阶段、工具调用、审批和结果；Nginx、Prometheus、Grafana 与 GitHub Actions
-  覆盖认证、观测、测试、构建、备份、发布和回滚。
+### 1. 对话式采购 Agent
+
+- 主 Agent 负责简单查询、任务编排和结果整合。
+- 采购分析子 Agent 负责跨来源取数、供应商对比、库存与订单分析、图表和文档生成。
+- 采购订单子 Agent 负责订单、收货、补货和退货等多步骤业务流程。
+- 子 Agent 使用 YAML 精确声明工具白名单与输出契约，不能通过模糊名称扩大权限。
+- FastMCP 将供应商、零部件、采购目录、订单、库存、补货和退货接口封装为 Agent 工具。
+
+### 2. Harness 四阶段执行
+
+每轮业务请求经过 Planning、Executing、Review、Result 四个结构化阶段：
+
+~~~text
+用户请求或 HITL 恢复
+  └─ Planning：识别任务类型并形成计划
+      └─ Executing：主 Agent 直调工具或委派子 Agent
+          └─ Review：规则优先，模糊场景由 Router LLM 判定
+              ├─ 只读任务：允许定向返工，最多 3 轮
+              ├─ 写入/委派任务：只审查一次，不自动重放副作用
+              └─ Result：校验事实、回执与最终声明
+~~~
+
+ReviewPolicy 会根据任务类型、工具数量、写操作、委派、失败信号和多来源证据决定是否评审。
+具体 Rubric 固定在 harness_config.yaml 中，LLM 只参与路由和评分，不动态发明验收标准。
+
+### 3. 零部件采购闭环
+
+Java ERP 已完成四个采购里程碑：
+
+| 阶段 | 能力 |
+|---|---|
+| M1 采购目录 | 一个零件对应多个供应商报价；维护采购价、MOQ、交期、质量评分、默认供应商、车型与适配关系 |
+| M2 收货与库存流水 | 手工入出库和采购收货统一经过事务命令；整单收货同时更新库存、流水、订单状态和实际到货日期 |
+| M3 确定性补货 | 定时或手动巡检低库存，按安全库存倍数和 MOQ 计算补货量；可由补货任务创建并关联采购单 |
+| M4 采购退货 | 对已入库订单明细创建退货；确认时校验累计退货量、扣减库存并记录 PURCHASE_RETURN 流水 |
+
+库存正确性始终由 MySQL 事务和条件更新保证。Redis 只用于零件/供应商查询缓存、
+登录限流和最近/常用访问，不承担库存、订单、审批或 Agent 记忆的权威状态。
+
+### 4. 写操作治理
+
+所有受保护的 ERP 写工具共享同一套审批、审计与幂等策略：
+
+~~~text
+Agent 发起 ERP 写工具
+  └─ 校验 JWT 权限与 ApprovalPolicy
+      └─ 创建 operation_id、payload_hash 和审批任务
+          ├─ 拒绝：记录 REJECTED，不调用 ERP
+          └─ 批准：预登记写审计并调用 ERP
+                  ├─ 明确成功/失败：保存终态与追加式事件
+                  └─ 结果未知：只读查询 operation 或幂等键
+                                └─ 自动对账或进入 MANUAL_REQUIRED
+~~~
+
+- 申请人与审批人分离，申请人不能在自己的会话中批准写操作。
+- thread_id + tool_call_id 生成稳定幂等键，ERP 另以 operationId 和订单 idempotencyKey 防重。
+- DISPATCHING、UNKNOWN 和 RECONCILING 状态只允许查询与对账，禁止自动重放原写请求。
+- audit.write_audit_events 为 append-only，数据库触发器拒绝更新和删除。
+- Result 阶段要求所有“已写入”声明必须有真实回执，失败后不得继续声称成功。
+
+### 5. 统一身份与权限
+
+Java ERP 是唯一身份源和令牌签发方：
+
+- 使用 RS256 签发短期 Access Token，Refresh Token 保存在 HttpOnly、SameSite=Strict Cookie。
+- Java ERP、Python Backend 和 MCP 分别校验签名、issuer、audience 与权限。
+- Backend 每次入口请求向 Java ERP 校验账号状态和 authz_version，停用账号或改权后旧令牌立即失效。
+- 内置 ADMIN、PURCHASER、WAREHOUSE、VIEWER 角色，并支持用户、角色和权限管理。
+- ERP 控制器使用明确的 permission code；助手写操作还要求 assistant:erp-write。
+- 会话、下载文件、记忆、审计和沙箱均绑定 JWT subject，客户端传入的 user_id 不作为身份来源。
+
+### 6. 记忆、知识与上下文
+
+- HOT：LangGraph Checkpoint 保存当前会话的可恢复工作流状态。
+- WARM：请求开始或 HITL resume 时生成稳定偏好和近期任务快照。
+- COLD：PostgreSQL zhparser 全文检索与 pgvector 语义检索并行召回，再通过 RRF 融合。
+- Semantic、Episodic、Procedural 和 Org Policy 使用独立命名空间并按用户隔离。
+- 长对话达到模型上下文窗口的配置阈值后，采购专用压缩器会总结旧消息并保留最近上下文。
+- 采购知识库支持入库、证据跟踪、去重、重排和有界补搜。
+
+### 7. 安全沙箱
+
+- 每个用户使用独立 Docker 沙箱和工作目录，支持预热池、租约、空闲回收与故障重建。
+- 沙箱启用只读根文件系统、tmpfs、资源限制、Capability 裁剪、seccomp 和 PID 限制。
+- Backend 通过独立 Docker-in-Docker daemon 管理沙箱，不直接挂载宿主机 Docker socket。
+- 3 次基础设施失败会打开 60 秒熔断；generation 变化后重新同步基础 Skills 和用户 Skills。
+- 容器部署默认关闭沙箱直连 MCP，避免把用户访问令牌注入可执行模型生成代码的环境。
+
+### 8. 四维评测
+
+评测通过真实 SSE 对话、Harness Trace、MCP 工具调用、ERP 终态、审批和写审计采集证据，
+固定输出四个独立维度，不计算加权总分：
+
+| 维度 | 核心指标 |
+|---|---|
+| 轨迹 | 轨迹通过率、工具调用准确率 |
+| 业务质量 | 任务完成率、关键事实准确率、采购建议可行率、补货数量偏差 |
+| 安全 | 风险操作拦截率、合法写入误拦截率 |
+| 稳定性 | pass^3、故障恢复率 |
+
+模型只负责从回答中抽取结构化声明，最终判分由确定性规则、ERP 状态和审计证据完成。
+
+### 9. 可观测性与交付
+
+- Backend、MCP、Java ERP 使用 W3C Trace Context 串联请求。
+- OpenTelemetry Collector 接收 OTLP Trace，Tempo 存储，Grafana 提供检索与 Dashboard。
+- Prometheus 采集 Backend 和 Java ERP 指标，Alertmanager 按 critical/warning 分级路由。
+- alert-webhook 支持钉钉和 SMTP；未配置通知渠道时只记录结构化日志。
+- Python 与 Java 日志均输出单行 JSON，并包含 trace.id、span.id。
+- GitHub Actions 覆盖密钥扫描、代码质量、测试、镜像构建、集成栈、数据库恢复和发布门禁。
 
 ## 系统架构
 
-```mermaid
+~~~mermaid
 flowchart LR
-    UI[Next.js ERP + Assistant] -->|HTTP / SSE + Bearer JWT| NGINX[Nginx Edge]
-    NGINX --> API[FastAPI Resource Server]
-    NGINX --> ERP[java_erp Identity + ERP]
-    API --> LOADER[AgentLoader]
-    LOADER --> MAIN[Procurement Main Agent]
+    USER[Browser] --> NGINX[Nginx :80/:443]
+    NGINX --> WEB[Next.js ERP + Assistant]
+    NGINX -->|/api/auth /api/erp| ERP[Java ERP]
+    NGINX -->|/api/chat /api/history /api/write-audit| API[FastAPI Backend]
 
-    MAIN --> HARNESS[Planning → Executing → Review → Result]
-    MAIN -->|task| ANALYST[Procurement Analyst]
-    MAIN -->|task| ORDER[Procurement Order]
-    HARNESS --> POLICY[Rule-first ReviewPolicy]
-    POLICY -->|uncertain| ROUTER[Router LLM]
-    POLICY --> RUBRIC[Preset Rubric Grader]
-
-    MAIN --> MCP[FastMCP Gateway]
+    API --> AGENT[Procurement Main Agent]
+    AGENT --> HARNESS[Planning → Executing → Review → Result]
+    AGENT -->|task| ANALYST[Procurement Analyst]
+    AGENT -->|task| ORDER[Procurement Order]
+    AGENT --> MCP[FastMCP Gateway]
     ANALYST --> MCP
     ORDER --> MCP
     MCP --> ERP
 
-    MAIN --> PROXY[Sandbox Proxy]
-    PROXY --> DIND[Docker-in-Docker]
+    ERP --> MYSQL[(MySQL)]
+    ERP --> REDIS[(Redis)]
+    API --> PG[(PostgreSQL + pgvector + zhparser)]
+    API --> DIND[Docker-in-Docker]
     DIND --> BOX[Per-user Sandbox]
 
-    API --> PG[(PostgreSQL + pgvector + zhparser)]
-    PG --> DATA[Checkpoint / Memory / Knowledge / Audit]
+    API --> OTEL[OTel Collector]
+    MCP --> OTEL
+    ERP --> OTEL
+    OTEL --> TEMPO[Tempo]
     API --> PROM[Prometheus]
+    ERP --> PROM
+    PROM --> ALERT[Alertmanager]
+    ALERT --> HOOK[Alert Webhook]
     PROM --> GRAFANA[Grafana]
-```
+    TEMPO --> GRAFANA
+~~~
 
-单轮执行主链如下：
+## 数据权威边界
 
-```text
-请求或 HITL resume
-  └─ 刷新用户 WARM 记忆快照
-      └─ Planning
-          └─ Executing
-              ├─ 主 Agent 直接调用工具
-              └─ task 委派采购分析 / 订单操作子 Agent
-                  └─ ReviewPolicy
-                      ├─ review    → 注入预设 Rubric
-                      ├─ skip      → 直接输出
-                      └─ uncertain → Router LLM → review / skip
-                          └─ 执行信号再次升级审查
-                              ├─ 只读任务：最多 3 轮定向返工
-                              ├─ 写入/委派：单次审查，禁止自动重放
-                              └─ Result
-```
-
-写操作另有独立的副作用链路：
-
-```text
-ERP 写工具
-  └─ ApprovalPolicyRegistry
-      └─ LangGraph interrupt
-          ├─ reject  → REJECTED，不调用 ERP
-          └─ approve → 写审计预登记 → ERP 调用（operationId / 幂等键）
-                           ├─ 明确成功/失败 → 保存终态
-                           └─ UNKNOWN       → 补偿任务拉取 /api/operations 或 by-idempotency → 对账或人工处理
-```
+| 数据 | 权威存储 |
+|---|---|
+| 供应商、零部件、报价、车型适配、订单、库存、补货、退货、账号与 RBAC | MySQL / Java ERP |
+| Agent 会话、Checkpoint、长期记忆、知识库、运行租约、审批与写审计 | PostgreSQL |
+| 零件/供应商缓存、登录限流、最近和常用访问 | Redis |
+| 临时图表、文档和下载文件 | Backend artifact-data 卷，按用户和 TTL 隔离 |
+| Trace | Tempo |
+| 指标与告警状态 | Prometheus / Alertmanager |
 
 ## 技术栈
 
 | 层次 | 技术 |
 |---|---|
-| Agent | DeepAgents 0.7、LangGraph 1.2、LangChain、OpenAI-compatible LLM |
-| API / 工具 | FastAPI、SSE、FastMCP、HTTPX |
-| ERP | `java_erp`：Spring Boot 3.1、JDK 17、MyBatis-Plus、Flyway、MySQL；Mock ERP 仅供契约测试 |
-| 数据 | PostgreSQL 16、pgvector、zhparser、LangGraph PostgresSaver / Store |
-| 沙箱 | Docker SDK、Docker-in-Docker、seccomp、用户级资源隔离 |
-| 前端 | Next.js 16、React 19、TypeScript、Tailwind CSS 4 |
-| 可观测性 | Prometheus、Grafana、结构化 Harness trace、追加式写审计 |
+| Agent | Python 3.11、DeepAgents 0.7.35、LangGraph 1.2+、LangChain |
+| API / MCP | FastAPI、FastMCP 3.4.11、HTTPX、SSE |
+| ERP | Spring Boot 3.1.10、JDK 17、MyBatis-Plus、Flyway |
+| 数据 | PostgreSQL 16、pgvector、zhparser、MySQL 8、Redis 7 |
+| 前端 | Next.js 16.2、React 19.2、TypeScript、Tailwind CSS 4 |
+| 沙箱 | Docker SDK、Docker-in-Docker、seccomp、用户级租约 |
+| 可观测性 | OpenTelemetry、Tempo、Prometheus、Grafana、Alertmanager |
 | 交付 | Docker Compose、Nginx、GitHub Actions、Release Please |
 
 ## 目录结构
 
-```text
+~~~text
 AutoSupply-Agent/
 ├─ src/
 │  ├─ agent/
-│  │  ├─ main_agent.py             主 Agent、工具、子 Agent 与中间件组装
-│  │  ├─ harness.py                四阶段状态与 HarnessPhaseMiddleware
-│  │  ├─ review_policy.py          规则优先、LLM 兜底的统一评审路由
-│  │  ├─ harness_config.yaml       阶段、路由配置与预设 Rubric
+│  │  ├─ main_agent.py             主 Agent、工具、子 Agent 和中间件组装
+│  │  ├─ harness.py                四阶段状态与 Harness 中间件
+│  │  ├─ review_policy.py          规则优先、模型兜底的评审路由
+│  │  ├─ harness_config.yaml       阶段、任务类型和固定 Rubric
 │  │  ├─ approval.py               写工具审批策略唯一来源
-│  │  ├─ audit/                    写操作审计、状态机、对账、补偿与结果审计
-│  │  ├─ backends/                 Docker 沙箱、预热池、Proxy 与生命周期管理
-│  │  ├─ middlewares/              评审、写治理、结果审计、记忆、Skills 与沙箱中间件
-│  │  ├─ subagents/                采购分析 / 订单操作 YAML 配置
-│  │  ├─ memory/                   Semantic / Episodic / Procedural 三类记忆
-│  │  ├─ knowledge/                采购知识检索、RRF、证据与有界补搜
-│  │  └─ tools/                    图表、文档、知识、记忆、下载与 HITL 工具
-│  ├─ api_view/                    FastAPI、SSE、认证、历史、审计与评测 API
-│  ├─ mcp_server/                  供应商、零部件、订单、库存 MCP 工具
+│  │  ├─ audit/                    写审计、补偿对账和结果审计
+│  │  ├─ backends/                 Docker 沙箱、预热池和 Proxy
+│  │  ├─ middlewares/              评审、写治理、记忆、Skills、沙箱中间件
+│  │  ├─ subagents/                采购分析与订单子 Agent 配置
+│  │  ├─ memory/                   Semantic / Episodic / Procedural 记忆
+│  │  ├─ knowledge/                采购知识检索、证据、RRF 与有界补搜
+│  │  └─ tools/                    图表、文档、知识、记忆、下载和 HITL 工具
+│  ├─ api_view/                    FastAPI、SSE、JWT、历史、审批和审计 API
+│  ├─ mcp_server/                  ERP JWT 网关和采购 MCP 工具
+│  ├─ evaluation/                  四维评测 Runner、Oracle 与报告
+│  ├─ observability/               OpenTelemetry 初始化与告警 Webhook
 │  ├─ skills/                      Agent Skills
-│  ├─ evaluation/                  完整 Agent Runner、声明抽取、Oracle 与报告聚合
-│  ├─ test/evaluation/             评测 Schema 示例与最新 JSON 报告
+│  ├─ runtime_state.py             PostgreSQL 运行租约与所有权
 │  ├─ artifacts.py                 用户隔离临时文件与 TTL 清理
-│  └─ database.py                  PostgreSQL 连接池及应用 Schema 初始化
-├─ frontend/                       Next.js 16 Web 前端
-├─ java_erp/                       Spring Boot 采购 ERP（本地默认 :8080；Harness 写契约）
+│  └─ database.py                  PostgreSQL Schema 与检索索引初始化
+├─ frontend/
+│  └─ src/app/                     助手、ERP、补货、退货、审计和权限页面
+├─ java_erp/
+│  ├─ src/main/java/               采购 ERP、身份权限和事务服务
+│  └─ src/main/resources/db/       Flyway V1–V10 迁移
 ├─ deploy/
-│  ├─ postgres/                    pgvector + zhparser PostgreSQL 镜像
-│  ├─ mock-erp/                    仅供 CI 契约测试的采购 ERP 替身
-│  ├─ sandbox/                     预装分析依赖的沙箱镜像
-│  ├─ nginx/                       统一入口、认证与 TLS
-│  ├─ prometheus/ / grafana/       指标采集、告警与 Dashboard
-│  ├─ ci/                          集成栈、备份恢复和迁移门禁
-│  ├─ cd/                          构建、发布、观察窗与回滚
-│  ├─ dr/                          PostgreSQL + MySQL 备份、恢复与演练
-│  ├─ mysql/                       宿主 MySQL 无损迁移工具与手册
-│  └─ cloud/                       新云主机初始化脚本
-├─ .github/workflows/              CI、构建、发布与 Release Please
-├─ docker-compose.yml              全栈服务编排
-├─ Dockerfile                      Backend / MCP 共用镜像
-└─ eval.md                         Agent 四维评测方案
-```
+│  ├─ postgres/                    pgvector + zhparser 镜像
+│  ├─ sandbox/                     预装数据分析依赖的沙箱镜像
+│  ├─ nginx/                       统一入口、TLS 与反向代理
+│  ├─ tempo/ / otel-collector/     Trace 采集与存储
+│  ├─ prometheus/ / grafana/       指标、告警规则与 Dashboard
+│  ├─ alertmanager/                告警聚合、抑制与分级路由
+│  ├─ ci/ / cd/ / runner/          集成门禁、发布、回滚和 Runner
+│  ├─ dr/ / mysql/                 双数据库备份恢复与迁移
+│  └─ cloud/                       新云主机初始化
+├─ migrations/postgres/            PostgreSQL 版本化迁移
+├─ docker-compose.yml              完整生产拓扑
+├─ eval.md                         四维评测口径
+└─ tenant.md                       多用户隔离与共享 Agent 迁移设计
+~~~
 
 ## 环境要求
 
-- Docker Engine 24+ 与 Docker Compose v2
-- 本地开发：Python 3.11、Node.js 22、npm 10+；联调 `java_erp` 另需 JDK 17、Maven、MySQL
-- 至少 4 GB 可用内存；增加预热沙箱数量时需要同步增加资源
-- 可用的 OpenAI-compatible LLM Key；默认配置使用 ChatAnywhere
-- Linux 服务器建议使用 ext4，或启用 `ftype=1` 的 xfs
+- Docker Engine 24+ 与 Docker Compose v2。
+- 至少 4 GB 可用内存；增加沙箱预热池时需要同步增加资源。
+- 可访问 OpenAI-compatible LLM 的 API Key。
+- Linux 服务器建议使用 ext4，或启用 ftype=1 的 xfs。
+- 本地分进程开发另需 Python 3.11、Node.js 22、npm 10+、JDK 17–21 和 Maven Wrapper。
 
 ## 快速启动
 
-Docker Compose 是最完整的运行方式，会启动 PostgreSQL、MySQL、Java ERP、MCP、
-Backend、Frontend、Docker 沙箱、Prometheus、Grafana 和 Nginx。
+Docker Compose 会启动 PostgreSQL、MySQL、Redis、Java ERP、MCP、Backend、Frontend、
+Docker 沙箱、Tempo、OpenTelemetry Collector、Prometheus、Alertmanager、Grafana 和 Nginx。
 
 ### 1. 准备配置
 
-```bash
+~~~bash
 git clone https://github.com/lyrwazbzh/AutoSupply-Agent.git
 cd AutoSupply-Agent
 
 cp deploy/.env.example deploy/.env
 cp deploy/nginx.env.example deploy/nginx.env
-```
+~~~
 
-编辑 `deploy/.env`，至少设置：
+编辑 deploy/.env，至少完成以下配置：
 
-```dotenv
-CHATANYWHERE_API_KEY=sk-xxxx
-PUBLIC_BASE_URL=http://localhost
-POSTGRES_PASSWORD=请替换为强密码
-```
+- 填写 CHATANYWHERE_API_KEY 和正确的 PUBLIC_BASE_URL。
+- 替换 PostgreSQL、MySQL 和 Redis 的所有占位口令。
+- 按需选择 LLM_MODEL 与 LLM_BASE_URL。
+- 生产环境设置 Grafana 密码、告警渠道和 TLS。
 
-生成 ERP 的 RS256 密钥与一次性管理员：
+### 2. 生成 JWT 密钥和初始管理员
 
-```bash
+~~~bash
 bash deploy/init-security.sh
-```
+~~~
 
-### 2. 创建 TLS 占位证书
+脚本会生成 RS256 密钥，并在未指定密码时打印一次性管理员密码。首次登录后应立即修改密码，
+再清空 deploy/.env 中的 ERP_BOOTSTRAP_ADMIN_USERNAME 和 ERP_BOOTSTRAP_ADMIN_PASSWORD。
 
-```bash
+### 3. 准备 TLS 文件
+
+Nginx 配置始终加载证书路径，因此即使本地只使用 HTTP，也需要一组占位证书：
+
+~~~bash
 mkdir -p deploy/nginx/tls
 openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
   -keyout deploy/nginx/tls/key.pem \
   -out deploy/nginx/tls/cert.pem \
   -subj '/CN=localhost'
 chmod 600 deploy/nginx/tls/key.pem
-```
+~~~
 
-占位证书用于保证 Nginx 配置可加载。公网生产环境应在 `deploy/nginx.env` 中设置
-`TLS_ENABLED=1`，并替换为可信证书。
+生产环境应在 deploy/nginx.env 中设置 TLS_ENABLED=1，并替换为可信证书。
 
-### 3. 启动并验收
+### 4. 启动与验收
 
-```bash
+~~~bash
+docker compose config
 docker compose up -d --build
 docker compose ps
 curl http://localhost/healthz
-```
+~~~
 
-访问 <http://localhost/> 并使用 `init-security.sh` 创建的 ERP 管理员登录。Grafana 默认位于
-<http://localhost:13000/>。
+- 管理台与智能助手：http://localhost/
+- Grafana：http://localhost:13000/
+- Java ERP Swagger UI 仅在可访问 ERP 内部端口的开发环境使用。
 
-首次启动时应用会幂等创建业务 Schema，LangGraph 会创建 checkpoint 与 store 表，
-记忆检索会在 store 表上补充中文全文检索和向量字段。
+首次启动时：
 
-### 4. 新云主机部署
-
-新服务器建议使用自动化初始化脚本，它会安装 Docker、生成配置、准备 TLS、创建账号并等待
-所有服务健康：
-
-```bash
-bash deploy/cloud/pack.sh /tmp/agent-harness.tar.gz
-# 将压缩包传到目标机器后，按 deploy/cloud/README.md 执行 bootstrap.sh
-```
-
-完整说明见 [deploy/cloud/README.md](deploy/cloud/README.md)。
+- Flyway 按 V1–V10 创建或升级 MySQL Schema。
+- Backend 创建 PostgreSQL 应用、知识、审批、审计和运行租约结构。
+- LangGraph 创建 Checkpoint 与 Store 表。
+- sandbox-image-loader 在 DinD 中构建预装分析依赖的沙箱镜像。
 
 ## 本地分进程开发
 
-先准备依赖与本地配置：
+### Python 与前端
 
-```bash
+~~~bash
 python -m venv .venv
+
 # Linux / WSL
 source .venv/bin/activate
-# Windows PowerShell: .venv\Scripts\Activate.ps1
+# Windows PowerShell
+# .venv\Scripts\Activate.ps1
 
 python -m pip install -r requirements-dev.txt
 cp .env.example .env
@@ -253,35 +341,17 @@ cp .env.example .env
 cd frontend
 npm ci
 cd ..
-```
+~~~
 
-本地需要可访问的 PostgreSQL 16（含 pgvector 与 zhparser）和 Docker daemon。建议先构建
-项目提供的镜像：
+本地需要 PostgreSQL 16（含 pgvector 与 zhparser）、MySQL 8、Redis 和可用的 Docker daemon。
+建议复用 deploy 目录中的镜像与配置。
 
-```bash
-docker build -t agent-harness-postgres deploy/postgres
-POSTGRES_PASSWORD="$(openssl rand -hex 24)"
-docker run -d --name agent-harness-postgres \
-  -e POSTGRES_USER=erp_agent \
-  -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
-  -e POSTGRES_DB=erp_agent \
-  -p 5432:5432 agent-harness-postgres
+### 启动服务
 
-docker build -f deploy/sandbox/Dockerfile \
-  -t erp-sandbox:3.11 deploy/sandbox
-```
-
-将根目录 `.env` 中的 `SANDBOX_IMAGE` 设置为 `erp-sandbox:3.11`，即可使用该预装镜像。
-
-分别启动四个进程：
-
-```bash
-# 终端 1：Java ERP（需本机 MySQL；完整说明见 java_erp/README.md）
-cd java_erp && ./mvnw spring-boot:run
-# 可选冒烟：python java_erp/scripts/smoke_harness.py
-#           再执行 java_erp/docs/verify_invariants.sql
-
-# Mock ERP 仅由 deploy/ci/compose.mock-erp.yml 启动，用于契约回归，不作为联调或生产实现
+~~~bash
+# 终端 1：Java ERP
+cd java_erp
+./mvnw spring-boot:run
 
 # 终端 2：MCP
 python -m src.mcp_server.server_main
@@ -290,80 +360,110 @@ python -m src.mcp_server.server_main
 python -m src.api_view.web_main
 
 # 终端 4：Frontend
-cd frontend && npm run dev
-```
+cd frontend
+npm run dev
+~~~
 
-本地模式访问 <http://localhost:3000/>。`MCP_SERVER_URL`、`ERP_BASE_URL`（默认
-`http://localhost:8080` 指向 `java_erp`）、`DATABASE_URL` 和 `SANDBOX_IMAGE` 以根目录 `.env` 为准。
+本地默认地址：
 
-## ERP 后端选择
+| 服务 | 地址 |
+|---|---|
+| Frontend | http://localhost:3000 |
+| Backend | http://localhost:8000 |
+| MCP | http://localhost:9000 |
+| Java ERP | http://localhost:8080 |
 
-| 模式 | 地址 | 适用 |
+Mock ERP 仅由 deploy/ci/compose.mock-erp.yml 启动，用于隔离契约测试，不作为联调或生产实现。
+
+## 关键配置
+
+| 配置 | 作用 |
+|---|---|
+| CHATANYWHERE_API_KEY / LLM_MODEL / LLM_BASE_URL | 主 Agent、Router、Grader 和联网工具使用的模型 |
+| DATABASE_URL | PostgreSQL、LangGraph、记忆、知识、租约与审计 |
+| ERP_BASE_URL | Java ERP 地址 |
+| MCP_SERVER_URL | Backend 访问 MCP 的地址 |
+| AUTH_MODE / JWT_* | Backend JWT Resource Server 配置 |
+| MCP_AUTH_ENABLED / MCP_JWT_AUDIENCE | MCP JWT 校验 |
+| ERP_REPLENISHMENT_* | 补货巡检开关、Cron、时区和目标库存倍数 |
+| SANDBOX_IMAGE / SANDBOX_WARM_POOL_SIZE | 沙箱镜像和预热池 |
+| MEMORY_* | WARM/COLD 记忆保留与召回策略 |
+| OTEL_* | Trace 服务名、Collector 地址和采样率 |
+| ALERT_* | 钉钉与 SMTP 告警渠道 |
+| ARTIFACT_TTL_SECONDS | 用户临时产物保留时间 |
+
+容器部署只读取 deploy/.env；项目根目录 .env 只用于本地分进程开发。
+
+## Backend 关键接口
+
+| 方法 | 路径 | 用途 |
 |---|---|---|
-| `java_erp`（本地默认） | `ERP_BASE_URL=http://localhost:8080` | 幂等、operations 回查、状态/库存 CAS、可选 Redis/MQ |
-| Java ERP（Compose/生产默认） | Compose 内 `java-erp:8080` | Flyway、MySQL、幂等写与 operation 回查 |
-| Mock ERP（仅测试） | `deploy/ci/compose.mock-erp.yml` 内 `mock-erp:8081` | 契约回归，不进入生产发布物 |
+| POST | /api/chat/stream | 创建或继续会话，以 SSE 返回阶段、Token、工具和中断事件 |
+| POST | /api/chat/{thread_id}/resume | 提交补充信息或消费已落库审批结果并恢复工作流 |
+| GET | /api/chat/{thread_id}/state | 查询中断与待处理状态 |
+| GET | /api/chat/{thread_id}/history | 获取当前用户的会话消息 |
+| GET / DELETE | /api/history / /api/history/{thread_id} | 查询或删除当前用户会话 |
+| GET | /api/write-audit | 查询当前用户写操作 |
+| GET | /api/write-audit/approval-queue | 管理员查看独立审批队列 |
+| POST | /api/write-audit/approvals/{operation_id}/decision | 管理员批准或拒绝写操作 |
+| GET / POST | /api/write-audit/manual-queue / {operation_id}/resolve-manual | 查询并处理人工对账 |
+| GET | /api/evaluation/metrics | 获取最新四维评测报告 |
+| GET | /api/evaluation/traces/{thread_id} | 读取有归属校验的 Harness Trace |
+| GET | /api/download/{file_id}/{filename} | 下载当前用户 TTL 内的临时产物 |
+| GET | /metrics | Prometheus 指标 |
+| GET | /health | Backend 健康检查 |
+| GET | /healthz | Nginx 存活检查 |
 
-供应商状态以 Java 枚举为准：`1=合作中, 2=已终止, 3=审核中`（历史 `0` 写库前归一为 `2`）。
-新采购单统一以 `status=1`（待审核）创建，后续状态只能通过受控迁移接口变更。接口细节见 [java_erp/README.md](java_erp/README.md)
-与 [java_erp/docs/API_DOCUMENTATION.md](java_erp/docs/API_DOCUMENTATION.md)。
+主要 SSE 事件包括 thinking、phase、todo_update、token、tool_start、tool_args、
+tool_result、tool_end、review_result、interrupt、error 和 done。
 
-## 记忆与知识检索
+## MCP 工具范围
 
-系统按用户隔离四个命名空间：
+| 工具组 | 主要能力 |
+|---|---|
+| 供应商 | 搜索、分页、详情、新增、状态变更 |
+| 零部件 | 查询、分页、按供应商查询、新增 |
+| 采购目录 | 供应商报价、车型查询、适配查询、按车型反查零件 |
+| 订单 | 建单、修改、查询、统计、状态变更、幂等键回查 |
+| 收货与库存 | 整单收货、库存预警、盘点、入出库、库存流水 |
+| 补货 | 查询、创建、巡检、生成采购单、完成、取消 |
+| 采购退货 | 查询、创建、确认 |
 
-| 类型 | 内容 | 写入方式 |
-|---|---|---|
-| Semantic | 稳定偏好与用户画像 | 从一个 thread 的全部用户消息增量提取；新值使旧版本失效 |
-| Episodic | 一次业务任务的目标、结论和真实工具结果 | 每轮结束更新固定的 `ep_{thread_id}` |
-| Procedural | 可复用经验、流程和操作约定 | 通过 `remember` 显式保存 |
-| Org Policy | 组织级只读规则 | 由服务端维护 |
-
-项目约束为“一个 thread 对应一个完整业务任务；新任务创建新 thread”。WARM 层注入有效
-Semantic 和近期 Episodic；更早内容由 `read_memory` 从 COLD 层按需检索。
-
-COLD 检索采用：
-
-```text
-用户权限过滤
-  → PostgreSQL zhparser 关键词召回 + pgvector 语义召回
-  → RRF 融合与去重
-  → 时间、访问频次、置信度有限增益
-  → Top-K 与访问统计更新
-```
+写工具会传递 operationId、X-Operation-Id、Bearer Token 和 Trace Context。
 
 ## 评测
 
-当前评测链通过真实对话 SSE、工具 Trace 和 Java ERP 金标生成 JSON 报告。无网络环境
-可先校验数据契约：
+校验数据集 Schema：
 
-```bash
-python -m src.evaluation --dataset src/test/evaluation/datasets/schema_examples.jsonl --validate-only
-pytest -q src/test/test_evaluation_oracle.py src/test/test_evaluation_runner.py src/test/test_evaluation_dimensions.py
-curl http://localhost:8000/api/evaluation/metrics
-```
+~~~bash
+python -m src.evaluation \
+  --dataset src/test/evaluation/datasets/schema_examples.jsonl \
+  --validate-only
+~~~
 
-核心指标口径：
+运行评测测试：
 
-```text
-轨迹：轨迹通过率、工具调用准确率
-业务质量：任务完成率、关键事实准确率、采购建议可行率、补货数量偏差
-安全：风险操作拦截率、合法写入误拦截率
-稳定性：pass^3、故障恢复率
-```
+~~~bash
+pytest -q \
+  src/test/test_evaluation_oracle.py \
+  src/test/test_evaluation_runner.py \
+  src/test/test_evaluation_dimensions.py
+~~~
 
-每条用例归入 `FULLY_RESOLVED`、`PARTIALLY_RESOLVED`、
-`CORRECT_CLARIFICATION`、`INCORRECT`、`UNSAFE` 或 `INFRA_ERROR`。不计算加权
-总分、85 分阈值、延迟、成本、记忆或 Redis 指标。完整口径见
-[eval.md](eval.md)。
+正式评测支持按 trajectory、business、safety、stability 选择维度，并通过独立评测环境执行
+Fixture 重置、ERP 探针和故障注入。完整口径见 [eval.md](eval.md)。
 
 ## 测试与质量门禁
 
-```bash
+~~~bash
 # Python
 ruff check .
 python -m compileall -q src
 pytest -v --cov --cov-report=term-missing
+
+# Java ERP
+cd java_erp
+./mvnw -B -ntp verify
 
 # Frontend
 cd frontend
@@ -371,74 +471,66 @@ npm run typecheck
 npm run lint
 npm run test
 npm run build
-```
+~~~
 
-GitHub Actions 使用同一份可复用门禁，覆盖：
+CI 还会执行：
 
-- Workflow 权限与触发安全检查
-- Gitleaks 全历史密钥扫描和敏感路径检查
-- Python lint、编译、离线回归与覆盖率
-- 前端类型、lint、测试与镜像构建
-- PostgreSQL + MySQL 备份恢复、迁移幂等与负向用例
-- Nginx 认证链路、完整 Compose 拓扑和真实沙箱冒烟
-- 后端、前端、PostgreSQL 与 Java ERP 镜像构建验证
+- Workflow 权限与触发安全检查。
+- Gitleaks 全历史密钥扫描和敏感路径检查。
+- PostgreSQL 与 MySQL 迁移、备份、恢复和负向用例。
+- Mock ERP 契约回归与 Java ERP 真实链路冒烟。
+- Nginx 认证路径、完整 Compose 拓扑和真实沙箱冒烟。
+- Backend、Frontend、PostgreSQL、Java ERP 镜像构建。
+- 发布、观察窗、状态检查和回滚能力验证。
 
-## 关键接口
+## 可观测性
 
-| 方法 | 路径 | 用途 |
-|---|---|---|
-| `POST` | `/api/chat/stream` | 创建或继续 thread，以 SSE 返回阶段、Token、工具和中断事件 |
-| `POST` | `/api/chat/{thread_id}/resume` | 申请人消费已落库审批结果，或提交补充信息并恢复 LangGraph |
-| `GET` | `/api/write-audit/approval-queue` | 管理员查看独立审批队列（不读取申请人会话） |
-| `POST` | `/api/write-audit/approvals/{operation_id}/decision` | 管理员按 operation_id 批准或拒绝 |
-| `GET` | `/api/chat/{thread_id}/state` | 查询中断及待处理状态 |
-| `GET` | `/api/chat/{thread_id}/history` | 获取会话展示消息 |
-| `GET` | `/api/history` | 获取当前用户的会话列表 |
-| `DELETE` | `/api/history/{thread_id}` | 删除当前用户会话 |
-| `GET` | `/api/write-audit` | 查询当前用户的写操作审计 |
-| `GET` | `/api/write-audit/{operation_id}` | 查看操作详情和追加式事件 |
-| `GET` | `/api/evaluation/metrics` | 获取最新评测 JSON |
-| `GET` | `/api/download/{file_id}/{filename}` | 下载当前用户 TTL 内的临时产物 |
-| `GET` | `/metrics` | Prometheus 指标 |
-| `GET` | `/health` | Backend 健康检查 |
-| `GET` | `/healthz` | Nginx 存活检查 |
+完整链路：
 
-`/api/chat/stream` 返回的主要 SSE 事件包括 `thinking`、`phase`、`todo_update`、
-`token`、`tool_start`、`tool_args`、`tool_result`、`tool_end`、`review_result`、
-`interrupt`、`error` 和 `done`。
+~~~text
+Backend ──traceparent──> MCP ──traceparent──> Java ERP
+   └──────────── OTLP/HTTP ────────────────┘
+                         ↓
+                  OTel Collector
+                         ↓
+                       Tempo ──> Grafana
 
-## 数据与安全约束
+Backend / Java ERP ──metrics──> Prometheus ──> Alertmanager
+                                                   ├─ warning：钉钉
+                                                   └─ critical：钉钉 + 邮件
+~~~
 
-- PostgreSQL 是 Agent 会话、审计与知识的权威持久化路径；MySQL 是 Java ERP 业务数据的权威路径。项目不依赖 MongoDB 或独立向量数据库。
-- 当前是用户级隔离，不包含租户与角色权限模型。认证身份由 Nginx 注入，Backend 使用内部
-  Token 验证请求确实来自 Nginx。
-- Backend 不应直接暴露公网端口；容器部署必须通过 Nginx 访问。
-- ERP 写操作在人工批准前不会发送；一旦发送后状态不明确，只允许查询和对账，不自动重放。
-- `audit.write_audit_events` 为 append-only，数据库触发器拒绝更新和删除。
-- 沙箱使用独立 DinD daemon，避免直接挂载宿主机 Docker socket；但 DinD 服务本身需要
-  `privileged`，因此它是受控环境内的工程隔离，不等同于强安全边界。
-- Agent 对象和 Docker 连接是实例内缓存；AgentSession 所有权、用户运行租约、
-  `user → container` 分配以及暖池所有权以 PostgreSQL 为准。副本切换时从 checkpoint
-  和外置分配重建本地对象，同一用户不会被两个副本并发执行。
-- 生成文件目前仍位于 Backend 本地临时目录；横向扩容时下载路由需要粘性会话或共享
-  artifact 存储。DinD 仍是共享沙箱基础设施的单点。
-- `.env`、数据库卷、运行日志、TLS/JWT 私钥、构建产物和本地依赖均已加入 `.gitignore`。
-  提交前建议运行 `bash deploy/cd/leak-check.sh --tree`。
+Grafana 预置 ERP Agent Overview Dashboard 和 Prometheus、Tempo 数据源。告警排查流程见
+[deploy/observability/RUNBOOK.md](deploy/observability/RUNBOOK.md)。
 
-## 运维文档
+## 当前工程边界
 
-- [容器拓扑、认证与故障排查](deploy/README.md)
+- 采购收货只支持整单入库，不支持部分收货。
+- 采购退货不包含质检、供应商结算、退款和复杂售后。
+- 多副本运行时，AgentSession、执行租约、沙箱分配和暖池归属已外置 PostgreSQL；
+  临时产物仍需要粘性下载路由或共享 Artifact 存储。
+- 共享 DinD 是沙箱基础设施单点，且 privileged DinD 只适合受控网络，不等同于强安全边界。
+- 沙箱直连 MCP 默认关闭；Agent 主进程仍通过受认证的 MCP 客户端访问 ERP。
+- Mock ERP 仅用于 CI 契约测试。
+- 生产环境必须使用 TLS、强数据库口令、独立 Grafana 密码和受保护的 JWT 私钥。
+
+## 文档索引
+
+- [完整部署、认证与故障排查](deploy/README.md)
+- [Java ERP 业务、数据库与写契约](java_erp/README.md)
+- [Java ERP API 文档](java_erp/docs/API_DOCUMENTATION.md)
+- [四维评测方案](eval.md)
+- [可观测性 Runbook](deploy/observability/RUNBOOK.md)
 - [云主机初始化](deploy/cloud/README.md)
+- [CI 集成栈](deploy/ci/README.md)
 - [构建、发布与回滚](deploy/cd/README.md)
-- [PostgreSQL + MySQL 备份、恢复与演练](deploy/dr/README.md)
-- [宿主 MySQL 迁入 Compose](deploy/mysql/README.md)
-- [CI 集成栈与数据库门禁](deploy/ci/README.md)
-- [Java ERP 联调、写契约与冒烟](java_erp/README.md)
-- [Agent 四维评测方案](eval.md)
+- [双数据库备份、恢复与演练](deploy/dr/README.md)
+- [宿主 MySQL 迁移](deploy/mysql/README.md)
+- [Runner 安装与权限边界](deploy/runner/README.md)
+- [PostgreSQL 迁移说明](migrations/README.md)
 
-## 来源与致谢
+## 相关项目
 
-- 仓库：[lyrwazbzh/AutoSupply-Agent](https://github.com/lyrwazbzh/AutoSupply-Agent)
-- Agent 框架：[DeepAgents](https://github.com/langchain-ai/deepagents) 与
-  [LangGraph](https://github.com/langchain-ai/langgraph)
-- 工具协议：[Model Context Protocol](https://modelcontextprotocol.io/)
+- [DeepAgents](https://github.com/langchain-ai/deepagents)
+- [LangGraph](https://github.com/langchain-ai/langgraph)
+- [Model Context Protocol](https://modelcontextprotocol.io/)
