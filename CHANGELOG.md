@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.2.0](https://github.com/lyrwazbzh/AutoSupply-Agent/compare/v1.1.2...v1.2.0) (2026-11-17)
+
+
+### 新功能
+
+* **evaluation:** add four-dimension agent evaluation ([63c1cfd](https://github.com/lyrwazbzh/AutoSupply-Agent/commit/63c1cfd80c6d9e293b90195e2a0e3a7312bc99bc))
+* **observability:** add tracing and monitoring stack ([30c8fd9](https://github.com/lyrwazbzh/AutoSupply-Agent/commit/30c8fd97134a9bdc3e6d37d6cdf7fd4a93d465a5))
+* **platform:** complete procurement agent and ERP implementation ([f3eca41](https://github.com/lyrwazbzh/AutoSupply-Agent/commit/f3eca4161612a5087d45cf6d9bac184f69b9582b))
+* update agent implementation ([67981b4](https://github.com/lyrwazbzh/AutoSupply-Agent/commit/67981b46f656c9c4ca3b4be88d46cdd4ccd567b5))
+* update AutoSupply-Agent ([b38b6af](https://github.com/lyrwazbzh/AutoSupply-Agent/commit/b38b6afa1cce3f2d768bd579a5280d77ae874d83))
+* wire java_erp as Harness backend and drop shortage surface ([ed580b0](https://github.com/lyrwazbzh/AutoSupply-Agent/commit/ed580b06bc06d58f896eb1b273b54757489deecc))
+
+
+### 文档
+
+* align root README with java_erp and current harness ([22ab01f](https://github.com/lyrwazbzh/AutoSupply-Agent/commit/22ab01fb4d6a57096e3edd062518cfb585215ae7))
+* rewrite README for parts procurement platform ([2911d8c](https://github.com/lyrwazbzh/AutoSupply-Agent/commit/2911d8cb6341c2110a64f0abc39cb5cc673bed21))
+
 ## [1.1.2](https://github.com/farhub-wq/Agent-Harness/compare/v1.1.1...v1.1.2) (2026-10-09)
 
 
